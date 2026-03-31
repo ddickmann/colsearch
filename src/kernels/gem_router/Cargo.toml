@@ -1,0 +1,32 @@
+[package]
+name = "latence-gem-router"
+version = "0.1.1"
+edition = "2021"
+authors = ["Latence Team"]
+description = "GEM-inspired set-native multi-vector routing core for ColBERT and ColPali"
+license = "Apache-2.0"
+
+[lib]
+name = "latence_gem_router"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+ndarray = "0.16"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+parking_lot = "0.12"
+thiserror = "2.0"
+matrixmultiply = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

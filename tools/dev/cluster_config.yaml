@@ -1,0 +1,26 @@
+# Cluster Configuration
+# Defines the nodes in your Omni-Cluster
+
+master_node:
+  user: "dennis" # CHANGE THIS
+  host: "10.0.0.1" # IP of the Compute Node A (Master)
+  path: "/Users/dennis/omni-index" # Target path on remote machine
+
+worker_nodes:
+  - user: "dennis" # CHANGE THIS
+    host: "10.0.0.2" # IP of Compute Node B
+    path: "/Users/dennis/omni-index"
+
+# Setup
+# The ssh_key needed to access these machines from the Operator
+ssh_key_path: "~/.ssh/id_ed25519"
+
+# Synchronization
+# Files/Folders to exclude from syncing
+sync_exclude:
+  - ".git"
+  - ".DS_Store"
+  - "venv"
+  - "__pycache__"
+  - "*.pyc"
+  - "artifacts"

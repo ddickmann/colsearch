@@ -1,0 +1,2 @@
+include voyager_index/py.typed
+include tests/fixtures/dataset_di_fixture.json

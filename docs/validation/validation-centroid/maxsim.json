@@ -1,0 +1,97 @@
+{
+  "benchmark": "maxsim_real_tensors",
+  "benchmark_docs_effective_count": 96,
+  "benchmark_docs_source_count": 32,
+  "corpus_points": 539,
+  "dim": 128,
+  "doc_tokens": 263,
+  "docs": 96,
+  "embedding_source": "real_model",
+  "fast_colbert_cpu": {
+    "benchmark": {
+      "first_warmup_ms": 3.108866512775421,
+      "max_ms": 2.9219016432762146,
+      "measure_runs": 5,
+      "median_ms": 2.822794020175934,
+      "min_ms": 2.7655214071273804,
+      "runs_ms": [
+        2.9219016432762146,
+        2.8061866760253906,
+        2.7655214071273804,
+        2.822794020175934,
+        2.86739319562912
+      ],
+      "warmup_runs": 1
+    },
+    "elapsed_ms": 2.822794020175934,
+    "max_abs_delta_vs_reference": 0.0,
+    "parity": true
+  },
+  "processor": {
+    "benchmark": {
+      "first_warmup_ms": 3.257647156715393,
+      "max_ms": 30.55305778980255,
+      "measure_runs": 5,
+      "median_ms": 1.3032704591751099,
+      "min_ms": 1.2987777590751648,
+      "runs_ms": [
+        1.3407841324806213,
+        1.3032704591751099,
+        30.55305778980255,
+        1.3024136424064636,
+        1.2987777590751648
+      ],
+      "warmup_runs": 1
+    },
+    "elapsed_ms": 1.3032704591751099,
+    "max_abs_delta_vs_reference": 9.5367431640625e-07,
+    "scores_shape": [
+      8,
+      96
+    ]
+  },
+  "queries": 8,
+  "query_count": 8,
+  "query_tokens": 9,
+  "reference_cpu": {
+    "benchmark": {
+      "first_warmup_ms": null,
+      "max_ms": 6.099209189414978,
+      "measure_runs": 3,
+      "median_ms": 2.3922622203826904,
+      "min_ms": 2.300746738910675,
+      "runs_ms": [
+        6.099209189414978,
+        2.3922622203826904,
+        2.300746738910675
+      ],
+      "warmup_runs": 0
+    },
+    "elapsed_ms": 2.3922622203826904,
+    "scores_shape": [
+      8,
+      96
+    ]
+  },
+  "triton_cuda": {
+    "benchmark": {
+      "first_warmup_ms": 774.4320556521416,
+      "max_ms": 0.277884304523468,
+      "measure_runs": 5,
+      "median_ms": 0.21076947450637817,
+      "min_ms": 0.20826607942581177,
+      "runs_ms": [
+        0.277884304523468,
+        0.21076947450637817,
+        0.21755695343017578,
+        0.20889192819595337,
+        0.20826607942581177
+      ],
+      "warmup_runs": 1
+    },
+    "elapsed_ms": 0.21076947450637817,
+    "max_abs_delta_vs_reference": 2.86102294921875e-06,
+    "parity": true,
+    "status": "passed"
+  }
+}

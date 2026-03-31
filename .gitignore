@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.coverage
+.coverage.*
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.env
+.venv
+env/
+venv/
+ENV/
+build/
+dist/
+htmlcov/
+pip-wheel-metadata/
+site/
+*.egg-info/
+validation-reports/
+
+# Data
+data/
+*.zst
+*.pt
+*.pth
+*.jsonl
+*.bin
+
+# Logs
+*.log
+wandb/
+
+# Native and release artifacts
+src/kernels/knapsack_solver/target/
+src/kernels/hnsw_indexer/target/
+src/kernels/gem_router/target/
+*.whl
+
+# IDE
+.vscode/
+.idea/
+
+# Inspect script
+inspect_hops.py

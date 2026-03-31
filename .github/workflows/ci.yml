@@ -1,0 +1,205 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  base-install:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install base package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install .
+      - name: Smoke import public package
+        run: |
+          python -c "import voyager_index; from voyager_index import DEFAULT_MULTIMODAL_MODEL, DEFAULT_MULTIMODAL_MODEL_SPEC, SUPPORTED_MULTIMODAL_MODELS, fast_colbert_scores; assert DEFAULT_MULTIMODAL_MODEL == 'collfm2'; assert DEFAULT_MULTIMODAL_MODEL_SPEC is SUPPORTED_MULTIMODAL_MODELS['collfm2']; assert 'colqwen3' in SUPPORTED_MULTIMODAL_MODELS; assert callable(fast_colbert_scores); print(voyager_index.__all__)"
+
+  package-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Inspect release artifacts
+        run: |
+          python -c "
+          import pathlib, tarfile, zipfile
+          dist = pathlib.Path('dist')
+          wheel = next(dist.glob('voyager_index-*.whl'))
+          sdist = next(dist.glob('voyager_index-*.tar.gz'))
+          wheel_names = set(zipfile.ZipFile(wheel).namelist())
+          raw_sdist = set(tarfile.open(sdist).getnames())
+          sdist_names = {n.split('/', 1)[1] for n in raw_sdist if '/' in n}
+          assert 'voyager_index/py.typed' in wheel_names, 'py.typed missing from wheel'
+          assert 'voyager_index/py.typed' in sdist_names, 'py.typed missing from sdist'
+          assert 'tests/fixtures/dataset_di_fixture.json' in sdist_names, 'fixture missing from sdist'
+          assert 'src/__init__.py' in wheel_names
+          assert 'src/server/__init__.py' in wheel_names
+          assert 'src/inference/__init__.py' in wheel_names
+          assert 'src/kernels/__init__.py' in wheel_names
+          assert 'src/server/main.py' not in wheel_names
+          assert 'src/server/api/service.py' not in wheel_names
+          assert 'src/inference/index_core/index.py' not in wheel_names
+          assert 'src/kernels/maxsim.py' not in wheel_names
+          assert 'voyager_index/_internal/inference/solver/__init__.py' not in wheel_names
+          print(f'Wheel: {len(wheel_names)} files, sdist: {len(sdist_names)} files — all checks passed')
+          "
+      - name: Install built wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install dist/voyager_index-*.whl
+          python -c "from voyager_index import ColbertIndex, SearchPipeline; assert ColbertIndex is not None; assert SearchPipeline is not None"
+      - name: Write package validation bundle
+        run: |
+          python scripts/release_validation_report.py \
+            --job-name package-build \
+            --output-dir validation-reports/package-build-${{ github.run_id }} \
+            --artifact dist/voyager_index-*.whl \
+            --artifact dist/voyager_index-*.tar.gz
+      - name: Upload package validation bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-build-report
+          path: validation-reports/package-build-${{ github.run_id }}
+
+  oss-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install package, extras, and native wheels
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[server,multimodal,dev,native-hnsw-build,native-gem-build]"
+          python -m pip install ./src/kernels/hnsw_indexer
+          python -m pip install ./src/kernels/gem_router
+      - name: Run OSS foundation tests
+        run: |
+          pytest \
+            tests/test_oss_foundation_surface.py \
+            tests/test_oss_release_hygiene.py \
+            tests/test_release_polish_surface.py \
+            tests/test_full_feature_validation_native.py \
+            tests/test_prototype_screening.py \
+            tests/test_release_validation_report.py \
+            tests/test_reference_api_persistence.py \
+            tests/test_reference_api_contract.py \
+            tests/test_reference_api_security.py \
+            tests/test_multimodal_storage.py \
+            tests/test_maxsim_parity.py \
+            tests/test_ontology_fixture_contract.py \
+            tests/test_search_pipeline_contract.py
+      - name: Run benchmark smoke
+        run: |
+          python benchmarks/oss_reference_benchmark.py --device cpu --points 16 --top-k 3 > benchmark.json
+          python -c "import json; payload = json.load(open('benchmark.json', 'r', encoding='utf-8')); assert 'maxsim' in payload; assert 'reference_api_ingest' in payload; assert 'reference_api_search' in payload; assert 'multimodal_search' in payload"
+      - name: Write OSS validation bundle
+        run: |
+          python scripts/release_validation_report.py \
+            --job-name oss-test \
+            --output-dir validation-reports/oss-test-${{ matrix.python-version }}-${{ github.run_id }} \
+            --benchmark-json benchmark.json
+      - name: Upload OSS validation bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-test-${{ matrix.python-version }}-report
+          path: validation-reports/oss-test-${{ matrix.python-version }}-${{ github.run_id }}
+
+  native-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install package and native build prerequisites
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[server,multimodal,dev,native-build,native-gem-build]"
+          python -m pip install ./src/kernels/hnsw_indexer ./src/kernels/knapsack_solver ./src/kernels/gem_router
+      - name: Smoke import native packages
+        run: |
+          python -c "import latence_hnsw, latence_solver, latence_gem_router; from latence_solver import TabuSearchSolver; assert hasattr(latence_hnsw, 'HnswSegment'); assert callable(latence_solver.gpu_available); assert TabuSearchSolver is not None; assert hasattr(latence_gem_router, 'PyGemRouter'); print(latence_hnsw.__file__); print(latence_solver.version()); print(latence_gem_router.__file__)"
+      - name: Prepare native validation fixtures
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+          from PIL import Image
+
+          target = Path(".native-validation-data")
+          target.mkdir(exist_ok=True)
+          Image.new("RGB", (64, 64), color="white").save(target / "native-doc.png")
+          shutil.copy("tests/fixtures/dataset_di_fixture.json", target / "dataset_di_825cbaae40335bc4265a3726.json")
+          PY
+      - name: Run native validation matrix
+        run: |
+          python scripts/full_feature_validation.py \
+            --tmp-data-dir .native-validation-data \
+            --native-bootstrap off \
+            --output-dir validation-reports/native-validation-${{ github.run_id }}
+      - name: Assert native lane status
+        run: |
+          python -c "import json, pathlib; report = json.loads(pathlib.Path('validation-reports/native-validation-${{ github.run_id }}/report.json').read_text(encoding='utf-8')); assert report['native_packages']['latence_hnsw']['status'] == 'installed_and_importable'; assert report['native_packages']['latence_solver']['status'] == 'installed_and_importable'; assert report['lanes']['native_hnsw']['status'] == 'passed'; assert report['lanes']['solver']['status'] == 'passed'; assert report['lanes']['solver']['summary']['gpu']['status'] in {'passed', 'gpu_unavailable_for_cuda_lane'}"
+      - name: Upload native validation bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-validation-report
+          path: validation-reports/native-validation-${{ github.run_id }}
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container
+        run: docker build -f deploy/reference-api/Dockerfile -t voyager-index:test .
+      - name: Run container and probe health
+        run: |
+          docker run -d --name voyager-index-smoke -p 18080:8080 voyager-index:test
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:18080/health; then
+              break
+            fi
+            sleep 3
+          done
+          curl -fsS http://127.0.0.1:18080/ready
+      - name: Print container logs on failure
+        if: failure()
+        run: docker logs voyager-index-smoke

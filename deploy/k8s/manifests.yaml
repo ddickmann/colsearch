@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: voyager-index
+  namespace: voyager
+spec:
+  serviceName: "voyager-headless"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: voyager-index
+  template:
+    metadata:
+      labels:
+        app: voyager-index
+    spec:
+      containers:
+      - name: voyager-node
+        image: latence/voyager-zero:latest
+        ports:
+        - containerPort: 8000
+          name: api
+        - containerPort: 50051
+          name: grpc
+        env:
+        - name: NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SHARD_COUNT
+          value: "12"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            memory: "64Gi"
+          requests:
+            nvidia.com/gpu: 1
+            memory: "32Gi"
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Ti
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voyager-api
+  namespace: voyager
+spec:
+  selector:
+    app: voyager-index
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: LoadBalancer

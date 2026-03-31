@@ -1,0 +1,111 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  build-python:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Verify artifacts
+        run: |
+          python -m pip install twine
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-python
+          path: dist/
+
+  build-rust-wheels:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - crate: hnsw_indexer
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - crate: knapsack_solver
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - crate: gem_router
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          # macOS Intel (cross-compile on ARM runner, macos-13 is deprecated)
+          - crate: hnsw_indexer
+            os: macos-14
+            target: x86_64-apple-darwin
+          - crate: knapsack_solver
+            os: macos-14
+            target: x86_64-apple-darwin
+          - crate: gem_router
+            os: macos-14
+            target: x86_64-apple-darwin
+          # macOS Apple Silicon
+          - crate: hnsw_indexer
+            os: macos-14
+            target: aarch64-apple-darwin
+          - crate: knapsack_solver
+            os: macos-14
+            target: aarch64-apple-darwin
+          - crate: gem_router
+            os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: src/kernels/${{ matrix.crate }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --strip --interpreter 3.10 3.11 3.12
+          before-script-linux: yum install -y clang-devel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.crate }}-${{ matrix.os }}-${{ matrix.target }}
+          path: src/kernels/${{ matrix.crate }}/target/wheels/*.whl
+
+  publish:
+    needs: [build-python, build-rust-wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts/
+      - name: Collect all wheels into dist/
+        run: |
+          mkdir -p dist/
+          find all-artifacts/ -name '*.whl' -exec cp {} dist/ \;
+          find all-artifacts/ -name '*.tar.gz' -exec cp {} dist/ \;
+          echo "=== Artifacts to publish ==="
+          ls -lh dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

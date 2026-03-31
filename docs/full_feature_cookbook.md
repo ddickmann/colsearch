@@ -1,0 +1,710 @@
+# Full-Feature Cookbook
+
+This guide is the complete OSS exploration path for `voyager-index`.
+
+It is designed so a user can walk the whole stack step by step, or skip directly
+to the sections they care about.
+
+The cookbook is intentionally honest about three different kinds of features:
+
+- reference HTTP API features you can run directly against `voyager-index-server`
+- optional local/native upgrades that change behavior after you install extra packages
+- external or library-side integration seams that are documented and supported as boundaries, but are not standalone HTTP endpoints in the OSS reference API
+
+If you want the short first-run path, start with `docs/reference_api_tutorial.md`.
+
+If you want an executable companion to this cookbook, run:
+
+```bash
+python examples/reference_api_feature_tour.py --output-json feature-tour-report.json
+```
+
+That script logs each step, prints progress as it goes, and writes a JSON report
+with the results, skips, and boundary checks.
+
+## Feature Map
+
+| Area | Where It Lives | Status In This Cookbook |
+| --- | --- | --- |
+| Collection CRUD | reference HTTP API | runnable |
+| Dense vector search | reference HTTP API | runnable |
+| BM25-only sparse search | reference HTTP API | runnable |
+| Dense + BM25 hybrid search | reference HTTP API | runnable |
+| Dense optimized refinement with `latence_solver` | reference HTTP API + optional native package | runnable when installed |
+| Stateless `/reference/optimize` solver API | reference HTTP API + optional native package | runnable when installed |
+| Late-interaction retrieval | reference HTTP API | runnable |
+| Multimodal retrieval | reference HTTP API | runnable |
+| Multimodal `strategy="optimized"` screening | reference HTTP API | runnable, with backend selection limits explained |
+| Health, readiness, metrics, persistence | reference HTTP API | runnable |
+| Multimodal precision profiles (`INT8`, `FP8`, `RoQ`) | OSS guidance + library / validation surface | documented with boundaries |
+| vLLM pooling provider | public provider seam | runnable as optional integration |
+| Document-processing / `PageBundle` preprocessing | reference HTTP API + public helper | runnable |
+| Ontology / `OntologySidecar` seam | adapter contract | documented with workflow |
+| Graph / Neo4j-adjacent concepts | library-side config concepts | documented as not part of HTTP contract |
+
+## Step 0. Install The Profile You Need
+
+Current release path:
+
+- clone this repo and install locally from source
+- run the commands below from the repo root
+- no PyPI package is required for this release
+- for the full install matrix and product overview, start with `README.md`
+
+Start from source:
+
+```bash
+git clone https://github.com/latenceai/voyager-index.git
+cd voyager-index
+python -m pip install --upgrade pip
+```
+
+Base reference API:
+
+```bash
+python -m pip install ".[server]"
+```
+
+That install includes the supported PDF, DOCX, XLSX, and image rendering stack
+used by `/reference/preprocess/documents`.
+
+CPU-first local install:
+
+```bash
+python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+python -m pip install ".[server]"
+```
+
+Optional multimodal helpers:
+
+```bash
+python -m pip install ".[server,multimodal]"
+```
+
+Optional local native packages:
+
+```bash
+python -m pip install ".[native-build]"
+python -m pip install ./src/kernels/hnsw_indexer ./src/kernels/knapsack_solver
+```
+
+What these extras change:
+
+- `latence_hnsw`: optional native dense/HNSW acceleration
+- `latence_solver`: canonical OSS solver package for dense refinement and `/reference/optimize`
+- multimodal extras: optional provider-side helpers and example flows
+
+If you are preparing a release build today, this source-checkout install flow is the supported story.
+Publishing wheels or a PyPI package can be added later without changing the HTTP contract documented here.
+
+## Step 1. Start The Reference Service
+
+```bash
+voyager-index-server
+```
+
+Then open the interactive API docs:
+
+```text
+http://127.0.0.1:8080/docs
+http://127.0.0.1:8080/redoc
+```
+
+Then verify the runtime:
+
+```bash
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
+curl http://127.0.0.1:8080/metrics
+```
+
+What these endpoints are for:
+
+- `/health`: liveness plus version, collection count, and GPU visibility
+- `/ready`: degraded-state reporting, including collection load failures and scan-limit warnings
+- `/metrics`: Prometheus-friendly counters and gauges
+- `/reference/preprocess/documents`: source-doc to page-image preprocessing before embedding
+
+Skip ahead if:
+
+- you already have the service running and want to jump directly to search flows
+
+## Step 2. Learn The CRUD Surface Once
+
+The reference API supports the following core collection operations:
+
+- create collection: `POST /collections/{name}`
+- inspect collection: `GET /collections/{name}/info`
+- list collections: `GET /collections`
+- delete collection: `DELETE /collections/{name}`
+- add or upsert points: `POST /collections/{name}/points`
+- delete points: `DELETE /collections/{name}/points`
+- search: `POST /collections/{name}/search`
+
+This add/upsert route is the OSS delta-ingestion story. The repo does not hide
+collection updates behind a separate streaming-only API.
+
+Create a dense collection:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/cookbook-dense \
+  -H "Content-Type: application/json" \
+  -d '{"dimension": 4, "kind": "dense"}'
+```
+
+Inspect it:
+
+```bash
+curl http://127.0.0.1:8080/collections/cookbook-dense/info
+```
+
+List all collections:
+
+```bash
+curl http://127.0.0.1:8080/collections
+```
+
+Delete a point:
+
+```bash
+curl -X DELETE http://127.0.0.1:8080/collections/cookbook-dense/points \
+  -H "Content-Type: application/json" \
+  -d '{"ids": ["doc-2"]}'
+```
+
+Delete the collection:
+
+```bash
+curl -X DELETE http://127.0.0.1:8080/collections/cookbook-dense
+```
+
+Skip ahead if:
+
+- you already understand the base CRUD shape and just want feature-specific examples
+
+## Step 3. Dense Retrieval, BM25, And Hybrid Search
+
+Create a dense collection:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide \
+  -H "Content-Type: application/json" \
+  -d '{"dimension": 4, "kind": "dense", "distance": "cosine"}'
+```
+
+Add points with both vectors and text payloads:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide/points \
+  -H "Content-Type: application/json" \
+  -d '{
+    "points": [
+      {
+        "id": "doc-1",
+        "vector": [1, 0, 0, 0],
+        "payload": {"text": "invoice total due", "doc_type": "invoice", "tenant": "acme", "token_count": 64}
+      },
+      {
+        "id": "doc-2",
+        "vector": [0.9, 0.1, 0, 0],
+        "payload": {"text": "invoice backup receipt", "doc_type": "invoice", "tenant": "acme", "token_count": 48}
+      },
+      {
+        "id": "doc-3",
+        "vector": [0, 1, 0, 0],
+        "payload": {"text": "board report summary", "doc_type": "report", "tenant": "beta", "token_count": 90}
+      }
+    ]
+  }'
+```
+
+### 3A. Dense vector-only search
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [1, 0, 0, 0], "top_k": 3}'
+```
+
+### 3B. BM25-only sparse search
+
+`dense` collections support sparse text-only retrieval through `query_text`.
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{"query_text": "invoice", "top_k": 3}'
+```
+
+### 3C. Hybrid dense + BM25 search
+
+Provide both `vector` and `query_text`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [1, 0, 0, 0],
+    "query_text": "invoice",
+    "top_k": 3
+  }'
+```
+
+### 3D. Payload filters
+
+Filters are flat payload equality checks and work across supported collection kinds.
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query_text": "invoice",
+    "filter": {"tenant": "acme"},
+    "top_k": 3
+  }'
+```
+
+### 3E. Return stored vectors
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [1, 0, 0, 0],
+    "top_k": 2,
+    "with_vector": true
+  }'
+```
+
+### 3F. Dot-product dense collections
+
+The dense HTTP surface also supports `distance: "dot"`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-dot \
+  -H "Content-Type: application/json" \
+  -d '{"dimension": 2, "kind": "dense", "distance": "dot"}'
+```
+
+Skip ahead if:
+
+- you only care about sparse/hybrid text flows and do not need multivector retrieval
+
+## Step 4. Optional Dense Refinement With The Solver
+
+This is the canonical OSS knapsack-solver path reused by both dense refinement and `/reference/optimize`.
+It is not just a convenience feature. It is the repo's deliberately contrarian
+answer to the mainstream `RRF -> large reranker` pattern: retrieve broadly,
+then explicitly optimize the final packed context instead of hoping rank fusion
+alone gives the best pack.
+
+Requirements:
+
+- `latence_solver` must be built and importable
+- you must pass a dense `vector`
+- `strategy` must be `"optimized"`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [1, 0, 0, 0],
+    "query_text": "invoice",
+    "strategy": "optimized",
+    "top_k": 3,
+    "max_tokens": 220,
+    "max_chunks": 2
+  }'
+```
+
+When this lane is active, the response may include:
+
+- `objective_score`
+- `total_tokens`
+
+Important limits:
+
+- this path requires `latence_solver` to be installed locally
+- `/reference/optimize` is the canonical public OSS solver endpoint
+- `/collections/{name}/optimize` remains a compatibility placeholder; use `/reference/optimize`
+- `strategy="optimized"` without a dense `vector` is invalid for this dense solver path
+
+## Step 5. Stateless `/reference/optimize`
+
+Probe the shared optimizer health endpoint:
+
+```bash
+curl http://127.0.0.1:8080/reference/optimize/health
+```
+
+The public solver endpoint accepts the same canonical request contract used internally:
+
+- dense candidates with dense vectors
+- dense candidates plus BM25-side scores in candidate metadata
+- multivector candidates scored through the canonical Triton MaxSim facade
+- multivector candidates plus BM25-side scores
+
+This endpoint expects precomputed base64 vector payloads in the `OptimizerRequest` JSON body and requires `latence_solver` to be installed.
+
+Framing:
+
+- mainstream stacks often stop at fusion or send a large candidate pool into a heavyweight reranker
+- this solver path is the more provocative alternative: treat final context assembly as an optimization problem
+- that is why it makes the most sense once candidates come from heterogeneous sources and must compete for limited LLM context budget
+
+## Step 6. Late-Interaction Retrieval
+
+Create the collection:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/li-guide \
+  -H "Content-Type: application/json" \
+  -d '{"dimension": 4, "kind": "late_interaction", "storage_mode": "sync"}'
+```
+
+Add multivector points:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/li-guide/points \
+  -H "Content-Type: application/json" \
+  -d '{
+    "points": [
+      {
+        "id": "li-1",
+        "vectors": [[1, 0, 0, 0], [1, 0, 0, 0]],
+        "payload": {"text": "invoice total due", "label": "invoice"}
+      },
+      {
+        "id": "li-2",
+        "vectors": [[0, 1, 0, 0], [0, 1, 0, 0]],
+        "payload": {"text": "meeting notes", "label": "meeting"}
+      }
+    ]
+  }'
+```
+
+Search:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/li-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": [[1, 0, 0, 0], [1, 0, 0, 0]],
+    "filter": {"label": "invoice"},
+    "with_vector": true,
+    "top_k": 2
+  }'
+```
+
+Important limits:
+
+- `late_interaction` supports `vector` or `vectors`
+- it does not support `query_text`
+- filters work, but exact multivector filtering can hit the readiness scan ceiling if the filtered candidate set is too large
+
+## Step 7. Multimodal Retrieval
+
+Collection writes still expect embeddings, but the supported product flow can
+start from source docs or existing page images.
+
+Render source docs into PageBundle-like page assets:
+
+```bash
+curl -X POST http://127.0.0.1:8080/reference/preprocess/documents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_paths": ["/data/source/invoice.pdf", "/data/source/sheet.xlsx"],
+    "output_dir": "/data/rendered-pages"
+  }'
+```
+
+Then send the returned `image_path` assets through your embedding provider and
+store the resulting vectors with `POST /collections/{name}/points`.
+
+Create the collection:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/mm-guide \
+  -H "Content-Type: application/json" \
+  -d '{"dimension": 4, "kind": "multimodal"}'
+```
+
+Insert precomputed patch embeddings:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/mm-guide/points \
+  -H "Content-Type: application/json" \
+  -d '{
+    "points": [
+      {
+        "id": "page-1",
+        "vectors": [[1, 0, 0, 0], [1, 0, 0, 0]],
+        "payload": {"doc_id": "invoice.pdf", "page_number": 1, "kind": "invoice"}
+      },
+      {
+        "id": "page-2",
+        "vectors": [[0, 1, 0, 0], [0, 1, 0, 0]],
+        "payload": {"doc_id": "report.pdf", "page_number": 2, "kind": "report"}
+      }
+    ]
+  }'
+```
+
+Search:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/mm-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": [[1, 0, 0, 0], [1, 0, 0, 0]],
+    "filter": {"kind": "invoice"},
+    "with_vector": true,
+    "top_k": 2
+  }'
+```
+
+Important limits:
+
+- `multimodal` collection writes still expect precomputed embeddings, not raw image inference inside the API
+- it supports `vector` or `vectors`, but not `query_text`
+
+## Step 8. Multimodal Optimized Screening
+
+The reference HTTP API supports `strategy="optimized"` for multimodal search.
+That means:
+
+- the default `auto` path keeps exact MaxSim as the final scoring contract
+- the service may use a lightweight screening index first
+- solver orderings are explicit opt-in experiments, not the default multimodal path
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/mm-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": [[1, 0, 0, 0], [1, 0, 0, 0]],
+    "strategy": "optimized",
+    "multimodal_optimize_mode": "auto",
+    "top_k": 2
+  }'
+```
+
+Advanced explicit solver ordering example:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/mm-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": [[1, 0, 0, 0], [1, 0, 0, 0]],
+    "strategy": "optimized",
+    "multimodal_optimize_mode": "maxsim_then_solver",
+    "multimodal_candidate_budget": 80,
+    "multimodal_maxsim_frontier_k": 40,
+    "top_k": 2
+  }'
+```
+
+What is and is not configurable from the HTTP API today:
+
+- yes: opting into `strategy="optimized"`
+- yes: selecting `multimodal_optimize_mode`
+- yes: setting `multimodal_candidate_budget`, `multimodal_prefilter_k`, and `multimodal_maxsim_frontier_k`
+- no: selecting `prototype_hnsw` vs `centroid` through an HTTP field
+
+Current measured guidance on the rendered `tmp_data` benchmark (`547` pages, `8`
+real-model queries):
+
+- `maxsim_only` won at about `997 ms` average latency and `0.699` `ndcg`
+- `maxsim_then_solver` dropped to about `0.473` `ndcg` and rose to about `3989 ms`
+- `solver_prefilter_maxsim` dropped to about `0.188` `ndcg` and rose to about `5732 ms`
+
+So keep `multimodal_optimize_mode: "auto"` unless you are intentionally
+experimenting. Backend-selection and deeper screening experiments still live in
+the library and validation surface. See:
+
+- `MULTIMODAL_FOUNDATION.md`
+- `SCREENING_PROMOTION_DECISION_MEMO.md`
+- `docs/validation/README.md`
+
+When the solver *does* make sense:
+
+- use exact Triton MaxSim for pure multimodal retrieval over one coherent multimodal index
+- use the solver as the final packing layer when your chunk pool already combines signals from multiple sources such as BM25, ontology/rules, metadata heuristics, dense retrieval, and multimodal retrieval
+- in that mixed-source case, prefer the solver over simple rank fusion like RRF when you care about token budget, redundancy control, diversity, and pack quality
+
+## Step 9. Precision Profiles And Quantization
+
+Public OSS guidance currently exposes four multimodal precision profiles:
+
+- `Exact`: FP16 Triton MaxSim
+- `Fast`: INT8 Triton MaxSim where available
+- `Experimental`: FP8
+- `Memory Saver`: RoQ4
+
+Important truth:
+
+- these profiles are documented and benchmarked in OSS
+- the reference HTTP API does not currently expose a public request field that selects `INT8`, `FP8`, or `RoQ`
+- deeper quantization experiments currently live in the library / validation surface rather than as a stable HTTP configuration contract
+
+Where to explore them:
+
+- overview: `README.md`
+- multimodal guidance: `MULTIMODAL_FOUNDATION.md`
+- benchmark posture: `BENCHMARKS.md`
+- validation evidence: `docs/validation/README.md`
+
+## Step 10. Persistence, Restart Safety, And Readiness
+
+After creating and filling collections, inspect persistence:
+
+```bash
+curl http://127.0.0.1:8080/collections/dense-guide/info
+curl http://127.0.0.1:8080/collections/li-guide/info
+curl http://127.0.0.1:8080/collections/mm-guide/info
+```
+
+Collection storage roots:
+
+- `hybrid/` for dense
+- `colbert/` for late interaction
+- `colpali/` for multimodal
+
+What survives restart:
+
+- collection metadata
+- indexed points
+- dense sparse-index state
+- late-interaction embeddings and metadata
+- multimodal manifest, chunk files, and screening state
+
+What `/ready` can tell you:
+
+- failed collection reloads
+- degraded startup state
+- filter scan ceiling issues for exact filtered multivector search
+
+## Step 11. Optional vLLM Provider Flow
+
+The public provider seam is:
+
+- `voyager_index.SUPPORTED_MULTIMODAL_MODELS`
+- `voyager_index.VllmPoolingProvider`
+
+Example:
+
+```bash
+python examples/vllm_pooling_provider.py
+```
+
+Recommended flow:
+
+1. serve a supported model on a user-operated pooling endpoint
+2. request token or patch embeddings
+3. send those embeddings to the reference API as `vectors`
+
+This is an optional integration, not a managed service bundled into the OSS repo.
+
+## Step 12. Optional Document-Processing Pipeline Input
+
+The OSS repo documents the `PageBundle` seam and now ships a local preprocessing
+helper plus reference endpoint for turning source docs into page-image assets.
+
+Those surfaces are:
+
+- `voyager_index.render_documents(...)`
+- `POST /reference/preprocess/documents`
+- the `PageBundle` contract in `ADAPTER_CONTRACTS.md`
+
+Typical flow:
+
+1. either a user-side document pipeline or the built-in preprocessing helper renders page-native assets, text, and metadata
+2. a provider produces embeddings for those pages or chunks
+3. `voyager-index` ingests the resulting text and vectors into `dense`, `late_interaction`, or `multimodal` collections
+
+Minimal `PageBundle` shape:
+
+```json
+{
+  "bundle_version": "1",
+  "doc_id": "invoice-001",
+  "pages": [
+    {
+      "page_id": "invoice-001-p1",
+      "page_number": 1,
+      "image_path": "/path/to/page-1.png",
+      "text": "invoice total due",
+      "markdown": "# Invoice\n\nTotal due ..."
+    }
+  ]
+}
+```
+
+How this connects to BM25:
+
+- `text` or `markdown` can be converted into payload text fields
+- those payload text fields support the dense collection's sparse/BM25 branch through `query_text`
+
+Important truth:
+
+- the OSS reference API now includes a preprocessing endpoint for the local doc-to-image stage
+- embedding generation still stays outside the OSS runtime; the package does not embed the upstream pooling provider
+
+## Step 13. Optional Ontology / Knowledge Features
+
+The OSS repo also documents `OntologySidecar` in `ADAPTER_CONTRACTS.md`.
+
+Typical flow:
+
+1. dataset intelligence produces ontology, entity, relation, or concept sidecars
+2. those sidecars stay external to the OSS runtime
+3. retrieval or downstream systems align on stable IDs and consume the sidecar intentionally
+
+Minimal `OntologySidecar` shape:
+
+```json
+{
+  "bundle_version": "1",
+  "target_kind": "document",
+  "targets": [
+    {
+      "target_id": "invoice-001",
+      "entities": ["invoice", "payment"],
+      "relations": ["invoice->payment"],
+      "concepts": ["accounts_payable"],
+      "scores": {"relevance": 0.92}
+    }
+  ]
+}
+```
+
+Important truth:
+
+- ontology generation and graph construction are outside the OSS runtime
+- the reference HTTP API does not expose a dedicated ontology or graph endpoint
+- `Neo4jConfig` and graph-adjacent concepts are library-side concepts, not part of the current OSS HTTP contract
+
+## Step 14. What Is Deliberately Not In The OSS HTTP API
+
+These are important so users do not mistake documented seams for shipped HTTP features:
+
+- `/collections/{name}/optimize` is only a compatibility placeholder; use `/reference/optimize`
+- premium solver backends are not in OSS
+- Voyager reasoning/research code is not in OSS; it now lives in the separate `latence-voyager` repo
+- graph / knowledge-graph serving is not part of the reference API
+- document intelligence and embedding serving are external producer/provider roles
+- multimodal screening-backend selection and quantization tuning are not yet public HTTP knobs
+
+## Step 15. Recommended Reading Paths
+
+If you want to keep going:
+
+- shortest first-run path: `docs/reference_api_tutorial.md`
+- runnable examples: `examples/README.md`
+- multimodal and screening details: `MULTIMODAL_FOUNDATION.md`
+- benchmark and validation posture: `BENCHMARKS.md`, `SCREENING_PROMOTION_DECISION_MEMO.md`, `docs/validation/README.md`
+- contracts and external seams: `ADAPTER_CONTRACTS.md`
+- public contract summary: `OSS_FOUNDATION.md`

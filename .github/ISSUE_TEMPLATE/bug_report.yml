@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a bug in voyager-index
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Please fill out the sections below so we can reproduce and fix the issue.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal code or steps to reproduce the behavior.
+      placeholder: |
+        1. pip install voyager-index
+        2. Run `python -c "..."`
+        3. Observe error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened, including any error messages or tracebacks.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Please provide the following:
+        - OS and version
+        - Python version
+        - voyager-index version (`python -c "import voyager_index; print(voyager_index.__version__)"`)
+        - PyTorch version (if relevant)
+        - Whether native packages are installed (latence_hnsw, latence_solver, latence_gem_router)
+      placeholder: |
+        OS: Ubuntu 22.04
+        Python: 3.11.10
+        voyager-index: 0.1.0
+        torch: 2.9.1 (CPU)
+        Native: latence_hnsw, latence_gem_router installed
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Paste any relevant log output. This will be formatted as code automatically.
+      render: shell

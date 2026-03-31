@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "latence-gem-router"
+version = "0.1.1"
+description = "GEM-inspired set-native multi-vector routing core for ColBERT and ColPali"
+authors = [{name = "Latence AI", email = "dev@latence.ai"}]
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "latence_gem_router"

@@ -1,0 +1,11 @@
+{
+  "attention_backend": "sdpa_monkeypatch",
+  "document_count": 20,
+  "document_token_max": 263,
+  "document_token_min": 258,
+  "embed_dim": 128,
+  "embedding_source": "real_model",
+  "query_count": 8,
+  "query_token_max": 5,
+  "query_token_min": 3
+}

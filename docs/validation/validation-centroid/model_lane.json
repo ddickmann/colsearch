@@ -1,0 +1,61 @@
+{
+  "attention_backend": "sdpa_monkeypatch",
+  "document_count": 539,
+  "document_token_max": 2310,
+  "document_token_min": 258,
+  "documents": 57,
+  "embed_dim": 128,
+  "embedding_source": "real_model",
+  "matched_entity_count": 393,
+  "model_id": "VAGOsolutions/SauerkrautLM-ColLFM2-450M-v0.1",
+  "package_installed": true,
+  "package_version": "0.1.1.dev3+g040853262",
+  "query_count": 8,
+  "query_token_max": 9,
+  "query_token_min": 2,
+  "record_count": 539,
+  "records_with_ontology_matches": 526,
+  "requested_device": "cuda:0",
+  "top_ontology_terms": [
+    {
+      "canonical_name": "model",
+      "entity_id": "cd14b01b59fd5b5c",
+      "record_count": 156
+    },
+    {
+      "canonical_name": "Transformer",
+      "entity_id": "a0df43c05e8efe76",
+      "record_count": 108
+    },
+    {
+      "canonical_name": "Large Language Models",
+      "entity_id": "4c85b035e80bf67e",
+      "record_count": 76
+    },
+    {
+      "canonical_name": "accuracy",
+      "entity_id": "6bb91c31ea149d4e",
+      "record_count": 70
+    },
+    {
+      "canonical_name": "Retrieval-Augmented Generation",
+      "entity_id": "53e2b5dd4c11f138",
+      "record_count": 70
+    },
+    {
+      "canonical_name": "training tokens",
+      "entity_id": "c2876ef22ceff4e9",
+      "record_count": 62
+    },
+    {
+      "canonical_name": "Mitarbeiter",
+      "entity_id": "53f19a3c44d7157e",
+      "record_count": 61
+    },
+    {
+      "canonical_name": "Seedbox",
+      "entity_id": "555952b7be1b0c56",
+      "record_count": 56
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "data": {
+    "entities": [
+      {
+        "entity_id": "entity-001",
+        "label": "Dataset",
+        "canonical_name": "Voyager Benchmark Corpus",
+        "source": "fixture",
+        "properties": {
+          "modality": "multimodal",
+          "pages": 12
+        }
+      },
+      {
+        "entity_id": "entity-002",
+        "label": "Model",
+        "canonical_name": "ColLFM2",
+        "source": "fixture",
+        "properties": {
+          "family": "colpali",
+          "size": "450M"
+        }
+      },
+      {
+        "entity_id": "entity-003",
+        "label": "Task",
+        "canonical_name": "Ontology Fusion",
+        "source": "fixture",
+        "properties": {
+          "kind": "hybrid-retrieval",
+          "status": "active"
+        }
+      }
+    ]
+  }
+}

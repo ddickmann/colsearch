@@ -1,0 +1,97 @@
+[package]
+name = "latence-solver"
+version = "0.1.1"
+edition = "2021"
+authors = ["Latence Team"]
+description = "CPU-reference-first Tabu Search Quadratic Knapsack solver with optional experimental accelerators"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/latenceai/voyager-index"
+keywords = ["optimization", "knapsack", "tabu-search", "cpu", "cuda", "machine-learning"]
+categories = ["algorithms", "science"]
+
+[lib]
+name = "latence_solver"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "latence-solver-cli"
+path = "src/bin/cli.rs"
+
+[dependencies]
+# CPU Tensor Operations (ndarray is more stable than burn)
+ndarray = "0.16"
+
+# GPU Compute (optional)
+wgpu = { version = "0.20", optional = true }
+pollster = { version = "0.3", optional = true }
+
+# Parallelism
+rayon = "1.10"
+
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Random number generation
+rand = "0.8"
+rand_chacha = "0.3"
+
+# SIMD operations
+wide = "0.7"
+
+# CUDA backend (optional)
+cudarc = { version = "0.12", optional = true, features = ["cuda-12040"] }
+half = { version = "2.4", features = ["std"], optional = true }
+
+# Memory management
+parking_lot = "0.12"
+
+# Metrics and timing
+instant = "0.1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.5"
+approx = "0.5"
+
+[features]
+default = []
+
+# Backend features
+gpu = ["wgpu", "pollster"]
+cpu = [] 
+cuda = ["dep:cudarc", "dep:half"]
+
+# Python bindings
+python = ["pyo3", "numpy"]
+
+# All features for development
+full = ["gpu", "cuda", "python"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1
+
+[[bench]]
+name = "solver_benchmarks"
+harness = false
+

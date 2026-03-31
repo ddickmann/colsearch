@@ -1,0 +1,78 @@
+{
+  "fallback_elapsed_ms": 0.08515268564224243,
+  "fallback_probe": {
+    "log_path": "/workspace/latency-index-3/validation-sidecar/latence_hnsw_fallback_probe.log",
+    "returncode": 0,
+    "status": "passed",
+    "stderr": "latence_hnsw is unavailable; falling back to a local Python segment. This path is suitable for development, testing, and small local indexes.\n",
+    "stdout": "{\"active_segment_class\": \"HnswSegment\", \"active_segment_module\": \"voyager_index._internal.inference.index_core.hnsw_manager\", \"elapsed_ms\": 0.08515268564224243, \"filtered_top_ids\": [101, 103], \"flushed_before_reopen\": true, \"reopened_top_ids\": [100, 101, 102], \"top_ids\": [100, 101, 102]}\n",
+    "summary": {
+      "active_segment_class": "HnswSegment",
+      "active_segment_module": "voyager_index._internal.inference.index_core.hnsw_manager",
+      "elapsed_ms": 0.08515268564224243,
+      "filtered_top_ids": [
+        101,
+        103
+      ],
+      "flushed_before_reopen": true,
+      "reopened_top_ids": [
+        100,
+        101,
+        102
+      ],
+      "top_ids": [
+        100,
+        101,
+        102
+      ]
+    }
+  },
+  "filtered_match": true,
+  "native_elapsed_ms": 0.08134543895721436,
+  "native_package": {
+    "cargo_available": true,
+    "distribution": "latence_hnsw",
+    "installed_version": "0.1.0",
+    "module": "latence_hnsw",
+    "rustc_available": true,
+    "source_dir": "/workspace/latency-index-3/src/kernels/hnsw_indexer",
+    "source_present": true,
+    "status": "installed_and_importable"
+  },
+  "native_probe": {
+    "log_path": "/workspace/latency-index-3/validation-sidecar/latence_hnsw_native_probe.log",
+    "returncode": 0,
+    "status": "passed",
+    "stderr": "",
+    "stdout": "{\"active_segment_class\": \"HnswSegment\", \"active_segment_module\": \"builtins\", \"elapsed_ms\": 0.08134543895721436, \"filtered_top_ids\": [101, 103], \"flushed_before_reopen\": true, \"reopened_top_ids\": [100, 101, 102], \"top_ids\": [100, 101, 102]}\n",
+    "summary": {
+      "active_segment_class": "HnswSegment",
+      "active_segment_module": "builtins",
+      "elapsed_ms": 0.08134543895721436,
+      "filtered_top_ids": [
+        101,
+        103
+      ],
+      "flushed_before_reopen": true,
+      "reopened_top_ids": [
+        100,
+        101,
+        102
+      ],
+      "top_ids": [
+        100,
+        101,
+        102
+      ]
+    }
+  },
+  "reopen_match": true,
+  "top_id_match": true,
+  "verify_install": {
+    "log_path": "/workspace/latency-index-3/validation-sidecar/latence_hnsw_verify_install.log",
+    "returncode": 0,
+    "status": "passed",
+    "stderr": "",
+    "stdout": "Module imported: /usr/local/lib/python3.11/dist-packages/latence_hnsw/__init__.py\n--- Test 1: RocksDB Storage & Initialization ---\n--- Test 2: Ingestion with Payload ---\nAdded 4 points. Expect 4.\n--- Test 3: Filtered Search ---\nFiltered search results: [(2, 0.11043152958154678)]\n--- Test 4: Update Payload ---\nPost-update search (cat B): [(4, 0.0)]\n--- Test 5: Deletion ---\nDeleted 1 points.\nSearch deleted ID 1 area: [(2, 0.0)]\nSUCCESS: Enterprise features (RocksDB, CRUD, Filter) Verified!\n"
+  }
+}

@@ -1,0 +1,139 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voyager-index"
+version = "0.1.2"
+description = "Local-first multivector and hybrid retrieval with MaxSim, durable CRUD, Docker deployment, and Tabu Search optimization."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = [
+  "LICENSE",
+  "LICENSING.md",
+  "THIRD_PARTY_NOTICES.md",
+  "src/kernels/vendor/qdrant/LICENSE",
+]
+authors = [
+  { name = "Latence AI" }
+]
+keywords = [
+  "retrieval",
+  "late-interaction",
+  "multimodal",
+  "colbert",
+  "colpali",
+  "maxsim",
+  "bm25",
+  "knapsack",
+  "vector-search",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.26,<3",
+  "torch>=2.2,<3",
+  "h5py>=3.10,<4",
+  "bm25s>=0.2,<1",
+  "PyStemmer>=2.2,<3",
+]
+
+[project.optional-dependencies]
+server = [
+  "fastapi>=0.111,<1",
+  "uvicorn>=0.30,<1",
+  "pydantic>=2,<3",
+  "Pillow>=10,<12",
+  "PyMuPDF>=1.24,<2",
+  "python-docx>=1.1,<2",
+  "openpyxl>=3.1,<4",
+]
+gpu = [
+  "triton>=2.1,<4",
+]
+hnswlib-engine = [
+  "hnswlib>=0.8,<1",
+]
+native-build = [
+  "maturin>=1.5,<2.0",
+]
+native-hnsw-build = [
+  "maturin>=1.5,<2.0",
+]
+native-solver-build = [
+  "maturin>=1.5,<2.0",
+]
+native-gem-build = [
+  "maturin>=1.5,<2.0",
+]
+multimodal = [
+  "httpx>=0.27,<1",
+  "Pillow>=10,<12",
+]
+preprocessing = [
+  "Pillow>=10,<12",
+  "PyMuPDF>=1.24,<2",
+  "python-docx>=1.1,<2",
+  "openpyxl>=3.1,<4",
+]
+native = [
+  "latence-hnsw>=0.1.1",
+  "latence-solver>=0.1.1",
+  "latence-gem-router>=0.1.1",
+]
+dev = [
+  "pytest>=8,<9",
+  "pytest-cov>=5,<6",
+]
+
+[project.scripts]
+voyager-index-server = "voyager_index.server:main"
+
+[project.urls]
+Homepage = "https://github.com/ddickmann/voyager-index"
+Repository = "https://github.com/ddickmann/voyager-index"
+Issues = "https://github.com/ddickmann/voyager-index/issues"
+Changelog = "https://github.com/ddickmann/voyager-index/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+include-package-data = true
+packages = [
+  "voyager_index",
+  "voyager_index._internal",
+  "voyager_index._internal.server",
+  "voyager_index._internal.server.api",
+  "voyager_index._internal.inference",
+  "voyager_index._internal.inference.control",
+  "voyager_index._internal.inference.distributed",
+  "voyager_index._internal.inference.engines",
+  "voyager_index._internal.inference.fusion",
+  "voyager_index._internal.inference.gym",
+  "voyager_index._internal.inference.index_core",
+  "voyager_index._internal.inference.index_gpu",
+  "voyager_index._internal.inference.quantization",
+  "voyager_index._internal.inference.utils",
+  "voyager_index._internal.kernels",
+  "src",
+  "src.server",
+  "src.inference",
+  "src.kernels",
+]
+
+[tool.setuptools.package-data]
+voyager_index = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = [
+  "tests",
+]
+pythonpath = [
+  ".",
+]

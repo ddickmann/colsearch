@@ -1,0 +1,146 @@
+{
+  "collections": {
+    "dense_base": 200,
+    "dense_ontology": 200,
+    "late_interaction": 200,
+    "multimodal": 200
+  },
+  "crud": {
+    "dense_delete_ms": 1173.667199909687,
+    "dense_delete_status": 200,
+    "dense_update_ms": 1171.6712191700935,
+    "dense_update_status": 200
+  },
+  "ingest": {
+    "dense_base_ms": 1291.6667088866234,
+    "dense_ontology_ms": 1240.787535905838,
+    "late_interaction_ms": 93485.42432487011,
+    "multimodal_ms": 98711.8556946516
+  },
+  "profiles": {
+    "late_interaction_ingest": {
+      "doc_count": 539,
+      "mode": "build_from_batches",
+      "storage_ms": 2370.871588587761,
+      "total_ms": 3924.0386486053467,
+      "update_strategy_ms": 1553.162045776844
+    },
+    "late_interaction_search": {
+      "doc_count": 539,
+      "load_ms": 0.23653358221054077,
+      "mode": "triton_cache",
+      "score_ms": 0.29683858156204224,
+      "topk_ms": 0.055283308029174805,
+      "used_cache": true
+    },
+    "late_interaction_storage_write": {
+      "batch_count": 1,
+      "doc_count": 539,
+      "mode": "create_from_batches",
+      "write_ms": 2353.3849716186523
+    },
+    "late_interaction_vector_load": {
+      "chunk_count": 3,
+      "doc_count": 539,
+      "elapsed_ms": 1549.5531558990479,
+      "mode": "load_documents"
+    },
+    "multimodal_ingest": {
+      "doc_count": 539,
+      "mode": "append_chunk",
+      "quantized": false,
+      "save_ms": 944.4689303636551,
+      "storage_type": "mmap"
+    },
+    "multimodal_screening": {
+      "candidate_budget": 64,
+      "candidate_count": 0,
+      "mode": "candidate_factory",
+      "query_dispersion": 0.9995670914649963,
+      "query_token_count": 2310,
+      "reason": "health_degraded",
+      "screening_backend": "prototype_hnsw",
+      "sidecar_health": "degraded"
+    },
+    "multimodal_search": {
+      "chunk_count": 1,
+      "direct_gather": false,
+      "doc_count": 539,
+      "heap_ms": 40.621429681777954,
+      "load_ms": 673.1902807950974,
+      "mask_ms": 1.7244964838027954,
+      "materialize_ms": 144.5857733488083,
+      "mode": "colpali_search",
+      "quantized_storage": false,
+      "requested_candidate_count": null,
+      "score_ms": 0.33405423164367676,
+      "screening": {
+        "avg_prototypes_per_doc": 4.0,
+        "doc_count": 539,
+        "engine": "prototype_screening",
+        "mode": "screening_append",
+        "prototype_count": 2156,
+        "screening_backend": "prototype_hnsw",
+        "sidecar_health": "degraded",
+        "storage_mb": 33.34918022155762
+      },
+      "storage_type": "mmap"
+    },
+    "multimodal_search_optimized": {
+      "chunk_count": 1,
+      "direct_gather": false,
+      "doc_count": 539,
+      "heap_ms": 40.57033360004425,
+      "load_ms": 667.9055094718933,
+      "mask_ms": 1.7210915684700012,
+      "materialize_ms": 142.512246966362,
+      "mode": "colpali_search",
+      "quantized_storage": false,
+      "requested_candidate_count": null,
+      "score_ms": 0.34968554973602295,
+      "screening": {
+        "candidate_budget": 64,
+        "candidate_count": 0,
+        "mode": "candidate_factory",
+        "query_dispersion": 0.9995670914649963,
+        "query_token_count": 2310,
+        "reason": "health_degraded",
+        "screening_backend": "prototype_hnsw",
+        "sidecar_health": "degraded"
+      },
+      "storage_type": "mmap"
+    }
+  },
+  "restart": {
+    "cold_start_ms": 3977.339692413807,
+    "dense_info": 200,
+    "dense_info_points": 538,
+    "dense_ontology_info": 200,
+    "dense_ontology_info_points": 539,
+    "dense_ontology_restart_first_id": "b82ed4e0cbde16f2-p017",
+    "dense_ontology_restart_search": 200,
+    "dense_restart_first_id": "c0eef6b6172d566b-p006",
+    "dense_restart_search": 200,
+    "li_info": 200,
+    "mm_info": 200
+  },
+  "search": {
+    "dense_hybrid_first_id": "847370837f5a8839-p010",
+    "dense_hybrid_ms": 1.856088638305664,
+    "dense_ontology_first_id": "847370837f5a8839-p010",
+    "dense_ontology_ms": 2.1209716796875,
+    "dense_optimized_first_id": "e1b10d5347779065-p003",
+    "dense_optimized_ms": 22.60097861289978,
+    "dense_optimized_objective": 2.44278430512058,
+    "dense_text_first_id": "c0eef6b6172d566b-p006",
+    "dense_text_ms": 1.662909984588623,
+    "dense_vector_first_id": "847370837f5a8839-p010",
+    "dense_vector_ms": 1.2268796563148499,
+    "late_interaction_first_id": "847370837f5a8839-p010",
+    "late_interaction_ms": 292.06811636686325,
+    "multimodal_first_id": "847370837f5a8839-p010",
+    "multimodal_ms": 1758.202649652958,
+    "multimodal_optimized_first_id": "847370837f5a8839-p010",
+    "multimodal_optimized_ms": 1766.337662935257
+  }
+}
