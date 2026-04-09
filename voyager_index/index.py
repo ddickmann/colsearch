@@ -53,7 +53,10 @@ def _check_gem_available() -> bool:
         from voyager_index._internal.inference.index_core.gem_manager import (
             GemNativeSegmentManager,
         )
-        return GemNativeSegmentManager is not None
+        if GemNativeSegmentManager is None:
+            return False
+        from latence_gem_index import GemSegment, PyMutableGemSegment
+        return GemSegment is not None and PyMutableGemSegment is not None
     except ImportError:
         return False
 
@@ -170,6 +173,17 @@ class Index:
 
             n_docs = len(vecs_list)
 
+            for v in vecs_list:
+                if v.shape[-1] != self._dim:
+                    raise ValueError(
+                        f"dimension mismatch: expected {self._dim}, got {v.shape[-1]}"
+                    )
+
+            if ids is not None and len(ids) != n_docs:
+                raise ValueError(
+                    f"ids length ({len(ids)}) != vectors count ({n_docs})"
+                )
+
             if ids is None:
                 assigned = []
                 for i in range(n_docs):
@@ -254,7 +268,8 @@ class Index:
     def get(self, ids: List[int]) -> List[Optional[Dict[str, Any]]]:
         """Retrieve payloads for the given document IDs."""
         self._check_open()
-        return [self._payloads.get(doc_id) for doc_id in ids]
+        with self._lock:
+            return [self._payloads.get(doc_id) for doc_id in ids]
 
     def scroll(
         self,
@@ -273,11 +288,10 @@ class Index:
         with self._lock:
             all_ids = sorted(self._payloads.keys())
 
-            if filters:
+            if filters and hasattr(self._manager, '_match_filter'):
                 all_ids = [
                     doc_id for doc_id in all_ids
                     if self._manager._match_filter(doc_id, filters)
-                    if hasattr(self._manager, '_match_filter')
                 ]
 
             page_ids = all_ids[offset : offset + limit]

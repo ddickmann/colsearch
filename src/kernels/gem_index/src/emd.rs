@@ -6,6 +6,7 @@ use latence_gem_router::codebook::TwoStageCodebook;
 ///
 /// For L2-normalized centroids: IP(a,b) = 1 - ||a-b||^2 / 2
 /// Returns: 1 - avg(max_IP) in [roughly -1..2] range.
+#[inline]
 pub fn qch_proxy_between_docs(
     codebook: &TwoStageCodebook,
     codes_a: &[u16],
@@ -32,6 +33,7 @@ pub fn qch_proxy_between_docs(
 }
 
 /// Symmetric Chamfer: average of both asymmetric directions.
+#[inline]
 pub fn qch_proxy_symmetric(
     codebook: &TwoStageCodebook,
     codes_a: &[u16],

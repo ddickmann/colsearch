@@ -24,6 +24,7 @@ impl GemGraph {
         self.shortcuts.iter().map(|s| s.len()).sum()
     }
 
+    #[inline]
     pub fn neighbors(&self, idx: usize) -> &[u32] {
         &self.adjacency[idx]
     }
@@ -36,6 +37,9 @@ impl GemGraph {
         flat_codes: &FlatDocCodes,
         dim: usize,
     ) {
+        if dim == 0 {
+            return;
+        }
         for (query_flat, target_int) in pairs {
             let target = *target_int as usize;
             if target >= self.adjacency.len() {
@@ -71,30 +75,33 @@ impl GemGraph {
     }
 }
 
-/// Select neighbors using HNSW diversity heuristic.
+/// Select neighbors using HNSW diversity heuristic (GEM paper Algorithm 2).
 /// Candidates must be sorted ascending by score (best-first).
+/// Uses asymmetric qCH with cand as first arg in both comparisons (WS-2.3 fix).
 pub fn select_neighbors_heuristic(
     candidates: &[(u32, f32)],
+    query_codes: &[u16],
     max_degree: usize,
     codebook: &TwoStageCodebook,
     flat_codes: &FlatDocCodes,
 ) -> Vec<(u32, f32)> {
     let mut selected: Vec<(u32, f32)> = Vec::with_capacity(max_degree);
 
-    for &(cand_idx, cand_dist) in candidates {
+    for &(cand_idx, _) in candidates {
         if selected.len() >= max_degree {
             break;
         }
         let cand_codes = flat_codes.doc_codes(cand_idx as usize);
+        let cand_to_query = qch_proxy_between_docs(codebook, cand_codes, query_codes);
 
         let too_close = selected.iter().any(|&(sel_idx, _)| {
             let sel_codes = flat_codes.doc_codes(sel_idx as usize);
-            let pair_dist = qch_proxy_between_docs(codebook, cand_codes, sel_codes);
-            pair_dist < cand_dist
+            let cand_to_sel = qch_proxy_between_docs(codebook, cand_codes, sel_codes);
+            cand_to_sel < cand_to_query
         });
 
         if !too_close {
-            selected.push((cand_idx, cand_dist));
+            selected.push((cand_idx, cand_to_query));
         }
     }
 
@@ -120,9 +127,9 @@ pub fn shrink_neighbors(
             (nbr, dist)
         })
         .collect();
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
 
-    let kept = select_neighbors_heuristic(&scored, max_degree, codebook, flat_codes);
+    let kept = select_neighbors_heuristic(&scored, node_codes, max_degree, codebook, flat_codes);
     adjacency[node_idx] = kept.iter().map(|&(idx, _)| idx).collect();
 }
 
@@ -174,8 +181,10 @@ pub fn build_graph(
             i,
         );
 
+        let doc_codes = flat_codes.doc_codes(i);
         let neighbors = select_neighbors_heuristic(
             &candidates,
+            doc_codes,
             max_degree,
             codebook,
             flat_codes,
@@ -197,9 +206,127 @@ pub fn build_graph(
         }
     }
 
+    bridge_repair(
+        &mut adjacency,
+        max_degree,
+        postings,
+        codebook,
+        flat_codes,
+    );
+
     GemGraph {
         adjacency,
         shortcuts: vec![Vec::new(); n_docs],
         max_degree,
     }
+}
+
+/// Bridge repair: ensure cross-cluster connectivity by adding edges between
+/// cluster-reachable subgraph and unreachable cluster members.
+/// Mirrors C++ `repair_fine_graph_structure` from the GEM reference.
+pub fn bridge_repair(
+    adjacency: &mut Vec<Vec<u32>>,
+    max_degree: usize,
+    postings: &ClusterPostings,
+    codebook: &TwoStageCodebook,
+    flat_codes: &FlatDocCodes,
+) {
+    let n_clusters = postings.lists.len();
+
+    for cluster_id in 0..n_clusters {
+        let entry_rep = match postings.cluster_reps.get(cluster_id) {
+            Some(Some(rep)) => *rep as usize,
+            _ => continue,
+        };
+
+        let members: Vec<u32> = postings.lists[cluster_id].clone();
+        if members.len() <= 1 {
+            continue;
+        }
+
+        // BFS from cluster entry to find reachable nodes within cluster
+        let mut reachable = std::collections::HashSet::new();
+        let mut bfs_queue = std::collections::VecDeque::new();
+        let member_set: std::collections::HashSet<u32> = members.iter().copied().collect();
+
+        bfs_queue.push_back(entry_rep as u32);
+        reachable.insert(entry_rep as u32);
+
+        // Track nodes with spare capacity for bridge targets
+        let mut spare_capacity: Vec<u32> = Vec::new();
+        if adjacency[entry_rep].len() < max_degree {
+            spare_capacity.push(entry_rep as u32);
+        }
+
+        while let Some(node) = bfs_queue.pop_front() {
+            for &nbr in &adjacency[node as usize] {
+                if member_set.contains(&nbr) && !reachable.contains(&nbr) {
+                    reachable.insert(nbr);
+                    bfs_queue.push_back(nbr);
+                    if adjacency[nbr as usize].len() < max_degree {
+                        spare_capacity.push(nbr);
+                    }
+                }
+            }
+        }
+
+        // For each unreachable cluster member, add a bridge edge
+        let mut spare_idx = 0;
+        for &member in &members {
+            if reachable.contains(&member) {
+                continue;
+            }
+
+            // Find a reachable node with spare capacity, or evict worst neighbor
+            let bridge_source = if spare_idx < spare_capacity.len() {
+                let src = spare_capacity[spare_idx] as usize;
+                spare_idx += 1;
+                src
+            } else {
+                // No spare capacity: evict worst neighbor from entry rep
+                evict_worst_neighbor(entry_rep, max_degree, adjacency, codebook, flat_codes);
+                entry_rep
+            };
+
+            let m = member as usize;
+            if !adjacency[bridge_source].contains(&member) {
+                adjacency[bridge_source].push(member);
+            }
+            if !adjacency[m].contains(&(bridge_source as u32)) {
+                adjacency[m].push(bridge_source as u32);
+                if adjacency[m].len() > max_degree {
+                    evict_worst_neighbor(m, max_degree, adjacency, codebook, flat_codes);
+                }
+            }
+        }
+    }
+}
+
+/// Evict the worst (most distant) neighbor from a node's adjacency list
+/// to make room for a bridge edge. Returns the evicted neighbor.
+fn evict_worst_neighbor(
+    node: usize,
+    max_degree: usize,
+    adjacency: &mut [Vec<u32>],
+    codebook: &TwoStageCodebook,
+    flat_codes: &FlatDocCodes,
+) -> Option<u32> {
+    if adjacency[node].len() < max_degree {
+        return None;
+    }
+    if adjacency[node].is_empty() {
+        return None;
+    }
+    let node_codes = flat_codes.doc_codes(node);
+    let worst_idx = adjacency[node]
+        .iter()
+        .enumerate()
+        .map(|(i, &nbr)| {
+            let nbr_codes = flat_codes.doc_codes(nbr as usize);
+            let dist = qch_proxy_between_docs(codebook, node_codes, nbr_codes);
+            (i, dist)
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i);
+    worst_idx.map(|i| adjacency[node].swap_remove(i))
 }

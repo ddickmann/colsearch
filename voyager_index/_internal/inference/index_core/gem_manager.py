@@ -145,16 +145,22 @@ class GemHybridSegmentManager:
         sealed_dir = self._shard_path / "sealed"
         if not sealed_dir.exists():
             return
+        if GemSegment is None:
+            logger.error("latence_gem_index not available — cannot load sealed segments")
+            return
         for seg_dir in sorted(sealed_dir.iterdir()):
             gem_path = seg_dir / "segment.gem"
             ids_path = seg_dir / "doc_ids.json"
             if gem_path.exists() and ids_path.exists():
-                seg = GemSegment()
-                seg.load(str(gem_path))
-                with open(ids_path) as f:
-                    ids = json.load(f)
-                self._sealed_segments.append(seg)
-                self._sealed_doc_ids.append(ids)
+                try:
+                    seg = GemSegment()
+                    seg.load(str(gem_path))
+                    with open(ids_path) as f:
+                        ids = json.load(f)
+                    self._sealed_segments.append(seg)
+                    self._sealed_doc_ids.append(ids)
+                except Exception as e:
+                    logger.error("Failed to load sealed segment %s: %s", seg_dir, e)
 
     def _get_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
@@ -339,6 +345,19 @@ class GemNativeSegmentManager:
         compaction_interval_s: float = 60.0,
         enable_shortcuts: bool = False,
     ):
+        if dim <= 0:
+            raise ValueError(f"dim must be positive, got {dim}")
+        if n_fine <= 0:
+            raise ValueError(f"n_fine must be positive, got {n_fine}")
+        if n_coarse <= 0:
+            raise ValueError(f"n_coarse must be positive, got {n_coarse}")
+        if max_degree <= 0:
+            raise ValueError(f"max_degree must be positive, got {max_degree}")
+        if not (0.0 <= seal_quality_threshold <= 1.0):
+            raise ValueError(f"seal_quality_threshold must be in [0,1], got {seal_quality_threshold}")
+        if not (0.0 <= compaction_threshold <= 1.0):
+            raise ValueError(f"compaction_threshold must be in [0,1], got {compaction_threshold}")
+
         self._shard_path = Path(shard_path)
         self._shard_path.mkdir(parents=True, exist_ok=True)
         self._dim = dim
@@ -417,16 +436,22 @@ class GemNativeSegmentManager:
         sealed_dir = self._shard_path / "sealed"
         if not sealed_dir.exists():
             return
+        if GemSegment is None:
+            logger.error("latence_gem_index not available — cannot load sealed segments")
+            return
         for seg_dir in sorted(sealed_dir.iterdir()):
             gem_path = seg_dir / "segment.gem"
             ids_path = seg_dir / "doc_ids.json"
             if gem_path.exists() and ids_path.exists():
-                seg = GemSegment()
-                seg.load(str(gem_path))
-                with open(ids_path) as f:
-                    ids = json.load(f)
-                self._sealed_segments.append(seg)
-                self._sealed_doc_ids.append(ids)
+                try:
+                    seg = GemSegment()
+                    seg.load(str(gem_path))
+                    with open(ids_path) as f:
+                        ids = json.load(f)
+                    self._sealed_segments.append(seg)
+                    self._sealed_doc_ids.append(ids)
+                except Exception as e:
+                    logger.error("Failed to load sealed segment %s: %s", seg_dir, e)
 
     def _load_payloads(self):
         p = self._shard_path / "payloads.json"
@@ -467,8 +492,15 @@ class GemNativeSegmentManager:
                     self._seed_buffer_vecs.append(entry.vectors)
                     self._seed_buffer_ids.append(entry.external_id)
 
-            if len(self._seed_buffer_ids) >= self._seed_batch_size and not self._codebook_trained:
-                self._init_active_from_seed()
+            if self._seed_buffer_ids and not self._codebook_trained:
+                if len(self._seed_buffer_ids) >= self._seed_batch_size:
+                    self._init_active_from_seed()
+                else:
+                    logger.info(
+                        "WAL recovery: %d docs in seed buffer (< batch size %d), "
+                        "deferring active segment build until more data arrives",
+                        len(self._seed_buffer_ids), self._seed_batch_size,
+                    )
 
     def _replay_recovered_docs(self, vecs: List[np.ndarray], ids: List[int]):
         """Rebuild the active segment from recovered document data."""
@@ -692,19 +724,14 @@ class GemNativeSegmentManager:
         return self.search_multivector(qv, k=k, ef=ef, n_probes=self._n_probes, filters=filters)
 
     def retrieve(self, ids: List[int], with_vector: bool = False, with_payload: bool = True):
-        results = {}
-        for doc_id in ids:
-            entry: Dict[str, Any] = {"id": doc_id}
-            if with_payload:
-                entry["payload"] = self._payloads.get(doc_id, {})
-            results[doc_id] = entry
-        return results
-
-    def _collect_active_vectors_from_wal(self) -> Tuple[List[np.ndarray], List[int]]:
-        """Collect all live document vectors from the active segment's seed buffer + WAL."""
-        vecs = list(self._seed_buffer_vecs)
-        ids = list(self._seed_buffer_ids)
-        return vecs, ids
+        with self._lock:
+            results = {}
+            for doc_id in ids:
+                entry: Dict[str, Any] = {"id": doc_id}
+                if with_payload:
+                    entry["payload"] = self._payloads.get(doc_id, {})
+                results[doc_id] = entry
+            return results
 
     def seal_active_segment(self):
         with self._lock:
@@ -719,6 +746,44 @@ class GemNativeSegmentManager:
             return
 
         logger.info("Sealing active segment with %d live docs", active_n)
+
+        vecs, ids = self._collect_all_active_docs()
+        if not vecs or not ids:
+            logger.warning("Seal: no vectors collected from active, skipping")
+            return
+
+        all_vecs = np.vstack(vecs).astype(np.float32)
+        offsets = []
+        pos = 0
+        for v in vecs:
+            n = v.shape[0]
+            offsets.append((pos, pos + n))
+            pos += n
+
+        if GemSegment is None:
+            raise RuntimeError("latence_gem_index not available — cannot seal")
+
+        sealed = GemSegment()
+        sealed.build(
+            all_vecs, ids, offsets,
+            n_fine=self._n_fine, n_coarse=self._n_coarse,
+            max_degree=self._max_degree,
+            ef_construction=self._gem_ef_construction,
+            max_kmeans_iter=self._max_kmeans_iter,
+            ctop_r=self._ctop_r,
+        )
+
+        seg_idx = len(self._sealed_segments)
+        seg_dir = self._shard_path / "sealed" / f"seg_{seg_idx:04d}"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        sealed.save(str(seg_dir / "segment.gem"))
+        with open(seg_dir / "doc_ids.json", "w") as f:
+            json.dump(ids, f)
+
+        self._sealed_segments.append(sealed)
+        self._sealed_doc_ids.append(ids)
+        logger.info("Sealed segment %d with %d docs written to %s", seg_idx, len(ids), seg_dir)
+
         self._active = None
         self._codebook_trained = False
         gc.collect()
@@ -728,8 +793,35 @@ class GemNativeSegmentManager:
         if self._checkpoint_mgr:
             self._checkpoint_mgr.clear()
 
+    def _collect_all_active_docs(self):
+        """Collect all live document vectors from WAL replay for sealing."""
+        if not self._wal_writer or WalReader is None:
+            return self._seed_buffer_vecs[:], self._seed_buffer_ids[:]
+
+        reader = WalReader(self._shard_path / "wal.bin")
+        entries = reader.replay()
+
+        live_docs = {}
+        for entry in entries:
+            from .gem_wal import WalOp
+            if entry.op == WalOp.INSERT and entry.vectors is not None:
+                if entry.external_id not in self._deleted_ids:
+                    live_docs[entry.external_id] = entry.vectors
+            elif entry.op == WalOp.DELETE:
+                live_docs.pop(entry.external_id, None)
+            elif entry.op == WalOp.UPSERT and entry.vectors is not None:
+                if entry.external_id not in self._deleted_ids:
+                    live_docs[entry.external_id] = entry.vectors
+                else:
+                    live_docs.pop(entry.external_id, None)
+
+        ids = list(live_docs.keys())
+        vecs = [live_docs[i] for i in ids]
+        return vecs, ids
+
     def should_seal(self) -> bool:
-        return self._should_seal_inner()
+        with self._lock:
+            return self._should_seal_inner()
 
     def _should_seal_inner(self) -> bool:
         if self._active is None or not self._active.is_ready():
@@ -741,9 +833,10 @@ class GemNativeSegmentManager:
         return False
 
     def quality_score(self) -> float:
-        if self._active is not None and self._active.is_ready():
-            return self._active.quality_score()
-        return 1.0
+        with self._lock:
+            if self._active is not None and self._active.is_ready():
+                return self._active.quality_score()
+            return 1.0
 
     def upsert_multidense(
         self,
@@ -803,24 +896,25 @@ class GemNativeSegmentManager:
         if self._metrics_hook:
             try:
                 self._metrics_hook(name, value)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Metrics hook error: %s", e)
 
     def flush(self):
-        self._save_next_doc_id()
-        self._save_deleted_ids()
-        self._save_payloads()
-        if self._checkpoint_mgr and self._active is not None:
-            try:
-                self._checkpoint_mgr.save(
-                    doc_vectors=self._seed_buffer_vecs,
-                    doc_ids=self._seed_buffer_ids,
-                    next_doc_id=self._next_doc_id,
-                    codebook_trained=self._codebook_trained,
-                    sealed_deleted_ids=self._sealed_deleted_ids,
-                )
-            except Exception as e:
-                logger.error("Checkpoint save failed: %s", e)
+        with self._lock:
+            self._save_next_doc_id()
+            self._save_deleted_ids()
+            self._save_payloads()
+            if self._checkpoint_mgr and self._active is not None:
+                try:
+                    self._checkpoint_mgr.save(
+                        doc_vectors=self._seed_buffer_vecs,
+                        doc_ids=self._seed_buffer_ids,
+                        next_doc_id=self._next_doc_id,
+                        codebook_trained=self._codebook_trained,
+                        sealed_deleted_ids=self._sealed_deleted_ids,
+                    )
+                except Exception as e:
+                    logger.error("Checkpoint save failed: %s", e)
 
     def close(self):
         self._stop_compaction_thread()
@@ -844,21 +938,22 @@ class GemNativeSegmentManager:
             pass
 
     def get_statistics(self) -> Dict[str, Any]:
-        stats: Dict[str, Any] = {
-            "total_vectors": self.total_vectors(),
-            "sealed_segments": len(self._sealed_segments),
-            "deleted_count": len(self._deleted_ids),
-            "dim": self._dim,
-            "codebook_trained": self._codebook_trained,
-            "seed_buffer_size": len(self._seed_buffer_ids),
-        }
-        if self._active is not None and self._active.is_ready():
-            stats["active"] = {
-                "n_live": self._active.n_live(),
-                "n_nodes": self._active.n_nodes(),
-                "n_edges": self._active.n_edges(),
-                "quality": self._active.quality_score(),
-                "delete_ratio": self._active.delete_ratio(),
-                "avg_degree": self._active.avg_degree(),
+        with self._lock:
+            stats: Dict[str, Any] = {
+                "total_vectors": self.total_vectors(),
+                "sealed_segments": len(self._sealed_segments),
+                "deleted_count": len(self._deleted_ids),
+                "dim": self._dim,
+                "codebook_trained": self._codebook_trained,
+                "seed_buffer_size": len(self._seed_buffer_ids),
             }
-        return stats
+            if self._active is not None and self._active.is_ready():
+                stats["active"] = {
+                    "n_live": self._active.n_live(),
+                    "n_nodes": self._active.n_nodes(),
+                    "n_edges": self._active.n_edges(),
+                    "quality": self._active.quality_score(),
+                    "delete_ratio": self._active.delete_ratio(),
+                    "avg_degree": self._active.avg_degree(),
+                }
+            return stats

@@ -4,10 +4,9 @@ use std::cmp::Ordering;
 use latence_gem_router::codebook::qch_proxy_score_u16;
 use latence_gem_router::router::FlatDocCodes;
 
-use crate::visited::VisitedSet;
+use crate::visited::with_visited;
 
-/// Candidate for min-heap: smallest score (best match) has highest priority.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct MinCand {
     score: f32,
     idx: u32,
@@ -25,15 +24,14 @@ impl PartialOrd for MinCand {
     }
 }
 impl Ord for MinCand {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        other.score.partial_cmp(&self.score)
-            .unwrap_or(Ordering::Equal)
+        other.score.total_cmp(&self.score)
             .then(other.idx.cmp(&self.idx))
     }
 }
 
-/// Candidate for max-heap: largest score (worst match) has highest priority.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct MaxCand {
     score: f32,
     idx: u32,
@@ -51,9 +49,9 @@ impl PartialOrd for MaxCand {
     }
 }
 impl Ord for MaxCand {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.score.partial_cmp(&other.score)
-            .unwrap_or(Ordering::Equal)
+        self.score.total_cmp(&other.score)
             .then(self.idx.cmp(&other.idx))
     }
 }
@@ -61,9 +59,10 @@ impl Ord for MaxCand {
 /// HNSW-style beam search on the GEM graph.
 ///
 /// Returns candidates sorted ascending by score (best-first).
+/// `shortcuts` is `None` when searching a mutable segment (avoids allocation).
 pub fn beam_search(
     adjacency: &[Vec<u32>],
-    shortcuts: &[Vec<u32>],
+    shortcuts: Option<&[Vec<u32>]>,
     entry_points: &[u32],
     query_scores: &[f32],
     n_query: usize,
@@ -78,80 +77,105 @@ pub fn beam_search(
         return Vec::new();
     }
 
-    let mut visited = VisitedSet::new(n_nodes);
-    let mut candidates: BinaryHeap<MinCand> = BinaryHeap::new();
-    let mut results: BinaryHeap<MaxCand> = BinaryHeap::new();
+    with_visited(n_nodes, |visited| {
+        let mut candidates: BinaryHeap<MinCand> = BinaryHeap::new();
+        let mut results: BinaryHeap<MaxCand> = BinaryHeap::new();
 
-    for &ep in entry_points {
-        let ep_usize = ep as usize;
-        if ep_usize >= n_nodes || visited.contains(ep_usize) {
-            continue;
-        }
-        visited.set(ep_usize);
-
-        let is_del = deleted.map_or(false, |d| ep_usize < d.len() && d[ep_usize]);
-        let doc_codes = flat_codes.doc_codes(ep_usize);
-        let score = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
-
-        candidates.push(MinCand { score, idx: ep });
-        if !is_del {
-            results.push(MaxCand { score, idx: ep });
-        }
-    }
-
-    while let Some(MinCand { score: c_dist, idx: c_node }) = candidates.pop() {
-        if results.len() >= ef {
-            if let Some(worst) = results.peek() {
-                if c_dist > worst.score {
-                    break;
-                }
-            }
-        }
-
-        let c_usize = c_node as usize;
-
-        let neighbor_iter: Box<dyn Iterator<Item = u32>> = if enable_shortcuts && c_usize < shortcuts.len() && !shortcuts[c_usize].is_empty() {
-            Box::new(
-                adjacency[c_usize].iter().copied()
-                    .chain(shortcuts[c_usize].iter().copied())
-            )
-        } else {
-            Box::new(adjacency[c_usize].iter().copied())
-        };
-
-        for nbr in neighbor_iter {
-            let nbr_usize = nbr as usize;
-            if nbr_usize >= n_nodes || visited.contains(nbr_usize) {
+        for &ep in entry_points {
+            let ep_usize = ep as usize;
+            if ep_usize >= n_nodes || visited.contains(ep_usize) {
                 continue;
             }
-            visited.set(nbr_usize);
+            visited.set(ep_usize);
 
-            let doc_codes = flat_codes.doc_codes(nbr_usize);
-            let dist = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
+            let is_del = deleted.map_or(false, |d| ep_usize < d.len() && d[ep_usize]);
+            let doc_codes = flat_codes.doc_codes(ep_usize);
+            let score = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
 
-            let should_add = results.len() < ef || {
-                results.peek().map_or(true, |w| dist < w.score)
-            };
+            candidates.push(MinCand { score, idx: ep });
+            if !is_del {
+                results.push(MaxCand { score, idx: ep });
+            }
+        }
 
-            if should_add {
-                candidates.push(MinCand { score: dist, idx: nbr });
-                let is_del = deleted.map_or(false, |d| nbr_usize < d.len() && d[nbr_usize]);
-                if !is_del {
-                    results.push(MaxCand { score: dist, idx: nbr });
-                    if results.len() > ef {
-                        results.pop();
+        while let Some(MinCand { score: c_dist, idx: c_node }) = candidates.pop() {
+            if results.len() >= ef {
+                if let Some(worst) = results.peek() {
+                    if c_dist > worst.score {
+                        break;
+                    }
+                }
+            }
+
+            let c_usize = c_node as usize;
+
+            #[inline(always)]
+            fn process_neighbor(
+                nbr: u32,
+                n_nodes: usize,
+                visited: &mut crate::visited::VisitedSet,
+                flat_codes: &FlatDocCodes,
+                query_scores: &[f32],
+                n_query: usize,
+                n_fine: usize,
+                ef: usize,
+                deleted: Option<&[bool]>,
+                candidates: &mut BinaryHeap<MinCand>,
+                results: &mut BinaryHeap<MaxCand>,
+            ) {
+                let nbr_usize = nbr as usize;
+                if nbr_usize >= n_nodes || visited.contains(nbr_usize) {
+                    return;
+                }
+                visited.set(nbr_usize);
+
+                let doc_codes = flat_codes.doc_codes(nbr_usize);
+                let dist = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
+
+                let should_add = results.len() < ef || {
+                    results.peek().map_or(true, |w| dist < w.score)
+                };
+
+                if should_add {
+                    candidates.push(MinCand { score: dist, idx: nbr });
+                    let is_del = deleted.map_or(false, |d| nbr_usize < d.len() && d[nbr_usize]);
+                    if !is_del {
+                        results.push(MaxCand { score: dist, idx: nbr });
+                        if results.len() > ef {
+                            results.pop();
+                        }
+                    }
+                }
+            }
+
+            for &nbr in &adjacency[c_usize] {
+                process_neighbor(
+                    nbr, n_nodes, visited, flat_codes, query_scores,
+                    n_query, n_fine, ef, deleted, &mut candidates, &mut results,
+                );
+            }
+
+            if enable_shortcuts {
+                if let Some(sc) = shortcuts {
+                    if c_usize < sc.len() {
+                        for &nbr in &sc[c_usize] {
+                            process_neighbor(
+                                nbr, n_nodes, visited, flat_codes, query_scores,
+                                n_query, n_fine, ef, deleted, &mut candidates, &mut results,
+                            );
+                        }
                     }
                 }
             }
         }
-    }
 
-    let mut out: Vec<(u32, f32)> = results
-        .into_iter()
-        .map(|mc| (mc.idx, mc.score))
-        .collect();
-    out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    out
+        let mut out: Vec<(u32, f32)> = results
+            .into_iter()
+            .map(|mc| (mc.idx, mc.score))
+            .collect();
+        out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        out
+    })
 }
 
 /// Beam search for graph construction (no delete mask, no shortcuts).
@@ -169,61 +193,62 @@ pub fn beam_search_construction(
         return Vec::new();
     }
 
-    let mut visited = VisitedSet::new(n_built);
-    let mut candidates: BinaryHeap<MinCand> = BinaryHeap::new();
-    let mut results: BinaryHeap<MaxCand> = BinaryHeap::new();
+    with_visited(n_built, |visited| {
+        let mut candidates: BinaryHeap<MinCand> = BinaryHeap::new();
+        let mut results: BinaryHeap<MaxCand> = BinaryHeap::new();
 
-    for &ep in entry_points {
-        let ep_usize = ep as usize;
-        if ep_usize >= n_built || visited.contains(ep_usize) {
-            continue;
-        }
-        visited.set(ep_usize);
-
-        let doc_codes = flat_codes.doc_codes(ep_usize);
-        let score = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
-        candidates.push(MinCand { score, idx: ep });
-        results.push(MaxCand { score, idx: ep });
-    }
-
-    while let Some(MinCand { score: c_dist, idx: c_node }) = candidates.pop() {
-        if results.len() >= ef {
-            if let Some(worst) = results.peek() {
-                if c_dist > worst.score {
-                    break;
-                }
-            }
-        }
-
-        let c_usize = c_node as usize;
-        for &nbr in &adjacency[c_usize] {
-            let nbr_usize = nbr as usize;
-            if nbr_usize >= n_built || visited.contains(nbr_usize) {
+        for &ep in entry_points {
+            let ep_usize = ep as usize;
+            if ep_usize >= n_built || visited.contains(ep_usize) {
                 continue;
             }
-            visited.set(nbr_usize);
+            visited.set(ep_usize);
 
-            let doc_codes = flat_codes.doc_codes(nbr_usize);
-            let dist = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
+            let doc_codes = flat_codes.doc_codes(ep_usize);
+            let score = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
+            candidates.push(MinCand { score, idx: ep });
+            results.push(MaxCand { score, idx: ep });
+        }
 
-            let should_add = results.len() < ef || {
-                results.peek().map_or(true, |w| dist < w.score)
-            };
+        while let Some(MinCand { score: c_dist, idx: c_node }) = candidates.pop() {
+            if results.len() >= ef {
+                if let Some(worst) = results.peek() {
+                    if c_dist > worst.score {
+                        break;
+                    }
+                }
+            }
 
-            if should_add {
-                candidates.push(MinCand { score: dist, idx: nbr });
-                results.push(MaxCand { score: dist, idx: nbr });
-                if results.len() > ef {
-                    results.pop();
+            let c_usize = c_node as usize;
+            for &nbr in &adjacency[c_usize] {
+                let nbr_usize = nbr as usize;
+                if nbr_usize >= n_built || visited.contains(nbr_usize) {
+                    continue;
+                }
+                visited.set(nbr_usize);
+
+                let doc_codes = flat_codes.doc_codes(nbr_usize);
+                let dist = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
+
+                let should_add = results.len() < ef || {
+                    results.peek().map_or(true, |w| dist < w.score)
+                };
+
+                if should_add {
+                    candidates.push(MinCand { score: dist, idx: nbr });
+                    results.push(MaxCand { score: dist, idx: nbr });
+                    if results.len() > ef {
+                        results.pop();
+                    }
                 }
             }
         }
-    }
 
-    let mut out: Vec<(u32, f32)> = results
-        .into_iter()
-        .map(|mc| (mc.idx, mc.score))
-        .collect();
-    out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    out
+        let mut out: Vec<(u32, f32)> = results
+            .into_iter()
+            .map(|mc| (mc.idx, mc.score))
+            .collect();
+        out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        out
+    })
 }

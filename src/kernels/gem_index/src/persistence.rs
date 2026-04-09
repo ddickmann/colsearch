@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 use latence_gem_router::codebook::TwoStageCodebook;
@@ -85,8 +86,18 @@ pub fn save_segment(data: &SegmentData, path: &Path) -> Result<(), PersistError>
 }
 
 /// Load segment from disk with integrity verification.
+/// Uses mmap for efficient I/O on large segment files,
+/// falling back to buffered read for small files.
 pub fn load_segment(path: &Path) -> Result<SegmentData, PersistError> {
     let file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len() as usize;
+
+    const MMAP_THRESHOLD: usize = 1024 * 1024; // 1MB
+
+    if file_len >= MMAP_THRESHOLD {
+        return load_segment_mmap(&file, file_len);
+    }
+
     let mut r = BufReader::new(file);
 
     let mut magic = [0u8; 4];
@@ -106,6 +117,14 @@ pub fn load_segment(path: &Path) -> Result<SegmentData, PersistError> {
     r.read_exact(&mut len_buf)?;
     let data_len = u64::from_le_bytes(len_buf) as usize;
 
+    let max_data = file_len.saturating_sub(16 + 4);
+    if data_len > max_data {
+        return Err(PersistError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("declared data_len {} exceeds file capacity {}", data_len, max_data),
+        )));
+    }
+
     let mut data_buf = vec![0u8; data_len];
     r.read_exact(&mut data_buf)?;
 
@@ -121,6 +140,68 @@ pub fn load_segment(path: &Path) -> Result<SegmentData, PersistError> {
     }
 
     let segment: SegmentData = bincode::deserialize(&data_buf)?;
+    Ok(segment)
+}
+
+/// Memory-mapped load for large segment files.
+/// Avoids copying file contents into heap -- the OS page cache serves reads.
+fn load_segment_mmap(file: &fs::File, file_len: usize) -> Result<SegmentData, PersistError> {
+    let mmap = unsafe { Mmap::map(file)? };
+    let bytes = &mmap[..];
+
+    if bytes.len() < 16 {
+        return Err(PersistError::BadMagic);
+    }
+
+    if &bytes[0..4] != MAGIC {
+        return Err(PersistError::BadMagic);
+    }
+
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version != VERSION {
+        return Err(PersistError::BadVersion(version));
+    }
+
+    let data_len = u64::from_le_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15],
+    ]) as usize;
+
+    let data_start: usize = 16;
+    let data_end = data_start.checked_add(data_len).ok_or_else(|| {
+        PersistError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "data_len overflow",
+        ))
+    })?;
+    let crc_end = data_end.checked_add(4).ok_or_else(|| {
+        PersistError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "crc offset overflow",
+        ))
+    })?;
+
+    if crc_end > file_len {
+        return Err(PersistError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "file truncated",
+        )));
+    }
+
+    let data_buf = &bytes[data_start..data_end];
+    let expected_crc = u32::from_le_bytes([
+        bytes[data_end], bytes[data_end + 1], bytes[data_end + 2], bytes[data_end + 3],
+    ]);
+    let actual_crc = crc32fast::hash(data_buf);
+
+    if expected_crc != actual_crc {
+        return Err(PersistError::BadChecksum {
+            expected: expected_crc,
+            actual: actual_crc,
+        });
+    }
+
+    let segment: SegmentData = bincode::deserialize(data_buf)?;
     Ok(segment)
 }
 

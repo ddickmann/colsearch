@@ -74,6 +74,23 @@ impl GemSegment {
         })?;
 
         let n_docs = doc_ids.len();
+        if n_docs != doc_offsets.len() {
+            return Err(PyValueError::new_err(format!(
+                "doc_ids length ({}) != doc_offsets length ({})",
+                n_docs, doc_offsets.len()
+            )));
+        }
+        for (i, &(start, end)) in doc_offsets.iter().enumerate() {
+            if start > end || end > n_vectors {
+                return Err(PyValueError::new_err(format!(
+                    "doc_offsets[{}] = ({}, {}) out of range for {} vectors",
+                    i, start, end, n_vectors
+                )));
+            }
+        }
+        if dim == 0 {
+            return Err(PyValueError::new_err("dim must be > 0"));
+        }
 
         // Build codebook
         let mut codebook = TwoStageCodebook::build(
@@ -168,7 +185,7 @@ impl GemSegment {
 
         let results = beam_search(
             &inner.graph.adjacency,
-            &inner.graph.shortcuts,
+            Some(&inner.graph.shortcuts),
             &entries,
             &query_scores,
             n_query,
@@ -182,9 +199,8 @@ impl GemSegment {
         let out: Vec<(u64, f32)> = results
             .into_iter()
             .take(k)
-            .map(|(int_idx, score)| {
-                let doc_id = inner.doc_ids[int_idx as usize];
-                (doc_id, score)
+            .filter_map(|(int_idx, score)| {
+                inner.doc_ids.get(int_idx as usize).map(|&doc_id| (doc_id, score))
             })
             .collect();
 
@@ -389,6 +405,40 @@ impl PyMutableGemSegment {
         })?;
 
         seg.insert(flat, n_tokens, doc_id);
+        Ok(())
+    }
+
+    /// Batch insert multiple documents in a single lock acquisition.
+    #[pyo3(signature = (vectors_list, doc_ids))]
+    fn insert_batch(
+        &mut self,
+        vectors_list: Vec<PyReadonlyArray2<f32>>,
+        doc_ids: Vec<u64>,
+    ) -> PyResult<()> {
+        let seg = self.inner.as_mut().ok_or_else(|| {
+            PyValueError::new_err("segment not built")
+        })?;
+
+        if vectors_list.len() != doc_ids.len() {
+            return Err(PyValueError::new_err(format!(
+                "vectors_list length ({}) != doc_ids length ({})",
+                vectors_list.len(), doc_ids.len()
+            )));
+        }
+
+        for (vecs, doc_id) in vectors_list.iter().zip(doc_ids.iter()) {
+            let arr = vecs.as_array();
+            let (n_tokens, dim) = (arr.shape()[0], arr.shape()[1]);
+            if dim != seg.dim {
+                return Err(PyValueError::new_err(format!(
+                    "dimension mismatch: expected {}, got {}", seg.dim, dim
+                )));
+            }
+            let flat = arr.as_slice().ok_or_else(|| {
+                PyValueError::new_err("array must be C-contiguous")
+            })?;
+            seg.insert(flat, n_tokens, *doc_id);
+        }
         Ok(())
     }
 

@@ -1,0 +1,340 @@
+{
+  "ts": "2026-04-09T08:22:26",
+  "purpose": "Golden recovery reference",
+  "api": {
+    "gem.GemSegment": {
+      "build": {
+        "sig": "build(self, /, all_vectors, doc_ids, doc_offsets, n_fine=256, n_coarse=32, max_degree=32, ef_construction=200, max_kmeans_iter=30, ctop_r=3) unbound builtins.GemSegment method",
+        "doc": "Build a sealed GEM segment from document vectors.\n\nArgs:\n  all_vectors: (N, D) float32 matrix of all token vectors\n  doc_ids: external document IDs\n  doc_offsets: (start, end) index pairs into all_vectors per document\n  n_fine: number of fine centroids (codebook size)\n  n_coarse: number of coarse clusters\n  max_degree: max neighbors per graph node (M parameter)\n  ef_construction: beam width during graph construction\n  max_kmeans_iter: k-means iteration limit\n  ctop_r: number of top coarse clusters per document"
+      },
+      "dim": {
+        "sig": "dim(self, /) unbound builtins.GemSegment method",
+        "doc": ""
+      },
+      "inject_shortcuts": {
+        "sig": "inject_shortcuts(self, /, training_pairs, max_shortcuts_per_node=4) unbound builtins.GemSegment method",
+        "doc": "Inject semantic shortcuts from training pairs.\ntraining_pairs: list of (query_vectors_flat, positive_doc_internal_id)"
+      },
+      "is_ready": {
+        "sig": "is_ready(self, /) unbound builtins.GemSegment method",
+        "doc": ""
+      },
+      "load": {
+        "sig": "load(self, /, path) unbound builtins.GemSegment method",
+        "doc": "Load sealed segment from disk."
+      },
+      "n_docs": {
+        "sig": "n_docs(self, /) unbound builtins.GemSegment method",
+        "doc": ""
+      },
+      "n_edges": {
+        "sig": "n_edges(self, /) unbound builtins.GemSegment method",
+        "doc": ""
+      },
+      "n_nodes": {
+        "sig": "n_nodes(self, /) unbound builtins.GemSegment method",
+        "doc": ""
+      },
+      "save": {
+        "sig": "save(self, /, path) unbound builtins.GemSegment method",
+        "doc": "Save sealed segment to disk."
+      },
+      "search": {
+        "sig": "search(self, /, query_vectors, k=10, ef=100, n_probes=4, enable_shortcuts=False) unbound builtins.GemSegment method",
+        "doc": "Search the sealed segment for nearest neighbors to a multi-vector query.\n\nReturns: list of (doc_id, qch_proxy_score) tuples, sorted best-first"
+      },
+      "total_shortcuts": {
+        "sig": "total_shortcuts(self, /) unbound builtins.GemSegment method",
+        "doc": ""
+      }
+    },
+    "gem.PyMutableGemSegment": {
+      "avg_degree": {
+        "sig": "avg_degree(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "build": {
+        "sig": "build(self, /, all_vectors, doc_ids, doc_offsets, n_fine=256, n_coarse=32, max_degree=32, ef_construction=200, max_kmeans_iter=30, ctop_r=3, n_probes=4) unbound builtins.PyMutableGemSegment method",
+        "doc": "Build a mutable segment from a seed batch: trains codebook + builds initial graph."
+      },
+      "compact": {
+        "sig": "compact(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "delete": {
+        "sig": "delete(self, /, doc_id) unbound builtins.PyMutableGemSegment method",
+        "doc": "Soft-delete a document by external ID. Returns True if found."
+      },
+      "delete_ratio": {
+        "sig": "delete_ratio(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "dim": {
+        "sig": "dim(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "insert": {
+        "sig": "insert(self, /, vectors, doc_id) unbound builtins.PyMutableGemSegment method",
+        "doc": "Insert a single document (multi-vector) into the mutable graph."
+      },
+      "is_ready": {
+        "sig": "is_ready(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "memory_bytes": {
+        "sig": "memory_bytes(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "n_edges": {
+        "sig": "n_edges(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "n_live": {
+        "sig": "n_live(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "n_nodes": {
+        "sig": "n_nodes(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": ""
+      },
+      "quality_score": {
+        "sig": "quality_score(self, /) unbound builtins.PyMutableGemSegment method",
+        "doc": "Quality score: 1.0 = same as initial build, < 1.0 = degraded."
+      },
+      "search": {
+        "sig": "search(self, /, query_vectors, k=10, ef=100, _n_probes=4) unbound builtins.PyMutableGemSegment method",
+        "doc": "Search the mutable segment."
+      },
+      "upsert": {
+        "sig": "upsert(self, /, vectors, doc_id) unbound builtins.PyMutableGemSegment method",
+        "doc": "Upsert: delete old version (if exists) then insert new."
+      }
+    },
+    "router.PyGemRouter": {
+      "add_documents": {
+        "sig": "add_documents(self, /, new_vectors, new_doc_ids, doc_offsets) unbound builtins.PyGemRouter method",
+        "doc": "Add new documents to an existing router."
+      },
+      "build": {
+        "sig": "build(self, /, all_vectors, doc_ids, doc_offsets, n_fine=256, n_coarse=32, max_kmeans_iter=30, ctop_r=3) unbound builtins.PyGemRouter method",
+        "doc": "Build the router from a matrix of all document vectors.\n\nArgs:\n  all_vectors: (N, D) float32 matrix of all token/prototype vectors\n  doc_ids: list of document IDs (length = n_docs)\n  doc_offsets: list of (start, end) tuples indexing into all_vectors for each doc\n  n_fine: number of fine centroids (codebook size)\n  n_coarse: number of coarse clusters\n  max_kmeans_iter: k-means iteration limit\n  ctop_r: number of top coarse clusters per document"
+      },
+      "compute_query_profile": {
+        "sig": "compute_query_profile(self, /, query_vectors, n_probes=4) unbound builtins.PyGemRouter method",
+        "doc": "Compute query centroid IDs and C_top.\n\nReturns: (centroid_ids: list[int], ctop: list[int])"
+      },
+      "get_cluster_entries": {
+        "sig": "get_cluster_entries(self, /, query_vectors, n_probes=4) unbound builtins.PyGemRouter method",
+        "doc": "Get HNSW entry point hints for multi-entry traversal.\n\nReturns doc IDs of cluster representatives for the query's most relevant clusters."
+      },
+      "is_ready": {
+        "sig": "is_ready(self, /) unbound builtins.PyGemRouter method",
+        "doc": "Check if the router is built and ready for queries."
+      },
+      "load": {
+        "sig": "load(self, /, path) unbound builtins.PyGemRouter method",
+        "doc": "Load router state from disk."
+      },
+      "n_coarse": {
+        "sig": "n_coarse(self, /) unbound builtins.PyGemRouter method",
+        "doc": "Number of coarse clusters."
+      },
+      "n_docs": {
+        "sig": "n_docs(self, /) unbound builtins.PyGemRouter method",
+        "doc": "Number of indexed documents."
+      },
+      "n_fine": {
+        "sig": "n_fine(self, /) unbound builtins.PyGemRouter method",
+        "doc": "Number of fine centroids in the codebook."
+      },
+      "query_cluster_overlaps": {
+        "sig": "query_cluster_overlaps(self, /, query_vectors, n_probes=4) unbound builtins.PyGemRouter method",
+        "doc": "Get per-document cluster overlap with a query's C_top.\n\nReturns: list of (doc_id, overlap_count)"
+      },
+      "route_query": {
+        "sig": "route_query(self, /, query_vectors, n_probes=4, max_candidates=500) unbound builtins.PyGemRouter method",
+        "doc": "Route a query to candidate documents.\n\nArgs:\n  query_vectors: (Q, D) float32 matrix of query token vectors\n  n_probes: number of coarse clusters to probe\n  max_candidates: max number of candidates to return\n\nReturns:\n  list of (doc_id, proxy_score) tuples, sorted best-first"
+      },
+      "save": {
+        "sig": "save(self, /, path) unbound builtins.PyGemRouter method",
+        "doc": "Save router state to disk."
+      }
+    }
+  },
+  "sealed": {
+    "docs": 50,
+    "nodes": 50,
+    "edges": 506,
+    "dim": 32,
+    "ready": true
+  },
+  "sealed_search": {
+    "n": 10,
+    "ids": [
+      15,
+      24,
+      1,
+      28,
+      8,
+      16,
+      12,
+      26,
+      34,
+      38
+    ],
+    "scores": [
+      -1.187163,
+      -1.131551,
+      -1.077396,
+      -1.077396,
+      -1.077396,
+      -1.022326,
+      -1.006503,
+      -1.001417,
+      -0.987392,
+      -0.974648
+    ]
+  },
+  "sealed_io": {
+    "ids_ok": true
+  },
+  "sealed_sc": 0,
+  "mut": {
+    "nodes": 20,
+    "live": 20,
+    "edges": 134,
+    "dim": 32,
+    "ready": true,
+    "qual": 1.0,
+    "dr": 0.0,
+    "deg": 6.7,
+    "mem": 2000
+  },
+  "mut_s": {
+    "n": 5,
+    "ids": [
+      19,
+      11,
+      17,
+      12,
+      6
+    ]
+  },
+  "mut_ins": 21,
+  "mut_del": {
+    "ret": true,
+    "live": 20
+  },
+  "mut_ups": 20,
+  "mut_cmp": {
+    "live": 20,
+    "dr": 0.0
+  },
+  "rtr": {
+    "docs": 50,
+    "fine": 32,
+    "coarse": 4,
+    "ready": true
+  },
+  "rtr_route": 10,
+  "rtr_pf": {
+    "cids": 4,
+    "ctop": 3
+  },
+  "rtr_ent": 2,
+  "rtr_io": true,
+  "lat_sealed": {
+    "p50": 29.9,
+    "p95": 40.4,
+    "p99": 49.1
+  },
+  "lat_mutable": {
+    "p50": 20.6,
+    "p95": 27.3,
+    "p99": 31.2
+  },
+  "lat_hnsw": {
+    "p50": 67.7,
+    "p99": 86.5
+  },
+  "pyc": {
+    "__init__.py": 1750,
+    "index.py": 54054,
+    "_config_impl.py": 448,
+    "config.py": 12492,
+    "_search_impl.py": 665,
+    "search.py": 525,
+    "preprocessing.py": 21569,
+    "_server_impl.py": 392,
+    "server.py": 374,
+    "_kernels_impl.py": 547,
+    "kernels.py": 535,
+    "multimodal.py": 5239,
+    "main.py": 8085,
+    "models.py": 20462,
+    "service.py": 129015,
+    "routes.py": 14253,
+    "triton_roq.py": 31577,
+    "roq.py": 1239,
+    "triton_maxsim.py": 34714,
+    "maxsim.py": 14458,
+    "search_pipeline.py": 6892,
+    "stateless_optimizer.py": 127313,
+    "rotational.py": 54075,
+    "scalar.py": 12877,
+    "product.py": 17285,
+    "binary.py": 13009,
+    "gem_manager.py": 86369,
+    "gem_wal.py": 21804,
+    "gem_segment_manager.py": 15664,
+    "hybrid_manager.py": 61783,
+    "screening_sidecar.py": 5886,
+    "hnsw_manager.py": 37887,
+    "prototype_screening.py": 50503,
+    "gem_screening.py": 19979,
+    "centroid_screening.py": 38166,
+    "embedder.py": 14441,
+    "feature_bridge.py": 5535,
+    "async_storage.py": 39593,
+    "storage.py": 36919,
+    "hnsw.py": 17545,
+    "neo4j.py": 16381,
+    "bm25s_engine.py": 6046,
+    "bm25.py": 31465,
+    "colpali.py": 81806,
+    "colbert.py": 26427,
+    "base.py": 10763
+  },
+  "rs_files": [
+    "emd.rs",
+    "graph.rs",
+    "id_tracker.rs",
+    "lib.rs",
+    "mutable.rs",
+    "persistence.rs",
+    "search.rs",
+    "visited.rs",
+    "codebook.rs",
+    "lib.rs",
+    "persistence.rs",
+    "router.rs"
+  ],
+  "deps": [
+    "bincode\"",
+    "byteorder\"",
+    "crc32fast\"",
+    "latence-gem-router\"",
+    "memmap2\"",
+    "numpy\"",
+    "parking_lot\"",
+    "proptest\"",
+    "pyo3\"",
+    "rand 0.8.5\"",
+    "rayon\"",
+    "serde\"",
+    "serde_json\"",
+    "tempfile\"",
+    "thiserror\""
+  ],
+  "speedup": 2.3
+}

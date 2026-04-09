@@ -69,8 +69,13 @@ impl IdTracker {
         self.ext_to_int.get(&ext_id).copied()
     }
 
+    #[inline]
     pub fn int_to_ext(&self, int_id: u32) -> u64 {
         self.int_to_ext[int_id as usize]
+    }
+
+    pub fn int_to_ext_checked(&self, int_id: u32) -> Option<u64> {
+        self.int_to_ext.get(int_id as usize).copied()
     }
 
     pub fn deleted_flags(&self) -> &[bool] {

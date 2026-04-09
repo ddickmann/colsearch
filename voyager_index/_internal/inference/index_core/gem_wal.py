@@ -22,10 +22,13 @@ Payload layout:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shutil
 import struct
 import tempfile
+import zlib
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -77,7 +80,8 @@ class WalWriter:
             reader = WalReader(self._path)
             entries = reader.replay()
             self._n_entries = len(entries)
-        except Exception:
+        except Exception as e:
+            logger.warning("WAL entry count failed (treating as 0): %s", e)
             self._n_entries = 0
 
     def _write_entry(self, op: WalOp, external_id: int, vectors: Optional[np.ndarray] = None):
@@ -92,7 +96,6 @@ class WalWriter:
             buf += vectors.astype(np.float32).tobytes()
 
         payload = buf
-        import zlib
         crc = zlib.crc32(payload) & 0xFFFFFFFF
 
         header = struct.pack(HEADER_FMT, WAL_MAGIC, WAL_VERSION, len(payload))
@@ -176,7 +179,6 @@ class WalReader:
                     break
 
                 expected_crc = struct.unpack("<I", crc_bytes)[0]
-                import zlib
                 actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
 
                 if expected_crc != actual_crc:
@@ -245,7 +247,6 @@ class CheckpointManager:
             "n_docs": len(doc_ids),
         }
         meta_path = tmp_dir / "meta.json"
-        import json
         meta_bytes = json.dumps(meta).encode("utf-8")
         with open(meta_path, "wb") as f:
             f.write(meta_bytes)
@@ -264,7 +265,6 @@ class CheckpointManager:
 
         final_dir = self._dir / "current"
         if final_dir.exists():
-            import shutil
             shutil.rmtree(final_dir)
         os.rename(str(tmp_dir), str(final_dir))
 
@@ -278,7 +278,6 @@ class CheckpointManager:
         if not meta_path.exists():
             return None
 
-        import json
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -312,5 +311,4 @@ class CheckpointManager:
     def clear(self):
         current = self._dir / "current"
         if current.exists():
-            import shutil
             shutil.rmtree(current)

@@ -153,8 +153,10 @@ impl MutableGemSegment {
                 idx,
             );
 
+            let doc_codes = self.flat_codes.doc_codes(idx);
             let neighbors = select_neighbors_heuristic(
                 &candidates,
+                doc_codes,
                 self.max_degree,
                 &self.codebook,
                 &self.flat_codes,
@@ -264,10 +266,9 @@ impl MutableGemSegment {
             return Vec::new();
         }
 
-        let empty_shortcuts = vec![Vec::new(); self.adjacency.len()];
         let results = beam_search(
             &self.adjacency,
-            &empty_shortcuts,
+            None,
             &entries,
             query_scores,
             n_query,
@@ -327,6 +328,11 @@ impl MutableGemSegment {
         let codes_bytes = self.flat_codes.codes.len() * 2
             + self.flat_codes.offsets.len() * 4
             + self.flat_codes.lengths.len() * 2;
-        adj_bytes + codes_bytes
+        let vectors_bytes = self.all_vectors.len() * std::mem::size_of::<f32>();
+        let offsets_bytes = self.doc_offsets.len() * std::mem::size_of::<(usize, usize)>();
+        let profiles_bytes = self.doc_profiles.len() * std::mem::size_of::<DocProfile>();
+        let tracker_bytes = self.id_tracker.n_total()
+            * (std::mem::size_of::<u64>() + std::mem::size_of::<bool>() + 16);
+        adj_bytes + codes_bytes + vectors_bytes + offsets_bytes + profiles_bytes + tracker_bytes
     }
 }
