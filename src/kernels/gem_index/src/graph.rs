@@ -127,7 +127,7 @@ pub fn shrink_neighbors(
             (nbr, dist)
         })
         .collect();
-    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+    scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
 
     let kept = select_neighbors_heuristic(&scored, node_codes, max_degree, codebook, flat_codes);
     adjacency[node_idx] = kept.iter().map(|&(idx, _)| idx).collect();
@@ -239,7 +239,7 @@ pub fn bridge_repair(
             _ => continue,
         };
 
-        let members: Vec<u32> = postings.lists[cluster_id].clone();
+        let members = &postings.lists[cluster_id];
         if members.len() <= 1 {
             continue;
         }
@@ -272,7 +272,7 @@ pub fn bridge_repair(
 
         // For each unreachable cluster member, add a bridge edge
         let mut spare_idx = 0;
-        for &member in &members {
+        for &member in members {
             if reachable.contains(&member) {
                 continue;
             }

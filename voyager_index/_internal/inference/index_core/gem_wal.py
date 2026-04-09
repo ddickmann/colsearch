@@ -158,40 +158,44 @@ class WalReader:
         corrupted = 0
 
         with open(self._path, "rb") as fd:
-            while True:
-                header = fd.read(HEADER_SIZE)
-                if len(header) < HEADER_SIZE:
+            file_data = fd.read()
+
+        pos = 0
+        while pos + HEADER_SIZE <= len(file_data):
+            header = file_data[pos : pos + HEADER_SIZE]
+            magic, version, entry_len = struct.unpack(HEADER_FMT, header)
+
+            if magic != WAL_MAGIC or version != WAL_VERSION:
+                corrupted += 1
+                next_pos = file_data.find(WAL_MAGIC, pos + 1)
+                if next_pos == -1:
                     break
+                pos = next_pos
+                continue
 
-                magic, version, entry_len = struct.unpack(HEADER_FMT, header)
-                if magic != WAL_MAGIC or version != WAL_VERSION:
-                    corrupted += 1
+            payload_end = pos + HEADER_SIZE + entry_len
+            crc_end = payload_end + CRC_SIZE
+            if crc_end > len(file_data):
+                corrupted += 1
+                break
+
+            payload = file_data[pos + HEADER_SIZE : payload_end]
+            expected_crc = struct.unpack("<I", file_data[payload_end:crc_end])[0]
+            actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
+
+            if expected_crc != actual_crc:
+                corrupted += 1
+                logger.warning("WAL CRC mismatch at offset %d, scanning for next entry", pos)
+                next_pos = file_data.find(WAL_MAGIC, pos + 1)
+                if next_pos == -1:
                     break
+                pos = next_pos
+                continue
 
-                payload = fd.read(entry_len)
-                if len(payload) < entry_len:
-                    corrupted += 1
-                    break
-
-                crc_bytes = fd.read(CRC_SIZE)
-                if len(crc_bytes) < CRC_SIZE:
-                    corrupted += 1
-                    break
-
-                expected_crc = struct.unpack("<I", crc_bytes)[0]
-                actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
-
-                if expected_crc != actual_crc:
-                    corrupted += 1
-                    logger.warning(
-                        "WAL CRC mismatch at entry %d, skipping rest",
-                        len(entries),
-                    )
-                    break
-
-                entry = self._parse_entry(payload)
-                if entry is not None:
-                    entries.append(entry)
+            entry = self._parse_entry(payload)
+            if entry is not None:
+                entries.append(entry)
+            pos = crc_end
 
         if corrupted > 0:
             logger.warning("WAL replay: %d corrupted entries skipped", corrupted)
@@ -264,9 +268,14 @@ class CheckpointManager:
             np.save(tmp_dir / "vectors.npy", np.zeros((0, 1), dtype=np.float32))
 
         final_dir = self._dir / "current"
+        old_dir = self._dir / ".old"
+        if old_dir.exists():
+            shutil.rmtree(old_dir)
         if final_dir.exists():
-            shutil.rmtree(final_dir)
+            os.rename(str(final_dir), str(old_dir))
         os.rename(str(tmp_dir), str(final_dir))
+        if old_dir.exists():
+            shutil.rmtree(old_dir, ignore_errors=True)
 
     def load(
         self,

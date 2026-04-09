@@ -28,6 +28,10 @@ impl IdTracker {
     }
 
     pub fn add(&mut self, ext_id: u64) -> u32 {
+        assert!(
+            self.int_to_ext.len() < u32::MAX as usize,
+            "IdTracker: exceeded u32::MAX documents"
+        );
         let int_id = self.int_to_ext.len() as u32;
         self.ext_to_int.insert(ext_id, int_id);
         self.int_to_ext.push(ext_id);

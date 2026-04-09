@@ -80,6 +80,7 @@ pub fn save_segment(data: &SegmentData, path: &Path) -> Result<(), PersistError>
         w.write_all(&encoded)?;
         w.write_all(&crc.to_le_bytes())?;
         w.flush()?;
+        w.get_ref().sync_all()?;
     }
     fs::rename(&tmp, path)?;
     Ok(())

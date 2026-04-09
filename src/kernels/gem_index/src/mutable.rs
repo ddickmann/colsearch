@@ -39,7 +39,13 @@ impl MutableGemSegment {
         n_probes: usize,
     ) -> Self {
         let n_docs = doc_ids.len();
+        assert_eq!(n_docs, doc_offsets.len(), "doc_ids and doc_offsets must have the same length");
         let n_vectors = doc_offsets.last().map_or(0, |&(_, e)| e);
+        debug_assert!(
+            all_vectors.len() >= n_vectors * dim,
+            "all_vectors too short: {} < {} * {}",
+            all_vectors.len(), n_vectors, dim,
+        );
 
         let mut codebook = TwoStageCodebook::build(
             all_vectors, n_vectors, dim, n_fine, n_coarse, max_kmeans_iter, 42,

@@ -405,6 +405,7 @@ class GemNativeSegmentManager:
 
         self._load_next_doc_id()
         self._load_deleted_ids()
+        self._load_sealed_deleted_ids()
         self._load_sealed_segments()
         self._load_payloads()
         self._recover_from_wal()
@@ -431,6 +432,17 @@ class GemNativeSegmentManager:
         p = self._shard_path / "deleted_ids.json"
         with open(p, "w") as f:
             json.dump(sorted(self._deleted_ids), f)
+
+    def _load_sealed_deleted_ids(self):
+        p = self._shard_path / "sealed_deleted_ids.json"
+        if p.exists():
+            with open(p) as f:
+                self._sealed_deleted_ids = set(json.load(f))
+
+    def _save_sealed_deleted_ids(self):
+        p = self._shard_path / "sealed_deleted_ids.json"
+        with open(p, "w") as f:
+            json.dump(sorted(self._sealed_deleted_ids), f)
 
     def _load_sealed_segments(self):
         sealed_dir = self._shard_path / "sealed"
@@ -639,21 +651,23 @@ class GemNativeSegmentManager:
         if not filters:
             return True
         payload = self._payloads.get(doc_id, {})
-        return self._check_payload(payload, filters)
+        return self._check_payload(payload, filters, doc_id=doc_id)
 
     @staticmethod
     def _match_filter_snapshot(doc_id: int, filters: Optional[Dict], payloads: Dict) -> bool:
         if not filters:
             return True
         payload = payloads.get(doc_id, {})
-        return GemNativeSegmentManager._check_payload(payload, filters)
+        return GemNativeSegmentManager._check_payload(payload, filters, doc_id=doc_id)
 
     @staticmethod
-    def _check_payload(payload: Dict, filters: Dict) -> bool:
+    def _check_payload(payload: Dict, filters: Dict, doc_id: Optional[int] = None) -> bool:
         """Evaluate Qdrant-compatible filter predicates."""
         for key, condition in filters.items():
             if key == "$has_id":
-                return payload.get("_id") in condition if isinstance(condition, (list, set)) else False
+                if isinstance(condition, (list, set)):
+                    return doc_id in condition if doc_id is not None else False
+                return False
             val = payload.get(key)
             if isinstance(condition, dict):
                 for op, cmp_val in condition.items():
@@ -866,14 +880,22 @@ class GemNativeSegmentManager:
 
     def delete(self, ids: List[int]):
         with self._lock:
+            sealed_id_set = set()
+            for seg_ids in self._sealed_doc_ids:
+                sealed_id_set.update(seg_ids)
+
             for doc_id in ids:
                 if self._wal_writer:
                     self._wal_writer.log_delete(doc_id)
                 self._deleted_ids.add(doc_id)
+                if doc_id in sealed_id_set:
+                    self._sealed_deleted_ids.add(doc_id)
                 if self._active is not None and self._active.is_ready():
                     self._active.delete(doc_id)
                 self._payloads.pop(doc_id, None)
             self._save_deleted_ids()
+            if self._sealed_deleted_ids:
+                self._save_sealed_deleted_ids()
 
     def upsert_payload(self, doc_id: int, payload: Dict[str, Any]):
         with self._lock:
@@ -903,6 +925,7 @@ class GemNativeSegmentManager:
         with self._lock:
             self._save_next_doc_id()
             self._save_deleted_ids()
+            self._save_sealed_deleted_ids()
             self._save_payloads()
             if self._checkpoint_mgr and self._active is not None:
                 try:

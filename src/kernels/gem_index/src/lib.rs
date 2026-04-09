@@ -91,6 +91,11 @@ impl GemSegment {
         if dim == 0 {
             return Err(PyValueError::new_err("dim must be > 0"));
         }
+        if n_docs > u32::MAX as usize {
+            return Err(PyValueError::new_err(format!(
+                "too many documents ({}) — max supported is {}", n_docs, u32::MAX
+            )));
+        }
 
         // Build codebook
         let mut codebook = TwoStageCodebook::build(
@@ -266,6 +271,23 @@ impl GemSegment {
         let inner = self.inner.as_mut().ok_or_else(|| {
             PyValueError::new_err("segment not built")
         })?;
+
+        if max_shortcuts_per_node == 0 {
+            return Ok(());
+        }
+        for (i, (flat, target)) in training_pairs.iter().enumerate() {
+            if flat.len() % inner.dim != 0 {
+                return Err(PyValueError::new_err(format!(
+                    "training_pairs[{}]: flat vector length {} is not a multiple of dim {}",
+                    i, flat.len(), inner.dim
+                )));
+            }
+            if (*target as usize) >= inner.graph.n_nodes() {
+                return Err(PyValueError::new_err(format!(
+                    "training_pairs[{}]: target {} >= n_nodes {}", i, target, inner.graph.n_nodes()
+                )));
+            }
+        }
 
         inner.graph.inject_shortcuts(
             &training_pairs,
