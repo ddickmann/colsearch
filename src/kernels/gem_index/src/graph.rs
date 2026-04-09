@@ -741,6 +741,38 @@ pub fn build_graph_dual(
         }
     }
 
+    // Repair isolated nodes (degree 0): connect to nearest neighbor by brute-force.
+    for doc_idx in 0..n_docs {
+        if !adjacency[doc_idx].is_empty() {
+            continue;
+        }
+        let doc_codes = flat_codes.doc_codes(doc_idx);
+        if doc_codes.is_empty() {
+            continue;
+        }
+        let mut best_nbr = u32::MAX;
+        let mut best_dist = f32::MAX;
+        #[allow(clippy::needless_range_loop)]
+        for other in 0..n_docs {
+            if other == doc_idx || adjacency[other].is_empty() {
+                continue;
+            }
+            let other_codes = flat_codes.doc_codes(other);
+            let d = construction_distance(codebook, doc_codes, other_codes, use_emd);
+            if d < best_dist {
+                best_dist = d;
+                best_nbr = other as u32;
+            }
+        }
+        if best_nbr != u32::MAX {
+            adjacency[doc_idx].push(best_nbr);
+            adjacency[best_nbr as usize].push(doc_idx as u32);
+            if adjacency[best_nbr as usize].len() > max_degree {
+                shrink_neighbors_emd(best_nbr as usize, max_degree, &mut adjacency, codebook, flat_codes, use_emd);
+            }
+        }
+    }
+
     // Safety net: bridge repair for any remaining disconnected components
     bridge_repair_emd(&mut adjacency, max_degree, postings, codebook, flat_codes, use_emd);
 
@@ -896,25 +928,28 @@ pub fn update_bridges(
         all_candidates.push((nbr, dist));
     }
 
-    // Add new neighbors (avoid duplicates)
-    for &(nbr, score) in new_neighbors {
+    // Add new neighbors (avoid duplicates), re-scoring with the construction metric
+    // to ensure consistent distance comparison (beam_search uses qCH, not qEMD).
+    for &(nbr, _) in new_neighbors {
         if nbr as usize != doc_idx && !old_neighbors.contains(&nbr) {
-            all_candidates.push((nbr, score));
+            let nbr_codes = flat_codes.doc_codes(nbr as usize);
+            let dist = construction_distance(codebook, doc_codes, nbr_codes, use_emd);
+            all_candidates.push((nbr, dist));
         }
     }
 
     // Step 2: If within budget, just merge
     if all_candidates.len() <= max_degree {
-        // Remove old reverse edges
         for &old_nbr in &old_neighbors {
             adjacency[old_nbr as usize].retain(|&x| x != doc_idx as u32);
         }
-        // Set new adjacency
         adjacency[doc_idx] = all_candidates.iter().map(|&(id, _)| id).collect();
-        // Add reverse edges
         for &(nbr, _) in &all_candidates {
             if !adjacency[nbr as usize].contains(&(doc_idx as u32)) {
                 adjacency[nbr as usize].push(doc_idx as u32);
+                if adjacency[nbr as usize].len() > max_degree {
+                    shrink_neighbors_emd(nbr as usize, max_degree, adjacency, codebook, flat_codes, use_emd);
+                }
             }
         }
         return;
@@ -924,35 +959,43 @@ pub fn update_bridges(
     all_candidates.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
     let mut selected: Vec<(u32, f32)> = all_candidates.iter().take(max_degree).cloned().collect();
 
-    // Step 4: Enforce cross-cluster constraint
-    // For each cluster in ctop(doc), ensure at least one neighbor from that cluster
+    // Step 4: Enforce cross-cluster constraint (iterated to convergence)
+    // Iterate up to |ctop| times since replacing for cluster A can evict the only
+    // neighbor covering cluster B.
     if doc_idx < doc_profiles.len() {
         let ctop = &doc_profiles[doc_idx].ctop;
+        let max_passes = ctop.len();
 
-        for &cluster_id in ctop {
-            let cluster_members: std::collections::HashSet<u32> = postings_members_for_cluster(
-                doc_profiles, cluster_id,
-            );
+        for _ in 0..max_passes {
+            let mut any_replaced = false;
+            for &cluster_id in ctop {
+                let has_cluster_neighbor = selected.iter().any(|&(nbr, _)| {
+                    let nbr_idx = nbr as usize;
+                    nbr_idx < doc_profiles.len()
+                        && doc_profiles[nbr_idx].ctop.contains(&cluster_id)
+                });
 
-            let has_cluster_neighbor = selected.iter().any(|&(nbr, _)| {
-                cluster_members.contains(&nbr)
-            });
-
-            if !has_cluster_neighbor {
-                // Find closest candidate from this cluster in all_candidates
-                if let Some(&(bridge_nbr, bridge_dist)) = all_candidates.iter().find(|&&(nbr, _)| {
-                    cluster_members.contains(&nbr) && nbr as usize != doc_idx
-                }) {
-                    // Replace the farthest selected neighbor
-                    if let Some(farthest_idx) = selected
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                        .map(|(i, _)| i)
-                    {
-                        selected[farthest_idx] = (bridge_nbr, bridge_dist);
+                if !has_cluster_neighbor {
+                    if let Some(&(bridge_nbr, bridge_dist)) = all_candidates.iter().find(|&&(nbr, _)| {
+                        let ni = nbr as usize;
+                        ni != doc_idx
+                            && ni < doc_profiles.len()
+                            && doc_profiles[ni].ctop.contains(&cluster_id)
+                    }) {
+                        if let Some(farthest_idx) = selected
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                            .map(|(i, _)| i)
+                        {
+                            selected[farthest_idx] = (bridge_nbr, bridge_dist);
+                            any_replaced = true;
+                        }
                     }
                 }
+            }
+            if !any_replaced {
+                break;
             }
         }
     }
@@ -972,16 +1015,161 @@ pub fn update_bridges(
     }
 }
 
-/// Helper: find documents that have `cluster_id` in their ctop.
-fn postings_members_for_cluster(
-    doc_profiles: &[DocProfile],
-    cluster_id: u32,
-) -> std::collections::HashSet<u32> {
-    let mut members = std::collections::HashSet::new();
-    for (i, p) in doc_profiles.iter().enumerate() {
-        if p.ctop.contains(&cluster_id) {
-            members.insert(i as u32);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
+    use latence_gem_router::codebook::{TwoStageCodebook, compute_ctop};
+    use latence_gem_router::router::{FlatDocCodes, DocProfile, ClusterPostings};
+
+    fn setup_test_data(n_docs: usize, tokens_per_doc: usize) -> (
+        Vec<f32>, usize, Vec<(usize, usize)>, TwoStageCodebook,
+        FlatDocCodes, Vec<DocProfile>, ClusterPostings, Vec<u64>,
+    ) {
+        let dim = 8;
+        let n_fine = 8;
+        let n_coarse = 4;
+        let ctop_r = 2;
+        let mut rng = StdRng::seed_from_u64(42);
+        let n_vectors = n_docs * tokens_per_doc;
+        let all_vectors: Vec<f32> = (0..n_vectors * dim)
+            .map(|_| rng.gen::<f32>() - 0.5)
+            .collect();
+        let doc_offsets: Vec<(usize, usize)> = (0..n_docs)
+            .map(|i| (i * tokens_per_doc, (i + 1) * tokens_per_doc))
+            .collect();
+        let doc_ids: Vec<u64> = (0..n_docs as u64).collect();
+
+        let codebook = TwoStageCodebook::build(
+            &all_vectors, n_vectors, dim, n_fine, n_coarse, 10, 42,
+        );
+        let all_assignments = codebook.assign_vectors(&all_vectors, n_vectors);
+
+        let mut doc_centroid_sets = Vec::with_capacity(n_docs);
+        for &(start, end) in &doc_offsets {
+            doc_centroid_sets.push(all_assignments[start..end].to_vec());
+        }
+
+        let mut flat_codes = FlatDocCodes::new();
+        let mut doc_profiles = Vec::with_capacity(n_docs);
+        let mut postings = ClusterPostings::new(n_coarse);
+        for (doc_idx, cids) in doc_centroid_sets.into_iter().enumerate() {
+            let ctop = compute_ctop(&codebook, &cids, ctop_r);
+            postings.add_doc(doc_idx as u32, &ctop);
+            flat_codes.add_doc(&cids);
+            doc_profiles.push(DocProfile {
+                centroid_ids: cids,
+                ctop,
+            });
+        }
+
+        (all_vectors, dim, doc_offsets, codebook, flat_codes, doc_profiles, postings, doc_ids)
+    }
+
+    #[test]
+    fn test_build_graph_basic() {
+        let (vecs, dim, offsets, cb, fc, dp, post, _) = setup_test_data(20, 5);
+        let graph = build_graph(&vecs, dim, &offsets, &cb, &fc, &dp, &post, 8, 32);
+        assert_eq!(graph.n_nodes(), 20);
+        assert!(graph.n_edges() > 0, "graph should have edges");
+        assert!(graph.levels.len() >= 1);
+        for i in 0..20 {
+            let nbrs = graph.levels[0].neighbors(i);
+            assert!(nbrs.len() <= 8, "node {} has {} neighbors > max_degree 8", i, nbrs.len());
         }
     }
-    members
+
+    #[test]
+    fn test_build_graph_single_doc() {
+        let (vecs, dim, offsets, cb, fc, dp, post, _) = setup_test_data(1, 5);
+        let graph = build_graph(&vecs, dim, &offsets, &cb, &fc, &dp, &post, 8, 32);
+        assert_eq!(graph.n_nodes(), 1);
+    }
+
+    #[test]
+    fn test_build_graph_with_payload() {
+        let (vecs, dim, offsets, cb, fc, dp, post, _) = setup_test_data(20, 5);
+        let payload: Vec<u32> = (0..20).map(|i| (i % 3) as u32).collect();
+        let graph = build_graph_with_payload(
+            &vecs, dim, &offsets, &cb, &fc, &dp, &post, 8, 32,
+            Some(&payload), false,
+        );
+        assert_eq!(graph.n_nodes(), 20);
+        assert!(graph.n_edges() > 0);
+    }
+
+    #[test]
+    fn test_build_graph_dual_basic() {
+        let (vecs, dim, offsets, cb, fc, dp, post, _) = setup_test_data(20, 5);
+        let graph = build_graph_dual(
+            &vecs, dim, &offsets, &cb, &fc, &dp, &post, 8, 32, false,
+        );
+        assert_eq!(graph.n_nodes(), 20);
+        assert!(graph.n_edges() > 0, "dual graph should have edges");
+        for i in 0..20 {
+            let nbrs = graph.levels[0].neighbors(i);
+            assert!(nbrs.len() <= 8, "node {} has {} neighbors > max_degree 8", i, nbrs.len());
+        }
+    }
+
+    #[test]
+    fn test_build_graph_dual_with_emd() {
+        let (vecs, dim, offsets, cb, fc, dp, post, _) = setup_test_data(10, 4);
+        let graph = build_graph_dual(
+            &vecs, dim, &offsets, &cb, &fc, &dp, &post, 6, 16, true,
+        );
+        assert_eq!(graph.n_nodes(), 10);
+        assert!(graph.n_edges() > 0);
+    }
+
+    #[test]
+    fn test_heuristic_emd_vs_ch() {
+        let (vecs, dim, offsets, cb, fc, dp, post, _) = setup_test_data(15, 5);
+        let graph_ch = build_graph_with_payload(
+            &vecs, dim, &offsets, &cb, &fc, &dp, &post, 8, 32, None, false,
+        );
+        let graph_emd = build_graph_with_payload(
+            &vecs, dim, &offsets, &cb, &fc, &dp, &post, 8, 32, None, true,
+        );
+        assert_eq!(graph_ch.n_nodes(), graph_emd.n_nodes());
+        assert!(graph_ch.n_edges() > 0);
+        assert!(graph_emd.n_edges() > 0);
+    }
+
+    #[test]
+    fn test_update_bridges_degree_limit() {
+        let (_vecs, _dim, _offsets, cb, fc, dp, _post, _) = setup_test_data(20, 5);
+        let max_degree = 4;
+        let mut adjacency: Vec<Vec<u32>> = vec![Vec::new(); 20];
+        adjacency[0] = vec![1, 2, 3, 4];
+        adjacency[1] = vec![0];
+        adjacency[2] = vec![0];
+        adjacency[3] = vec![0];
+        adjacency[4] = vec![0];
+
+        let new_neighbors: Vec<(u32, f32)> = vec![(5, 0.5), (6, 0.6), (7, 0.7)];
+        update_bridges(0, &new_neighbors, &mut adjacency, &dp, max_degree, &cb, &fc, false);
+
+        assert!(
+            adjacency[0].len() <= max_degree,
+            "node 0 has {} neighbors > max_degree {}", adjacency[0].len(), max_degree
+        );
+    }
+
+    #[test]
+    fn test_csr_roundtrip() {
+        let adj = vec![
+            vec![1u32, 2],
+            vec![0, 2],
+            vec![0, 1],
+        ];
+        let csr = CsrAdjacency::from_adj_lists(&adj);
+        assert_eq!(csr.n_nodes(), 3);
+        assert_eq!(csr.neighbors(0), &[1, 2]);
+        assert_eq!(csr.neighbors(1), &[0, 2]);
+        assert_eq!(csr.neighbors(2), &[0, 1]);
+        let restored = csr.to_adj_lists();
+        assert_eq!(restored, adj);
+    }
 }

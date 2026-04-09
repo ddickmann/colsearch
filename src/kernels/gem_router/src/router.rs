@@ -375,11 +375,14 @@ impl GemRouter {
     ) -> Option<crate::adaptive_cutoff::CutoffTree> {
         let state = self.state.as_ref()?;
         let n_pairs = training_positives.len();
-        if n_pairs == 0 {
+        if n_pairs == 0 || n_query_vecs.len() != n_pairs {
+            return None;
+        }
+        let expected_q_len: usize = n_query_vecs.iter().sum::<usize>() * state.codebook.dim;
+        if training_queries.len() < expected_q_len {
             return None;
         }
 
-        // Build query top-clusters for each pair
         let mut query_top_clusters: Vec<Vec<u32>> = Vec::with_capacity(n_pairs);
         let mut offset = 0usize;
         for &nq in n_query_vecs {
@@ -461,7 +464,7 @@ impl GemRouter {
             })
             .collect();
 
-        let doc_features = crate::adaptive_cutoff::build_doc_features(
+        let (doc_features, len_normalizer) = crate::adaptive_cutoff::build_doc_features(
             &cluster_scores,
             &doc_lengths,
             r_max,
@@ -472,6 +475,7 @@ impl GemRouter {
             &labels,
             max_depth,
             r_max,
+            len_normalizer,
         ))
     }
 }

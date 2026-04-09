@@ -36,6 +36,9 @@ pub enum TreeNode {
 pub struct CutoffTree {
     pub nodes: Vec<TreeNode>,
     pub r_max: usize,
+    /// Document-length normalizer used during training (max doc length in batch).
+    /// Inference must use the same divisor for feature consistency.
+    pub len_normalizer: f32,
 }
 
 impl CutoffTree {
@@ -45,12 +48,20 @@ impl CutoffTree {
     /// - `labels`: &[usize] — target r value per sample
     /// - `max_depth`: tree depth limit (recommended: 6-8)
     /// - `r_max`: maximum cutoff value
-    pub fn train(features: &[Vec<f32>], labels: &[usize], max_depth: usize, r_max: usize) -> Self {
+    pub fn train(
+        features: &[Vec<f32>],
+        labels: &[usize],
+        max_depth: usize,
+        r_max: usize,
+        len_normalizer: f32,
+    ) -> Self {
         assert_eq!(features.len(), labels.len());
+        let len_normalizer = if len_normalizer > 0.0 { len_normalizer } else { 1.0 };
         if features.is_empty() {
             return Self {
                 nodes: vec![TreeNode::Leaf { value: r_max.max(1) }],
                 r_max,
+                len_normalizer,
             };
         }
 
@@ -73,7 +84,7 @@ impl CutoffTree {
             nodes.push(TreeNode::Leaf { value: majority_label(labels, &indices) });
         }
 
-        Self { nodes, r_max }
+        Self { nodes, r_max, len_normalizer }
     }
 
     /// Predict the cluster cutoff r for a document given its feature vector.
@@ -99,8 +110,8 @@ impl CutoffTree {
     }
 
     /// Serialize to bytes for persistence.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
     }
 
     /// Deserialize from bytes.
@@ -273,10 +284,10 @@ pub fn build_doc_features(
     cluster_scores: &[Vec<f32>],
     doc_lengths: &[usize],
     r_max: usize,
-) -> Vec<Vec<f32>> {
+) -> (Vec<Vec<f32>>, f32) {
     let max_len = doc_lengths.iter().copied().max().unwrap_or(1).max(1) as f32;
 
-    cluster_scores
+    let features = cluster_scores
         .iter()
         .zip(doc_lengths.iter())
         .map(|(scores, &len)| {
@@ -289,7 +300,8 @@ pub fn build_doc_features(
             feat[r_max] = len as f32 / max_len;
             feat
         })
-        .collect()
+        .collect();
+    (features, max_len)
 }
 
 /// Compute training labels for the adaptive cutoff tree.
@@ -331,7 +343,7 @@ mod tests {
             .map(|i| if i <= 10 { 1 } else { 2 })
             .collect();
 
-        let tree = CutoffTree::train(&features, &labels, 4, 5);
+        let tree = CutoffTree::train(&features, &labels, 4, 5, 1.0);
         assert_eq!(tree.predict(&[3.0, 0.5]), 1);
         assert_eq!(tree.predict(&[15.0, 0.5]), 2);
     }
@@ -340,13 +352,13 @@ mod tests {
     fn test_single_class() {
         let features = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
         let labels = vec![3, 3];
-        let tree = CutoffTree::train(&features, &labels, 4, 5);
+        let tree = CutoffTree::train(&features, &labels, 4, 5, 1.0);
         assert_eq!(tree.predict(&[0.0, 0.0]), 3);
     }
 
     #[test]
     fn test_empty_training() {
-        let tree = CutoffTree::train(&[], &[], 4, 5);
+        let tree = CutoffTree::train(&[], &[], 4, 5, 1.0);
         assert_eq!(tree.predict(&[0.0]), 5);
     }
 
@@ -359,8 +371,8 @@ mod tests {
             .map(|i| if i < 5 { 1 } else { 2 })
             .collect();
 
-        let tree = CutoffTree::train(&features, &labels, 3, 4);
-        let bytes = tree.to_bytes();
+        let tree = CutoffTree::train(&features, &labels, 3, 4, 1.0);
+        let bytes = tree.to_bytes().expect("serialization should succeed");
         let restored = CutoffTree::from_bytes(&bytes).unwrap();
         assert_eq!(tree.predict(&[2.0]), restored.predict(&[2.0]));
         assert_eq!(tree.predict(&[8.0]), restored.predict(&[8.0]));
@@ -373,11 +385,12 @@ mod tests {
             vec![0.8, 0.1, 0.05, 0.02],
         ];
         let lengths = vec![10, 50];
-        let feats = build_doc_features(&scores, &lengths, 3);
+        let (feats, normalizer) = build_doc_features(&scores, &lengths, 3);
         assert_eq!(feats.len(), 2);
-        assert_eq!(feats[0].len(), 4); // r_max=3, plus 1 for length
+        assert_eq!(feats[0].len(), 4);
         assert!((feats[0][3] - 0.2).abs() < 1e-5); // 10/50
         assert!((feats[1][3] - 1.0).abs() < 1e-5); // 50/50
+        assert!((normalizer - 50.0).abs() < 1e-5);
     }
 
     #[test]
@@ -387,5 +400,31 @@ mod tests {
         let labels = compute_training_labels(&q_clusters, &d_clusters, 5);
         assert_eq!(labels[0], 2); // cluster 1 at rank 1 (0-indexed)
         assert_eq!(labels[1], 3); // cluster 5 at rank 2
+    }
+
+    #[test]
+    fn test_single_sample_tree() {
+        let features = vec![vec![1.0, 2.0, 0.5]];
+        let labels = vec![2];
+        let tree = CutoffTree::train(&features, &labels, 4, 5, 1.0);
+        assert_eq!(tree.predict(&[1.0, 2.0, 0.5]), 2);
+        assert_eq!(tree.predict(&[0.0, 0.0, 0.0]), 2);
+    }
+
+    #[test]
+    fn test_mismatched_features_predict() {
+        let features: Vec<Vec<f32>> = (0..20)
+            .map(|i| vec![i as f32, (20 - i) as f32, 0.5])
+            .collect();
+        let labels: Vec<usize> = (0..20)
+            .map(|i| if i < 10 { 1 } else { 2 })
+            .collect();
+        let tree = CutoffTree::train(&features, &labels, 4, 5, 1.0);
+        // Shorter feature vector - should not panic
+        let result = tree.predict(&[5.0]);
+        assert!(result == 1 || result == 2, "should predict valid class");
+        // Longer feature vector - should not panic
+        let result = tree.predict(&[5.0, 15.0, 0.5, 99.0, 100.0]);
+        assert!(result == 1 || result == 2, "should predict valid class");
     }
 }

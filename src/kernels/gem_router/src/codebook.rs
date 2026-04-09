@@ -504,7 +504,7 @@ pub fn compute_ctop_adaptive(
     for (i, &(_, score)) in indexed.iter().take(r_max).enumerate() {
         features[i] = score;
     }
-    features[r_max] = centroid_ids.len() as f32 / 128.0; // normalize by typical doc length
+    features[r_max] = centroid_ids.len() as f32 / tree.len_normalizer;
 
     let predicted_r = tree.predict(&features).max(1).min(indexed.len());
 
@@ -758,5 +758,25 @@ mod tests {
         assert_eq!(cluster_overlap(&[0, 1, 2], &[1, 3]), 1);
         assert_eq!(cluster_overlap(&[0, 1, 2], &[0, 1, 2]), 3);
         assert_eq!(cluster_overlap(&[0], &[1]), 0);
+    }
+
+    #[test]
+    fn test_compute_ctop_adaptive_basic() {
+        use crate::adaptive_cutoff::CutoffTree;
+        let dim = 8;
+        let n = 30;
+        let mut rng = StdRng::seed_from_u64(42);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+        let cb = TwoStageCodebook::build(&data, n, dim, 8, 4, 10, 42);
+        let assignments = cb.assign_vectors(&data, n);
+        let centroid_ids: Vec<u32> = assignments[0..10].to_vec();
+        let r_max = 3;
+        // Train a trivial tree
+        let features = vec![vec![0.5, 0.3, 0.1, 0.5]; 5];
+        let labels = vec![2; 5];
+        let tree = CutoffTree::train(&features, &labels, 3, r_max, 50.0);
+        let result = compute_ctop_adaptive(&cb, &centroid_ids, &tree, r_max);
+        assert!(!result.is_empty(), "should return at least 1 cluster");
+        assert!(result.len() <= r_max, "should not exceed r_max");
     }
 }

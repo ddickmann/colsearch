@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use latence_gem_router::codebook::TwoStageCodebook;
 
 use crate::network_simplex::emd_sinkhorn;
@@ -125,22 +123,29 @@ fn max_ip_from_row(dists: &[f32], row_base: usize, codes_b: &[u16], n_fine: usiz
     max_ip
 }
 
-/// Build a normalized histogram from centroid codes.
+/// Build a normalized histogram from centroid codes using direct Vec indexing.
 /// Returns (unique_ids, weights) where weights sum to 1.0.
 fn build_histogram(codes: &[u16], n_fine: usize) -> (Vec<u16>, Vec<f64>) {
-    let mut counts: HashMap<u16, u32> = HashMap::with_capacity(codes.len().min(n_fine));
+    let mut counts = vec![0u32; n_fine];
+    let mut total = 0u32;
     for &c in codes {
         if (c as usize) < n_fine {
-            *counts.entry(c).or_insert(0) += 1;
+            counts[c as usize] += 1;
+            total += 1;
         }
     }
-    let total = counts.values().sum::<u32>() as f64;
-    if total == 0.0 {
+    if total == 0 {
         return (Vec::new(), Vec::new());
     }
-    let mut ids: Vec<u16> = counts.keys().copied().collect();
-    ids.sort_unstable();
-    let weights: Vec<f64> = ids.iter().map(|id| counts[id] as f64 / total).collect();
+    let inv_total = 1.0 / total as f64;
+    let mut ids = Vec::new();
+    let mut weights = Vec::new();
+    for (i, &c) in counts.iter().enumerate() {
+        if c > 0 {
+            ids.push(i as u16);
+            weights.push(c as f64 * inv_total);
+        }
+    }
     (ids, weights)
 }
 
@@ -188,9 +193,10 @@ pub fn qemd_between_docs(
         }
     }
 
-    // Sinkhorn with high regularization (lambda=100) and 200 iterations gives
-    // near-exact EMD while being inherently symmetric and robust.
-    let result = emd_sinkhorn(&weights_a, &weights_b, &cost_matrix, 100.0, 200);
+    // Log-domain Sinkhorn with lambda=20 and early stopping (tol=1e-6, max 100 iters).
+    // Lambda=20 provides sufficient ranking accuracy for neighbor selection during
+    // graph construction while converging ~3-5x faster than lambda=100.
+    let result = emd_sinkhorn(&weights_a, &weights_b, &cost_matrix, 20.0, 100);
     result as f32
 }
 
@@ -386,5 +392,63 @@ mod tests {
         let ch = construction_distance(&cb, &a, &b, false);
         assert!(emd > 0.0, "qEMD should be positive: {emd}");
         assert!(ch > 0.0, "qCH should be positive: {ch}");
+    }
+
+    fn make_test_codebook() -> (TwoStageCodebook, Vec<u32>) {
+        let dim = 8;
+        let n = 40;
+        let mut rng = StdRng::seed_from_u64(99);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+        let cb = TwoStageCodebook::build(&data, n, dim, 8, 4, 10, 42);
+        let assignments = cb.assign_vectors(&data, n);
+        (cb, assignments)
+    }
+
+    #[test]
+    fn test_qemd_empty_codes() {
+        let (cb, assignments) = make_test_codebook();
+        let codes: Vec<u16> = assignments[0..5].iter().map(|&c| c as u16).collect();
+        assert_eq!(qemd_between_docs(&cb, &[], &codes), f32::MAX);
+        assert_eq!(qemd_between_docs(&cb, &codes, &[]), f32::MAX);
+        assert_eq!(qch_proxy_between_docs(&cb, &[], &codes), f32::MAX);
+    }
+
+    #[test]
+    fn test_qemd_single_code() {
+        let (cb, assignments) = make_test_codebook();
+        let a: Vec<u16> = vec![assignments[0] as u16];
+        let b: Vec<u16> = vec![assignments[5] as u16];
+        let dist = qemd_between_docs(&cb, &a, &b);
+        assert!(dist >= 0.0 && dist.is_finite(), "single-code qEMD should be finite: {dist}");
+    }
+
+    #[test]
+    fn test_qemd_all_same_codes() {
+        let (cb, _) = make_test_codebook();
+        let codes = vec![3u16; 10];
+        let dist = qemd_between_docs(&cb, &codes, &codes);
+        assert!(dist < 1e-4, "identical repeated codes should have ~0 qEMD: {dist}");
+    }
+
+    #[test]
+    fn test_qemd_large_n_fine_boundary() {
+        let (cb, _) = make_test_codebook();
+        let n = cb.n_fine;
+        let valid: Vec<u16> = vec![(n - 1) as u16; 5];
+        let invalid: Vec<u16> = vec![n as u16; 5];
+        let dist_valid = qemd_between_docs(&cb, &valid, &valid);
+        assert!(dist_valid.is_finite(), "valid boundary codes should work");
+        let dist_invalid = qemd_between_docs(&cb, &invalid, &valid);
+        assert_eq!(dist_invalid, f32::MAX, "all-invalid codes should return MAX");
+    }
+
+    #[test]
+    fn test_construction_distance_max_passthrough() {
+        let (cb, assignments) = make_test_codebook();
+        let codes: Vec<u16> = assignments[0..5].iter().map(|&c| c as u16).collect();
+        assert_eq!(construction_distance(&cb, &[], &codes, true), f32::MAX);
+        assert_eq!(construction_distance(&cb, &[], &codes, false), f32::MAX);
+        assert_eq!(construction_distance(&cb, &codes, &[], true), f32::MAX);
+        assert_eq!(construction_distance(&cb, &codes, &[], false), f32::MAX);
     }
 }

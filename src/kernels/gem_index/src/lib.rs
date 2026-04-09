@@ -61,7 +61,7 @@ impl GemSegment {
     ///   payload_clusters: optional per-doc cluster IDs for payload-aware construction
     ///   use_emd: use qEMD (Earth Mover's Distance) for graph construction instead of qCH
     ///   dual_graph: use per-cluster dual-graph construction (GEM paper Algorithm 1)
-    #[pyo3(signature = (all_vectors, doc_ids, doc_offsets, n_fine = 256, n_coarse = 32, max_degree = 32, ef_construction = 200, max_kmeans_iter = 30, ctop_r = 3, payload_clusters = None, use_emd = true, dual_graph = true))]
+    #[pyo3(signature = (all_vectors, doc_ids, doc_offsets, n_fine = 256, n_coarse = 32, max_degree = 32, ef_construction = 200, max_kmeans_iter = 30, ctop_r = 3, payload_clusters = None, use_emd = false, dual_graph = false))]
     fn build(
         &mut self,
         py: Python<'_>,
@@ -106,6 +106,12 @@ impl GemSegment {
             return Err(PyValueError::new_err(format!(
                 "too many documents ({}) — max supported is {}", n_docs, u32::MAX
             )));
+        }
+        if dual_graph && payload_clusters.is_some() {
+            return Err(PyValueError::new_err(
+                "dual_graph=True and payload_clusters are mutually exclusive: \
+                 dual-graph uses the router's cluster postings, not external payload clusters"
+            ));
         }
 
         let sealed = py.allow_threads(move || {
@@ -536,6 +542,11 @@ impl PyMutableGemSegment {
             return Err(PyValueError::new_err(format!(
                 "doc_ids length ({}) != doc_offsets length ({})",
                 n_docs, doc_offsets.len()
+            )));
+        }
+        if n_docs > u32::MAX as usize {
+            return Err(PyValueError::new_err(format!(
+                "too many documents ({}) — max supported is {}", n_docs, u32::MAX
             )));
         }
         for (i, &(start, end)) in doc_offsets.iter().enumerate() {

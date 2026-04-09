@@ -294,7 +294,10 @@ impl PyGemRouter {
             max_depth,
         ).ok_or_else(|| PyValueError::new_err("training failed: no state or no pairs"))?;
 
-        Ok(tree.to_bytes())
+        let bytes = tree.to_bytes().map_err(|e| {
+            PyValueError::new_err(format!("serialization failed: {e}"))
+        })?;
+        Ok(bytes)
     }
 }
 
