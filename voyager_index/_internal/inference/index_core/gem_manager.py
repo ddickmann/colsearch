@@ -33,14 +33,14 @@ except ImportError:
     HnswSegmentManager = None
 
 try:
-    from .gem_wal import WalWriter, WalReader, CheckpointManager
+    from .gem_wal import CheckpointManager, WalReader, WalWriter
 except ImportError:
     WalWriter = None
     WalReader = None
     CheckpointManager = None
 
 try:
-    from .io_utils import atomic_json_write, FileLock, RWLock
+    from .io_utils import FileLock, RWLock, atomic_json_write
 except ImportError:
     atomic_json_write = None
     FileLock = None
@@ -238,6 +238,19 @@ class GemHybridSegmentManager:
     ) -> List[Tuple[int, float]]:
         with self._lock:
             all_results: Dict[int, float] = {}
+
+            if self._active is not None:
+                try:
+                    active_raw = self._active.search(
+                        query_vectors.astype(np.float32), k=k, ef=ef,
+                    )
+                    for doc_id, score in active_raw:
+                        sim = 1.0 / (1.0 + max(score, 0.0))
+                        if doc_id not in self._deleted_ids:
+                            if doc_id not in all_results or sim > all_results[doc_id]:
+                                all_results[doc_id] = sim
+                except Exception as e:
+                    logger.debug("Active HNSW search error (may be empty): %s", e)
 
             for seg, seg_ids in zip(self._sealed_segments, self._sealed_doc_ids):
                 raw = seg.search(query_vectors.astype(np.float32), k=k, ef=ef, n_probes=n_probes)
@@ -570,17 +583,26 @@ class GemNativeSegmentManager:
         if self._wal_writer and WalReader is not None:
             reader = WalReader(self._shard_path / "wal.bin")
             entries = reader.replay()
+            checkpoint_ids = set(self._seed_buffer_ids)
             for entry in entries:
                 from .gem_wal import WalOp
                 if entry.op == WalOp.INSERT and entry.vectors is not None:
-                    self._seed_buffer_vecs.append(entry.vectors)
-                    self._seed_buffer_ids.append(entry.external_id)
+                    if entry.external_id not in checkpoint_ids:
+                        self._seed_buffer_vecs.append(entry.vectors)
+                        self._seed_buffer_ids.append(entry.external_id)
+                        checkpoint_ids.add(entry.external_id)
+                    if entry.payload is not None:
+                        self._payloads[entry.external_id] = entry.payload
                 elif entry.op == WalOp.DELETE:
                     self._deleted_ids.add(entry.external_id)
                 elif entry.op == WalOp.UPSERT and entry.vectors is not None:
                     self._deleted_ids.discard(entry.external_id)
-                    self._seed_buffer_vecs.append(entry.vectors)
-                    self._seed_buffer_ids.append(entry.external_id)
+                    if entry.external_id not in checkpoint_ids:
+                        self._seed_buffer_vecs.append(entry.vectors)
+                        self._seed_buffer_ids.append(entry.external_id)
+                        checkpoint_ids.add(entry.external_id)
+                    if entry.payload is not None:
+                        self._payloads[entry.external_id] = entry.payload
                 elif entry.op == WalOp.UPDATE_PAYLOAD and entry.payload is not None:
                     self._payloads[entry.external_id] = entry.payload
 
@@ -648,6 +670,14 @@ class GemNativeSegmentManager:
         self._seed_buffer_vecs.clear()
         self._seed_buffer_ids.clear()
 
+    def allocate_ids(self, n: int) -> List[int]:
+        """Atomically allocate n sequential document IDs."""
+        ctx = self._rwlock.write_lock() if self._rwlock else self._lock
+        with ctx:
+            start = self._next_doc_id
+            self._next_doc_id += n
+            return list(range(start, start + n))
+
     def _start_compaction_thread(self):
         if self._compaction_interval_s <= 0:
             return
@@ -688,10 +718,11 @@ class GemNativeSegmentManager:
             for i, doc_id in enumerate(ids):
                 vecs = vectors[i].astype(np.float32)
 
+                doc_payload = payloads[i] if payloads else {}
                 if self._wal_writer:
-                    self._wal_writer.log_insert(doc_id, vecs)
+                    self._wal_writer.log_insert(doc_id, vecs, doc_payload)
 
-                self._payloads[doc_id] = (payloads[i] if payloads else {})
+                self._payloads[doc_id] = doc_payload
                 self._next_doc_id = max(self._next_doc_id, doc_id + 1)
 
                 if self._active is not None and self._active.is_ready():
@@ -905,14 +936,16 @@ class GemNativeSegmentManager:
         queries: List[np.ndarray],
         k: int = 10,
         ef: int = 100,
+        n_probes: Optional[int] = None,
     ) -> List[List[Tuple[int, float]]]:
         """Batch search across all segments using parallel Rust execution."""
+        n_probes = n_probes if n_probes is not None else self._n_probes
         ctx = self._rwlock.read_lock() if self._rwlock else self._lock
         with ctx:
             all_query_results: List[List[Tuple[int, float]]] = [[] for _ in queries]
 
             for seg in self._sealed_segments:
-                batch_results = seg.search_batch(queries, k=k, ef=ef, n_probes=self._n_probes)
+                batch_results = seg.search_batch(queries, k=k, ef=ef, n_probes=n_probes)
                 for qi, res in enumerate(batch_results):
                     for doc_id, score in self._gem_to_similarity(res):
                         if doc_id not in self._deleted_ids and doc_id not in self._sealed_deleted_ids:
@@ -1032,26 +1065,27 @@ class GemNativeSegmentManager:
             self._checkpoint_mgr.clear()
 
     def _collect_all_active_docs(self):
-        """Collect all live document vectors from WAL replay for sealing."""
-        if not self._wal_writer or WalReader is None:
-            return self._seed_buffer_vecs[:], self._seed_buffer_ids[:]
-
-        reader = WalReader(self._shard_path / "wal.bin")
-        entries = reader.replay()
-
+        """Collect all live document vectors from seed buffer + WAL for sealing."""
         live_docs = {}
-        for entry in entries:
-            from .gem_wal import WalOp
-            if entry.op == WalOp.INSERT and entry.vectors is not None:
-                if entry.external_id not in self._deleted_ids:
-                    live_docs[entry.external_id] = entry.vectors
-            elif entry.op == WalOp.DELETE:
-                live_docs.pop(entry.external_id, None)
-            elif entry.op == WalOp.UPSERT and entry.vectors is not None:
-                if entry.external_id not in self._deleted_ids:
-                    live_docs[entry.external_id] = entry.vectors
-                else:
+        for doc_id, vec in zip(self._seed_buffer_ids, self._seed_buffer_vecs):
+            if doc_id not in self._deleted_ids:
+                live_docs[doc_id] = vec
+
+        if self._wal_writer and WalReader is not None:
+            reader = WalReader(self._shard_path / "wal.bin")
+            entries = reader.replay()
+            for entry in entries:
+                from .gem_wal import WalOp
+                if entry.op == WalOp.INSERT and entry.vectors is not None:
+                    if entry.external_id not in self._deleted_ids:
+                        live_docs[entry.external_id] = entry.vectors
+                elif entry.op == WalOp.DELETE:
                     live_docs.pop(entry.external_id, None)
+                elif entry.op == WalOp.UPSERT and entry.vectors is not None:
+                    if entry.external_id not in self._deleted_ids:
+                        live_docs[entry.external_id] = entry.vectors
+                    else:
+                        live_docs.pop(entry.external_id, None)
 
         ids = list(live_docs.keys())
         vecs = [live_docs[i] for i in ids]
@@ -1086,9 +1120,10 @@ class GemNativeSegmentManager:
         with ctx:
             for i, doc_id in enumerate(ids):
                 vecs = vectors[i].astype(np.float32)
+                doc_payload = payloads[i] if payloads else {}
                 if self._wal_writer:
-                    self._wal_writer.log_upsert(doc_id, vecs)
-                self._payloads[doc_id] = (payloads[i] if payloads else {})
+                    self._wal_writer.log_upsert(doc_id, vecs, doc_payload)
+                self._payloads[doc_id] = doc_payload
                 self._next_doc_id = max(self._next_doc_id, doc_id + 1)
 
                 if self._active is not None and self._active.is_ready():
@@ -1168,8 +1203,6 @@ class GemNativeSegmentManager:
                         codebook_trained=self._codebook_trained,
                         sealed_deleted_ids=self._sealed_deleted_ids,
                     )
-                    if self._wal_writer:
-                        self._wal_writer.truncate()
                 except Exception as e:
                     logger.error("Checkpoint save failed: %s", e)
 
@@ -1207,10 +1240,9 @@ class GemNativeSegmentManager:
         Returns (token_scores, matched_centroid_ids) or (None, None)
         if not computable.
         """
-        n_query = query.shape[0] if query.ndim == 2 else 1
-        token_scores = [0.0] * n_query
-        matched = [0] * n_query
-        return token_scores, matched
+        raise NotImplementedError(
+            "_explain_score is not yet implemented; set explain=False"
+        )
 
     def get_statistics(self) -> Dict[str, Any]:
         ctx = self._rwlock.read_lock() if self._rwlock else self._lock

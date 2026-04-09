@@ -6,8 +6,9 @@ Provides a clean interface to select the appropriate storage backend.
 
 from pathlib import Path
 from typing import Literal
-from .storage import Storage
+
 from .async_storage import AsyncPipelineStorage
+from .storage import Storage
 
 StorageMode = Literal['sync', 'async']
 
@@ -19,26 +20,26 @@ def create_storage(
 ) -> 'Storage | AsyncPipelineStorage':
     """
     Create storage backend (sync or async).
-    
+
     Args:
         path: Storage directory path
         config: Index configuration
-        mode: 'sync' for synchronous (simple, reliable) or 
+        mode: 'sync' for synchronous (simple, reliable) or
               'async' for asynchronous (2x faster, GPU-optimized)
         **kwargs: Additional arguments for async storage
             - max_batch_size: Maximum batch size (default: 100)
             - num_workers: Number of I/O workers (default: 2)
-    
+
     Returns:
         Storage instance
-    
+
     Examples:
         # Synchronous (default, reliable)
         >>> storage = create_storage(path, config, mode='sync')
-        
+
         # Asynchronous (faster, GPU-optimized)
         >>> storage = create_storage(path, config, mode='async')
-    
+
     Notes:
         - Sync: Simple, reliable, good for <10K docs
         - Async: 2x faster, GPU-optimized, best for >10K docs

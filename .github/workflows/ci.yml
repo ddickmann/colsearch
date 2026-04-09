@@ -13,6 +13,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff check
+        run: ruff check voyager_index/ tests/ scripts/
+      - name: Ruff format check
+        run: ruff format --check voyager_index/ tests/ scripts/
+
   base-install:
     runs-on: ubuntu-latest
     strategy:
@@ -121,21 +135,7 @@ jobs:
           python -m pip install ./src/kernels/gem_router
           python -m pip install ./src/kernels/gem_index
       - name: Run OSS foundation tests
-        run: |
-          pytest \
-            tests/test_oss_foundation_surface.py \
-            tests/test_oss_release_hygiene.py \
-            tests/test_release_polish_surface.py \
-            tests/test_full_feature_validation_native.py \
-            tests/test_prototype_screening.py \
-            tests/test_release_validation_report.py \
-            tests/test_reference_api_persistence.py \
-            tests/test_reference_api_contract.py \
-            tests/test_reference_api_security.py \
-            tests/test_multimodal_storage.py \
-            tests/test_maxsim_parity.py \
-            tests/test_ontology_fixture_contract.py \
-            tests/test_search_pipeline_contract.py
+        run: pytest tests/ -v --tb=short --cov=voyager_index --cov-fail-under=30
       - name: Run benchmark smoke
         run: |
           python benchmarks/oss_reference_benchmark.py --device cpu --points 16 --top-k 3 > benchmark.json

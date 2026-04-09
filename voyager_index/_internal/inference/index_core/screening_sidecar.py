@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, Optional, Protocol, Sequence, runtime_checkable
 
-
 SCREENING_HEALTH_WARMING = "warming"
 SCREENING_HEALTH_HEALTHY = "healthy"
 SCREENING_HEALTH_DEGRADED = "degraded"

@@ -250,12 +250,15 @@ class Index:
                 )
 
             if ids is None:
-                assigned = []
-                for _ in range(n_docs):
-                    doc_id = self._manager._next_doc_id
-                    assigned.append(doc_id)
-                    self._manager._next_doc_id += 1
-                ids = assigned
+                if hasattr(self._manager, 'allocate_ids'):
+                    ids = self._manager.allocate_ids(n_docs)
+                else:
+                    assigned = []
+                    for _ in range(n_docs):
+                        doc_id = self._manager._next_doc_id
+                        assigned.append(doc_id)
+                        self._manager._next_doc_id += 1
+                    ids = assigned
 
             if payloads is None:
                 payloads = [{} for _ in range(n_docs)]
@@ -318,38 +321,38 @@ class Index:
         """
         self._check_open()
 
-        with self._lock:
-            search_kwargs_inner = {"k": k, "ef": ef, "filters": filters}
-            if hasattr(self._manager, 'search_multivector'):
-                qv = query.astype(np.float32, copy=False)
-                qv = qv if qv.ndim == 2 else qv.reshape(1, -1)
-                raw = self._manager.search_multivector(
-                    qv, k=k, ef=ef, n_probes=n_probes, filters=filters,
-                )
-            else:
-                raw = self._manager.search(
-                    query.astype(np.float32, copy=False),
-                    **search_kwargs_inner,
-                )
+        search_kwargs_inner = {"k": k, "ef": ef, "filters": filters}
+        if hasattr(self._manager, 'search_multivector'):
+            qv = query.astype(np.float32, copy=False)
+            qv = qv if qv.ndim == 2 else qv.reshape(1, -1)
+            raw = self._manager.search_multivector(
+                qv, k=k, ef=ef, n_probes=n_probes, filters=filters,
+            )
+        else:
+            raw = self._manager.search(
+                query.astype(np.float32, copy=False),
+                **search_kwargs_inner,
+            )
 
+        with self._lock:
             payloads_snap = dict(self._payloads)
 
-            results = []
-            for doc_id, score in raw:
-                payload = payloads_snap.get(doc_id)
-                tok_scores = None
-                matched = None
-                if explain and hasattr(self._manager, '_explain_score'):
-                    tok_scores, matched = self._manager._explain_score(
-                        query.astype(np.float32, copy=False), doc_id,
-                    )
-                results.append(SearchResult(
-                    doc_id=int(doc_id), score=float(score),
-                    payload=payload,
-                    token_scores=tok_scores, matched_tokens=matched,
-                ))
+        results = []
+        for doc_id, score in raw:
+            payload = payloads_snap.get(doc_id)
+            tok_scores = None
+            matched = None
+            if explain and hasattr(self._manager, '_explain_score'):
+                tok_scores, matched = self._manager._explain_score(
+                    query.astype(np.float32, copy=False), doc_id,
+                )
+            results.append(SearchResult(
+                doc_id=int(doc_id), score=float(score),
+                payload=payload,
+                token_scores=tok_scores, matched_tokens=matched,
+            ))
 
-            return results
+        return results
 
     def search_batch(
         self,
@@ -375,30 +378,31 @@ class Index:
         """
         self._check_open()
 
+        raw_batched = self._manager.search_batch(
+            [q.astype(np.float32, copy=False) for q in queries],
+            k=k, ef=ef, n_probes=n_probes,
+        )
+
         with self._lock:
-            all_results = []
             payloads_snap = dict(self._payloads)
-            raw_batched = self._manager.search_batch(
-                [q.astype(np.float32, copy=False) for q in queries],
-                k=k, ef=ef,
-            )
 
-            for raw in raw_batched:
-                results = []
-                for doc_id, score in raw:
-                    payload = payloads_snap.get(doc_id)
-                    if filters and hasattr(self._manager, '_evaluate_filter'):
-                        if not self._manager._evaluate_filter(
-                            payload or {}, filters, doc_id=doc_id
-                        ):
-                            continue
-                    results.append(SearchResult(
-                        doc_id=int(doc_id), score=float(score),
-                        payload=payload,
-                    ))
-                all_results.append(results[:k])
+        all_results = []
+        for raw in raw_batched:
+            results = []
+            for doc_id, score in raw:
+                payload = payloads_snap.get(doc_id)
+                if filters and hasattr(self._manager, '_evaluate_filter'):
+                    if not self._manager._evaluate_filter(
+                        payload or {}, filters, doc_id=doc_id
+                    ):
+                        continue
+                results.append(SearchResult(
+                    doc_id=int(doc_id), score=float(score),
+                    payload=payload,
+                ))
+            all_results.append(results[:k])
 
-            return all_results
+        return all_results
 
     def get(self, ids: List[int]) -> List[Optional[Dict[str, Any]]]:
         """Retrieve payloads for the given document IDs."""
@@ -462,7 +466,7 @@ class Index:
                 os.unlink(tmp_path)
 
     def stats(self) -> IndexStats:
-        """Return summary statistics."""
+        """Return summary statistics. Thread-safe via manager's internal RWLock."""
         self._check_open()
         raw = self._manager.get_statistics()
         total = raw.get("total_vectors", 0)
@@ -489,12 +493,13 @@ class Index:
 
     def close(self):
         """Close the index, releasing all resources."""
-        if not self._closed:
-            self._closed = True
-            try:
-                self._manager.close()
-            except Exception as e:
-                logger.warning("Error closing manager: %s", e)
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self._manager.close()
+                except Exception as e:
+                    logger.warning("Error closing manager: %s", e)
 
     def __enter__(self):
         return self

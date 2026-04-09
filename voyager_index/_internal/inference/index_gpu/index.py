@@ -28,8 +28,8 @@ Architecture:
 
 # Import from refactored modules
 from ..config import IndexConfig
-from ..index_core.storage import Storage, IndexStatistics
 from ..index_core.index import ColbertIndex
+from ..index_core.storage import IndexStatistics, Storage
 
 # Re-export for backward compatibility
 __all__ = [

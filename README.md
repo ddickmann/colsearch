@@ -1,5 +1,9 @@
 # voyager-index
 
+[![CI](https://github.com/ddickmann/voyager-index/actions/workflows/ci.yml/badge.svg)](https://github.com/ddickmann/voyager-index/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/voyager-index)](https://pypi.org/project/voyager-index/)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **The first open-source native multi-vector index.**
 Built for ColBERT, ColPali, and late-interaction retrieval at scale.
 

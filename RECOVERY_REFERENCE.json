@@ -9,7 +9,7 @@
       },
       "dim": {
         "sig": "dim(self, /) unbound builtins.GemSegment method",
-        "doc": ""
+        "doc": "Return the vector dimensionality of the segment."
       },
       "inject_shortcuts": {
         "sig": "inject_shortcuts(self, /, training_pairs, max_shortcuts_per_node=4) unbound builtins.GemSegment method",
@@ -17,7 +17,7 @@
       },
       "is_ready": {
         "sig": "is_ready(self, /) unbound builtins.GemSegment method",
-        "doc": ""
+        "doc": "Return True if the segment is built and ready for queries."
       },
       "load": {
         "sig": "load(self, /, path) unbound builtins.GemSegment method",
@@ -25,15 +25,15 @@
       },
       "n_docs": {
         "sig": "n_docs(self, /) unbound builtins.GemSegment method",
-        "doc": ""
+        "doc": "Return the number of documents in the segment."
       },
       "n_edges": {
         "sig": "n_edges(self, /) unbound builtins.GemSegment method",
-        "doc": ""
+        "doc": "Return the total number of edges in the graph."
       },
       "n_nodes": {
         "sig": "n_nodes(self, /) unbound builtins.GemSegment method",
-        "doc": ""
+        "doc": "Return the total number of nodes in the graph."
       },
       "save": {
         "sig": "save(self, /, path) unbound builtins.GemSegment method",
@@ -45,13 +45,13 @@
       },
       "total_shortcuts": {
         "sig": "total_shortcuts(self, /) unbound builtins.GemSegment method",
-        "doc": ""
+        "doc": "Return the total number of shortcut edges."
       }
     },
     "gem.PyMutableGemSegment": {
       "avg_degree": {
         "sig": "avg_degree(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Return the average node degree in the mutable graph."
       },
       "build": {
         "sig": "build(self, /, all_vectors, doc_ids, doc_offsets, n_fine=256, n_coarse=32, max_degree=32, ef_construction=200, max_kmeans_iter=30, ctop_r=3, n_probes=4) unbound builtins.PyMutableGemSegment method",
@@ -59,7 +59,7 @@
       },
       "compact": {
         "sig": "compact(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Compact the segment: rebuild graph without deleted nodes."
       },
       "delete": {
         "sig": "delete(self, /, doc_id) unbound builtins.PyMutableGemSegment method",
@@ -67,11 +67,11 @@
       },
       "delete_ratio": {
         "sig": "delete_ratio(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Return the fraction of deleted nodes (0.0 to 1.0)."
       },
       "dim": {
         "sig": "dim(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Return the vector dimensionality."
       },
       "insert": {
         "sig": "insert(self, /, vectors, doc_id) unbound builtins.PyMutableGemSegment method",
@@ -79,23 +79,23 @@
       },
       "is_ready": {
         "sig": "is_ready(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Return True if the mutable segment is built and ready."
       },
       "memory_bytes": {
         "sig": "memory_bytes(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Estimated memory usage of the mutable segment in bytes."
       },
       "n_edges": {
         "sig": "n_edges(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Return the total number of edges."
       },
       "n_live": {
         "sig": "n_live(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Return the number of non-deleted documents."
       },
       "n_nodes": {
         "sig": "n_nodes(self, /) unbound builtins.PyMutableGemSegment method",
-        "doc": ""
+        "doc": "Return the total number of nodes (including deleted)."
       },
       "quality_score": {
         "sig": "quality_score(self, /) unbound builtins.PyMutableGemSegment method",

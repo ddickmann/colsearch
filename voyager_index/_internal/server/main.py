@@ -6,7 +6,7 @@ FastAPI server for deploying the local voyager-index reference service.
 Usage:
     # Development
     uvicorn voyager_index.server:app --reload --port 8080
-    
+
     # Local service
     uvicorn voyager_index.server:app --host 127.0.0.1 --port 8080
 
@@ -14,8 +14,8 @@ Author: Latence Team
 License: Apache-2.0
 """
 
-import os
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -46,17 +46,17 @@ def create_app(
 ) -> FastAPI:
     """
     Create and configure FastAPI application.
-    
+
     Args:
         title: API title
         version: API version
         enable_cors: Enable CORS middleware
         index_path: Path for index storage
-    
+
     Returns:
         Configured FastAPI application
     """
-    
+
     index_dir = (
         index_path
         or os.environ.get("VOYAGER_INDEX_PATH")
@@ -81,15 +81,15 @@ def create_app(
                 logger.info("Running on CPU")
         except ImportError:
             logger.info("PyTorch not available, running on CPU")
-        
+
         yield
-        
+
         # Shutdown
         close_service = getattr(app.state.search_service, "close", None)
         if callable(close_service):
             close_service()
         logger.info("Shutting down server")
-    
+
     app = FastAPI(
         title=title,
         description="""
@@ -143,7 +143,7 @@ curl -X POST http://localhost:8080/collections/docs/search \\
         redoc_url="/redoc",
     )
     app.state.index_dir = index_dir
-    
+
     # CORS middleware
     if enable_cors:
         allowed_origins = os.environ.get(
@@ -157,7 +157,7 @@ curl -X POST http://localhost:8080/collections/docs/search \\
             allow_methods=["GET", "POST", "DELETE"],
             allow_headers=["Content-Type", "Authorization"],
         )
-    
+
     # Exception handler
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
@@ -166,16 +166,16 @@ curl -X POST http://localhost:8080/collections/docs/search \\
             status_code=500,
             content={"error": "Internal server error"},
         )
-    
+
     # Include routes
     app.include_router(router, prefix="")
-    
+
     return app
 
 
 def main() -> None:
     import uvicorn
-    
+
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", 8080))
     workers = int(os.environ.get("WORKERS", 1))
@@ -184,7 +184,7 @@ def main() -> None:
             "WORKERS>1 is not supported by the voyager-index reference API. "
             "Run a single worker until shared-state coordination is implemented."
         )
-    
+
     uvicorn.run(
         "voyager_index.server:app",
         host=host,

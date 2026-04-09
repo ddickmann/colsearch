@@ -7,10 +7,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
-from pathlib import Path
 import re
 import shutil
 import textwrap
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 DEFAULT_PAGE_BUNDLE_VERSION = "1.0"
@@ -105,7 +105,7 @@ def render_documents(
             skipped.append({"path": str(source), "reason": "not_a_file"})
             continue
 
-        suffix = source.suffix.lower()
+        source.suffix.lower()
         doc_id = _stable_doc_id(source, effective_source_root)
         document_dir = output_root / doc_id
         if document_dir.exists():

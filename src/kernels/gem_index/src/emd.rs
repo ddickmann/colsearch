@@ -61,6 +61,17 @@ fn max_ip_from_row(dists: &[f32], row_base: usize, codes_b: &[u16], n_fine: usiz
         if c0 >= n_fine || c1 >= n_fine || c2 >= n_fine || c3 >= n_fine
             || c4 >= n_fine || c5 >= n_fine || c6 >= n_fine || c7 >= n_fine
         {
+            // Fallback: process valid codes individually instead of skipping
+            for &cb in chunk {
+                let idx = cb as usize;
+                if idx < n_fine {
+                    let l2 = dists[row_base + idx];
+                    let ip = 1.0 - l2 * l2 * 0.5;
+                    if ip > max_ip {
+                        max_ip = ip;
+                    }
+                }
+            }
             continue;
         }
 

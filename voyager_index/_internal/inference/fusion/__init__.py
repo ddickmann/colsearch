@@ -11,13 +11,13 @@ Supported Strategies:
 
 from ..fusion.strategies import (
     fuse_results,
-    reciprocal_rank_fusion,
-    weighted_sum_fusion,
     max_fusion,
     min_fusion,
     normalize_min_max,
+    normalize_softmax,
     normalize_z_score,
-    normalize_softmax
+    reciprocal_rank_fusion,
+    weighted_sum_fusion,
 )
 
 __all__ = [

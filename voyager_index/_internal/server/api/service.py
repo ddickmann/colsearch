@@ -4,17 +4,17 @@ Durable collection service for the voyager-index reference API.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import os
-from pathlib import Path
 import shutil
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np

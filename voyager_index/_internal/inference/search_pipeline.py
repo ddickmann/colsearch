@@ -1,7 +1,8 @@
 
 import logging
-from typing import List, Tuple, Optional, Dict, Any, Union
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
 import numpy as np
 
 from .index_core.hybrid_manager import HybridSearchManager
@@ -22,7 +23,7 @@ class SearchPipeline:
     Remote compute-side productization is intentionally out of scope for this
     class.
     """
-    
+
     def __init__(
         self,
         shard_path: str,
@@ -40,7 +41,7 @@ class SearchPipeline:
             "roq_bits": roq_bits,
             "on_disk": on_disk
         }
-        
+
         self.manager = HybridSearchManager(
             shard_path=Path(shard_path),
             dim=dim,
@@ -48,13 +49,13 @@ class SearchPipeline:
             # Enable RoQ 4-bit/8-bit if requested
             roq_bits=roq_bits if use_roq else None
         )
-        
+
         logger.info(f"SearchPipeline initialized at {shard_path} (RoQ={use_roq})")
 
     def index(
-        self, 
-        corpus: List[str], 
-        vectors: Union[np.ndarray, List[np.ndarray]], 
+        self,
+        corpus: List[str],
+        vectors: Union[np.ndarray, List[np.ndarray]],
         ids: List[int],
         payloads: Optional[List[Dict[str, Any]]] = None
     ):
@@ -71,14 +72,14 @@ class SearchPipeline:
             self.manager.index(corpus, vectors, ids, payloads)
 
     def search(
-        self, 
+        self,
         query: Union[str, np.ndarray],
         top_k_retrieval: int = 100,
         enable_refinement: bool = False
     ) -> Dict[str, Any]:
         """
         Execute retrieval with optional solver refinement.
-        
+
         Args:
             query: Query vector for dense retrieval, or query text for sparse-only retrieval.
             top_k_retrieval: Number of candidates from HNSW (Map).
@@ -106,13 +107,13 @@ class SearchPipeline:
                 "SearchPipeline.search expects a single dense query vector. "
                 "Late-interaction multi-vector queries should use ColbertIndex directly."
             )
-            
+
         search_output = self.manager.search(
-            query_text="", 
+            query_text="",
             query_vector=query_vector,
             k=top_k_retrieval
         )
-        
+
         retrieval_ids = search_output.get('union_ids', [])
         dense_ids = [doc_id for doc_id, _ in search_output.get("dense", [])]
         sparse_ids = [doc_id for doc_id, _ in search_output.get("sparse", [])]
@@ -133,7 +134,7 @@ class SearchPipeline:
             query_text="",
             candidate_ids=retrieval_ids
         )
-        
+
         return {
             "retrieval": search_output,
             "retrieval_count": len(retrieval_ids),

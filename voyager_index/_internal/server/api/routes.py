@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from .models import (
     AddPointsRequest,
     CollectionInfo,
-    CollectionKind,
     CollectionListResponse,
     CreateCollectionRequest,
     DeletePointsRequest,

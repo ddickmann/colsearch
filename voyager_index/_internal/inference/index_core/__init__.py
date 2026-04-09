@@ -11,8 +11,8 @@ Modules:
 - embedder: API gateway integration for embeddings
 """
 
-from .storage import Storage, IndexStatistics
 from .index import ColbertIndex
+from .storage import IndexStatistics, Storage
 
 __all__ = [
     'Storage',

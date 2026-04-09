@@ -3,9 +3,9 @@ Public search and indexing exports for voyager-index.
 """
 
 from voyager_index._search_impl import (
+    ColbertIndex,
     ColPaliConfig,
     ColPaliEngine,
-    ColbertIndex,
     MultiModalEngine,
     SearchPipeline,
 )

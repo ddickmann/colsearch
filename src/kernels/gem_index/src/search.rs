@@ -105,7 +105,7 @@ pub fn beam_search<A: Adjacency>(
             }
             visited.set(ep_usize);
 
-            let is_del = deleted.map_or(false, |d| ep_usize < d.len() && d[ep_usize]);
+            let is_del = deleted.is_some_and(|d| ep_usize < d.len() && d[ep_usize]);
             let doc_codes = flat_codes.doc_codes(ep_usize);
             let score = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
 
@@ -145,12 +145,12 @@ pub fn beam_search<A: Adjacency>(
                 let dist = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
 
                 let should_add = results.len() < ef || {
-                    results.peek().map_or(true, |w| dist < w.score)
+                    results.peek().is_none_or(|w| dist < w.score)
                 };
 
                 if should_add {
                     candidates.push(MinCand { score: dist, idx: nbr });
-                    let is_del = deleted.map_or(false, |d| nbr_usize < d.len() && d[nbr_usize]);
+                    let is_del = deleted.is_some_and(|d| nbr_usize < d.len() && d[nbr_usize]);
                     if !is_del {
                         results.push(MaxCand { score: dist, idx: nbr });
                         if results.len() > ef {
@@ -182,12 +182,12 @@ pub fn beam_search<A: Adjacency>(
                             let dist = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
 
                             let should_add = results.len() < ef || {
-                                results.peek().map_or(true, |w| dist < w.score)
+                                results.peek().is_none_or(|w| dist < w.score)
                             };
 
                             if should_add {
                                 candidates.push(MinCand { score: dist, idx: nbr });
-                                let is_del = deleted.map_or(false, |d| nbr_usize < d.len() && d[nbr_usize]);
+                                let is_del = deleted.is_some_and(|d| nbr_usize < d.len() && d[nbr_usize]);
                                 if !is_del {
                                     results.push(MaxCand { score: dist, idx: nbr });
                                     if results.len() > ef {
@@ -272,7 +272,7 @@ pub fn beam_search_construction<A: Adjacency>(
                 let dist = qch_proxy_score_u16(query_scores, n_query, n_fine, doc_codes);
 
                 let should_add = results.len() < ef || {
-                    results.peek().map_or(true, |w| dist < w.score)
+                    results.peek().is_none_or(|w| dist < w.score)
                 };
 
                 if should_add {

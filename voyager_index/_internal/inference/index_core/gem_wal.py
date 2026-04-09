@@ -86,7 +86,13 @@ class WalWriter:
             logger.warning("WAL entry count failed (treating as 0): %s", e)
             self._n_entries = 0
 
-    def _write_entry(self, op: WalOp, external_id: int, vectors: Optional[np.ndarray] = None):
+    def _write_entry(
+        self,
+        op: WalOp,
+        external_id: int,
+        vectors: Optional[np.ndarray] = None,
+        doc_payload: Optional[dict] = None,
+    ):
         if self._fd is None:
             raise RuntimeError("WAL not open")
 
@@ -97,24 +103,29 @@ class WalWriter:
             buf += struct.pack("<II", n_vecs, dim)
             buf += vectors.astype(np.float32).tobytes()
 
-        payload = buf
-        crc = zlib.crc32(payload) & 0xFFFFFFFF
+        if doc_payload is not None and op != WalOp.DELETE:
+            payload_json = json.dumps(doc_payload).encode("utf-8")
+            buf += struct.pack("<I", len(payload_json))
+            buf += payload_json
 
-        header = struct.pack(HEADER_FMT, WAL_MAGIC, WAL_VERSION, len(payload))
+        entry_bytes = buf
+        crc = zlib.crc32(entry_bytes) & 0xFFFFFFFF
+
+        header = struct.pack(HEADER_FMT, WAL_MAGIC, WAL_VERSION, len(entry_bytes))
         self._fd.write(header)
-        self._fd.write(payload)
+        self._fd.write(entry_bytes)
         self._fd.write(struct.pack("<I", crc))
         self._fd.flush()
         self._n_entries += 1
 
-    def log_insert(self, external_id: int, vectors: np.ndarray):
-        self._write_entry(WalOp.INSERT, external_id, vectors)
+    def log_insert(self, external_id: int, vectors: np.ndarray, doc_payload: Optional[dict] = None):
+        self._write_entry(WalOp.INSERT, external_id, vectors, doc_payload)
 
     def log_delete(self, external_id: int):
         self._write_entry(WalOp.DELETE, external_id)
 
-    def log_upsert(self, external_id: int, vectors: np.ndarray):
-        self._write_entry(WalOp.UPSERT, external_id, vectors)
+    def log_upsert(self, external_id: int, vectors: np.ndarray, doc_payload: Optional[dict] = None):
+        self._write_entry(WalOp.UPSERT, external_id, vectors, doc_payload)
 
     def log_update_payload(self, external_id: int, payload: dict):
         """WAL-log a payload update so it survives crashes."""
@@ -255,6 +266,16 @@ class WalReader:
                 vectors = np.frombuffer(vec_data[:expected], dtype=np.float32).reshape(
                     n_vecs, dim
                 )
+                trailing = vec_data[expected:]
+                if len(trailing) >= 4:
+                    pld_len = struct.unpack_from("<I", trailing, 0)[0]
+                    if len(trailing) >= 4 + pld_len:
+                        try:
+                            entry_payload = json.loads(
+                                trailing[4 : 4 + pld_len].decode("utf-8")
+                            )
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            pass
 
         return WalEntry(op=op, external_id=external_id, vectors=vectors, payload=entry_payload)
 

@@ -1,6 +1,6 @@
 [package]
 name = "latence-gem-index"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Latence Team"]
 description = "Native GEM graph index for multi-vector retrieval (ColBERT/ColPali)"
@@ -29,7 +29,6 @@ anyhow = "1"
 tempfile = "3"
 
 [dev-dependencies]
-proptest = "1"
 tempfile = "3"
 
 [profile.release]

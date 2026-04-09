@@ -88,6 +88,7 @@ native = [
   "latence-hnsw>=0.1.1",
   "latence-solver>=0.1.1",
   "latence-gem-router>=0.1.1",
+  "latence-gem-index>=0.1.0",
 ]
 dev = [
   "pytest>=8,<9",
@@ -121,14 +122,21 @@ packages = [
   "voyager_index._internal.inference.quantization",
   "voyager_index._internal.inference.utils",
   "voyager_index._internal.kernels",
-  "src",
-  "src.server",
-  "src.inference",
-  "src.kernels",
 ]
 
 [tool.setuptools.package-data]
 voyager_index = ["py.typed"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["voyager_index"]
 
 [tool.pytest.ini_options]
 testpaths = [

@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _popc(x):
     return tl.inline_asm_elementwise("popc.b32 $0, $1;", "=r,r", [x], dtype=tl.int32, is_pure=True, pack=1)
@@ -33,17 +34,17 @@ def _roq_maxsim_1bit_kernel(
     """
     q_idx = tl.program_id(0)
     d_idx = tl.program_id(1)
-    
+
     q_ptr_base = Q_PTR + q_idx * q_batch_stride
     d_ptr_base = D_PTR + d_idx * d_batch_stride
-    
+
     total_score = 0.0
-    
+
     # Calculate number of int32s per vector (n_bytes / 4)
     # Assumes n_bytes is multiple of 4 (dim 128 -> 16 bytes -> 4 ints)
-    n_ints = n_bytes // 4
-    n_ints_offsets = tl.arange(0, 4) # Hardcoded for 128 dim (4 ints)
-    
+    n_bytes // 4
+    tl.arange(0, 4) # Hardcoded for 128 dim (4 ints)
+
     # Cosine correction scale
     scaled_dim = dim.to(tl.float32)
 
@@ -51,40 +52,40 @@ def _roq_maxsim_1bit_kernel(
     # q_token_stride was computed as 16 in launcher?
     # Let's assume standard packed layout.
     q_stride_bytes = n_bytes
-    
+
     # Offsets for byte-wise loading
     byte_offsets = tl.arange(0, BLOCK_DIM)
-    
+
     # Loop over query tokens
     for i in range(n_q_tokens):
         q_off = i * q_stride_bytes
         q_ptr = q_ptr_base + q_off
         # q_ptr_i32 = q_ptr.to(tl.pointer_type(tl.int32)) # Not used in new logic
         # q_vec = tl.load(q_ptr_i32 + n_ints_offsets) # Original load
-        
+
         # Load Q Vector (byte-wise)
         q_vec_bytes = tl.load(q_ptr + byte_offsets, mask=byte_offsets < n_bytes, other=0)
         # Mask to ensure unsigned for popc
         q_vec_bytes = q_vec_bytes.to(tl.int32) & 0xFF
-        
+
         max_sim = -1.0e9
 
         for j_start in range(0, n_d_tokens, BLOCK_D):
             j_offsets = j_start + tl.arange(0, BLOCK_D)
             j_mask = j_offsets < n_d_tokens
-            
+
             # Doc ptr
             # d_off = j_offsets[:, None] * n_bytes # [BLOCK_D, 1] # Original d_off
             # d_ptr = d_ptr_base + d_off # Original d_ptr
             # d_ptr_i32 = d_ptr.to(tl.pointer_type(tl.int32)) # Original d_ptr_i32
             # d_ptrs = d_ptr_i32 + n_ints_offsets[None, :] # [BLOCK_D, n_ints] # Original d_ptrs
             # d_vecs = tl.load(d_ptrs, mask=j_mask[:, None], other=0) # Original d_vecs
-            
+
             # Load D Vectors [BLOCK_D, n_bytes]
             d_ptr_offs = j_offsets[:, None] * n_bytes + byte_offsets[None, :]
             # d_ptr_offs assumed within int32 range
-            
-            d_vecs_bytes = tl.load(d_ptr_base + d_ptr_offs, 
+
+            d_vecs_bytes = tl.load(d_ptr_base + d_ptr_offs,
                                    mask=(j_mask[:, None] & (byte_offsets[None, :] < n_bytes)), other=0)
             d_vecs_bytes = d_vecs_bytes.to(tl.int32) & 0xFF
 
@@ -94,17 +95,17 @@ def _roq_maxsim_1bit_kernel(
             bits_diff = _popc(xor_res) # [BLOCK_D, BLOCK_DIM]
             dist_int = tl.sum(bits_diff, axis=1)
             dist_float = dist_int.to(tl.float32)
-            
+
             # Cosine Correction
             # sim = D * cos(pi * h / D)
             angle = 3.14159265 * dist_float / scaled_dim
             sim = scaled_dim * tl.cos(angle)
-            
+
             sim = tl.where(j_mask, sim, -1.0e9)
             block_max = tl.max(sim, axis=0)
             if block_max > max_sim:
                 max_sim = block_max
-                
+
         total_score += max_sim
 
     out_ptr = OUTPUT_PTR + q_idx * output_q_stride + d_idx * output_d_stride
@@ -329,28 +330,28 @@ def _roq_maxsim_8bit_kernel(
     Sim(x, y) = <x, y> = (||x||^2 + ||y||^2 - ||x-y||^2) / 2
     But for RoQ, we estimate <x, y> directly:
     <x, q> approx D*l_x*l_q + l_x*d_q*sum(c_q) + d_x*l_q*sum(c_x) + d_x*d_q*<c_x, c_q>
-    
+
     Meta layout: [scale, offset, code_sum, norm_sq] (floats)
     """
     q_idx = tl.program_id(0)
     d_idx = tl.program_id(1)
-    
+
     q_ptr_base = Q_CODES_PTR + q_idx * q_batch_stride
     d_ptr_base = D_CODES_PTR + d_idx * d_batch_stride
-    
+
     q_meta_base = Q_META_PTR + q_idx * n_q_tokens * 4
     d_meta_base = D_META_PTR + d_idx * n_d_tokens * 4
-    
-    # dim is passed as scalar (int32). 
+
+    # dim is passed as scalar (int32).
     # To use in float calc, we can just use it (promotes) or cast.
     # float(dim) fails on JIT types.
     dim_float = dim # Implicit promotion
-    
+
     # Offsets for dimension
     dim_offsets = tl.arange(0, BLOCK_DIM)
-    
+
     total_score = 0.0
-    
+
     # Loop over query tokens
     for i in range(n_q_tokens):
         # Load Query Meta (scalar per token)
@@ -358,74 +359,74 @@ def _roq_maxsim_8bit_kernel(
         q_scale = tl.load(q_meta_ptr + 0)
         q_offset = tl.load(q_meta_ptr + 1)
         q_sum = tl.load(q_meta_ptr + 2)
-        
+
         # Load Query Code Vector (1, Dim)
         # We need this repeated for BLOCK_D, or broadcast
         q_code_ptr = q_ptr_base + i * q_token_stride + dim_offsets
         q_code_mask = dim_offsets < dim
         q_vec = tl.load(q_code_ptr, mask=q_code_mask, other=0.0).to(tl.float32)
-        
+
         # Constant parts for this query token
         # T1 coeff: D * q_offset
         t1_q_part = dim_float * q_offset
         # T3 coeff: q_scale * q_sum
         t3_coeff = q_scale * q_sum
-        
+
         max_sim = -1.0e9 # Float32 min
-        
+
         # Loop over doc tokens in blocks
         for j_start in range(0, n_d_tokens, BLOCK_D):
             # Block offsets
             j_offsets = j_start + tl.arange(0, BLOCK_D)
             j_mask = j_offsets < n_d_tokens
-            
+
             # Load Doc Meta [BLOCK_D]
             # Layout: (B, T, 4) -> (T, 4) contiguous since B is handled by grid
             # d_meta_base points to start of docs for this batch item
             d_meta_ptr = d_meta_base + j_offsets * 4
-            
+
             # Load scalars vectorized [BLOCK_D]
             d_scale = tl.load(d_meta_ptr + 0, mask=j_mask, other=0.0)
             d_offset = tl.load(d_meta_ptr + 1, mask=j_mask, other=0.0)
             d_sum = tl.load(d_meta_ptr + 2, mask=j_mask, other=0.0)
-            
+
             # Load Doc Codes [BLOCK_D, DIM]
             # Pointer arithmetic: Base + T_offset * stride + DIM_offset
             d_code_ptrs = d_ptr_base + (j_offsets[:, None] * d_token_stride) + dim_offsets[None, :]
             d_code_mask = (j_offsets[:, None] < n_d_tokens) & (dim_offsets[None, :] < dim)
-            
+
             d_vecs = tl.load(d_code_ptrs, mask=d_code_mask, other=0.0).to(tl.float32)
-            
+
             # Dot Product <c_x, c_q> [BLOCK_D]
             # q_vec is [DIM], d_vecs is [BLOCK_D, DIM]
             # Broadcast q_vec to [1, DIM] implicitly
             prod = q_vec[None, :] * d_vecs
             dot_val = tl.sum(prod, axis=1)
-            
+
             # Affine Correction Vectorized
             # T1: D * q_offset * d_offset
             t1 = t1_q_part * d_offset
-            
+
             # T2: d_scale * d_sum * q_offset
             t2 = d_scale * d_sum * q_offset
-            
+
             # T3: q_scale * q_sum * d_offset (t3_coeff computed outside)
             t3 = t3_coeff * d_offset
-            
+
             # T4: q_scale * d_scale * dot_val
             t4 = q_scale * d_scale * dot_val
-            
+
             # Final sim [BLOCK_D]
             sim = t1 + t2 + t3 + t4
-            
+
             # Apply mask (set invalid to min)
             sim = tl.where(j_mask, sim, -1.0e9)
-            
+
             # Max reduction across block
             block_max = tl.max(sim, axis=0)
             if block_max > max_sim:
                 max_sim = block_max
-        
+
         total_score += max_sim
 
     out_ptr = OUTPUT_PTR + q_idx * output_q_stride + d_idx * output_d_stride
@@ -445,9 +446,9 @@ def roq_maxsim_8bit(queries_codes, queries_meta, docs_codes, docs_meta):
     A, S, Dim = queries_codes.shape
     B, T, Dim2 = docs_codes.shape
     assert Dim == Dim2
-    
+
     scores = torch.empty((A, B), dtype=torch.float32, device=queries_codes.device)
-    
+
     grid = (A, B)
     _roq_maxsim_8bit_kernel[grid](
         queries_codes, docs_codes,
@@ -474,7 +475,7 @@ def roq_maxsim_8bit(queries_codes, queries_meta, docs_codes, docs_meta):
 @triton.jit
 def _roq_maxsim_4bit_kernel(
     Q_CODES_PTR, D_CODES_PTR,
-    Q_META_PTR, D_META_PTR, 
+    Q_META_PTR, D_META_PTR,
     Q_MASK_PTR, D_MASK_PTR,
     OUTPUT_PTR,
     q_batch_stride, q_token_stride,
@@ -496,18 +497,18 @@ def _roq_maxsim_4bit_kernel(
     """
     q_idx = tl.program_id(0)
     d_idx = tl.program_id(1)
-    
+
     q_ptr_base = Q_CODES_PTR + q_idx * q_batch_stride
     d_ptr_base = D_CODES_PTR + d_idx * d_batch_stride
-    
+
     q_meta_ptr_base = Q_META_PTR + q_idx * n_q_tokens * q_meta_token_stride
     d_meta_ptr_base = D_META_PTR + d_idx * n_d_tokens * d_meta_token_stride
-    
+
     total_score = 0.0
-    
+
     # Offsets for bytes loop
     byte_offsets = tl.arange(0, BLOCK_DIM)
-    
+
     for i in range(n_q_tokens):
         q_token_active = tl.load(
             Q_MASK_PTR + q_idx * q_mask_batch_stride + i * q_mask_token_stride
@@ -515,23 +516,23 @@ def _roq_maxsim_4bit_kernel(
         if q_token_active:
             # Load Q Meta
             q_meta_ptr = q_meta_ptr_base + i * q_meta_token_stride
-            
+
             q_scale = tl.load(q_meta_ptr + 0)
             q_offset = tl.load(q_meta_ptr + 1)
             q_sum = tl.load(q_meta_ptr + 2)
             q_affine_offset = dim * q_offset + q_scale * q_sum
-            
+
             # Load Q Vector (Packed Bytes)
             q_off = i * q_token_stride
             q_ptr = q_ptr_base + q_off
             q_vec_bytes = tl.load(q_ptr + byte_offsets, mask=byte_offsets < n_bytes, other=0)
-            
+
             # Keep nibble arithmetic in int32, then cast once after reduction.
             q_high = (q_vec_bytes >> 4).to(tl.int32)
             q_low = (q_vec_bytes & 0x0F).to(tl.int32)
-            
+
             max_sim = -1.0e9
-            
+
             for j_start in range(0, n_d_tokens, BLOCK_D):
                 j_offsets = j_start + tl.arange(0, BLOCK_D)
                 j_mask = j_offsets < n_d_tokens
@@ -562,7 +563,7 @@ def _roq_maxsim_4bit_kernel(
                 block_max = tl.max(sim, axis=0)
                 if block_max > max_sim:
                     max_sim = block_max
-                    
+
             total_score += max_sim
 
     out_ptr = OUTPUT_PTR + q_idx * output_q_stride + d_idx * output_d_stride
@@ -578,7 +579,7 @@ def roq_maxsim_4bit(queries_codes, queries_meta, docs_codes, docs_meta, queries_
         docs_meta: (B, T, 4) float32
     """
     scores = torch.empty((queries_codes.shape[0], docs_codes.shape[0]), dtype=torch.float32, device=queries_codes.device)
-    
+
     A, S, NB = queries_codes.shape
     B, T, NB2 = docs_codes.shape
     assert NB == NB2
@@ -590,9 +591,9 @@ def roq_maxsim_4bit(queries_codes, queries_meta, docs_codes, docs_meta, queries_
         documents_mask = torch.ones((B, T), dtype=torch.float32, device=docs_codes.device)
     else:
         documents_mask = documents_mask.to(device=docs_codes.device, dtype=torch.float32)
-    
+
     dim = NB * 2 # 2 nibbles per byte
-    
+
     block_dim = 32
     while block_dim < NB:
         block_dim *= 2
@@ -650,19 +651,19 @@ def _roq_maxsim_2bit_kernel(
 ):
     q_idx = tl.program_id(0) # query batch idx
     d_idx = tl.program_id(1) # doc batch idx
-    
+
     # Pointers
     q_ptr_base = Q_PTR + q_idx * stride_q_batch
     d_ptr_base = D_PTR + d_idx * stride_d_batch
-    
+
     q_meta_ptr_base = Q_META_PTR + q_idx * n_q_tokens * q_meta_token_stride
     d_meta_ptr_base = D_META_PTR + d_idx * n_d_tokens * d_meta_token_stride
-    
+
     total_score = 0.0
-    
+
     byte_offsets = tl.arange(0, BLOCK_DIM) # n_bytes is small (dim/4)
     # Actually we just load everything
-    
+
     for i in range(n_q_tokens):
         q_token_active = tl.load(
             Q_MASK_PTR + q_idx * q_mask_batch_stride + i * q_mask_token_stride
@@ -672,7 +673,7 @@ def _roq_maxsim_2bit_kernel(
             q_scale = tl.load(q_meta_ptrs + 0)
             q_offset = tl.load(q_meta_ptrs + 1)
             q_sum = tl.load(q_meta_ptrs + 2)
-            
+
             q_vec_bytes = tl.load(q_ptr_base + i * stride_q_tokens + byte_offsets, mask=byte_offsets < n_bytes, other=0)
             q0 = (q_vec_bytes >> 6).to(tl.float32)
             q1 = ((q_vec_bytes >> 4) & 3).to(tl.float32)
@@ -680,16 +681,16 @@ def _roq_maxsim_2bit_kernel(
             q3 = (q_vec_bytes & 3).to(tl.float32)
 
             max_sim = -1.0e9
-            
+
             for j_start in range(0, n_d_tokens, BLOCK_D):
                 j_offsets = j_start + tl.arange(0, BLOCK_D)
                 j_mask = j_offsets < n_d_tokens
-                
+
                 d_meta_ptrs = d_meta_ptr_base + j_offsets * d_meta_token_stride
                 d_scale = tl.load(d_meta_ptrs + 0, mask=j_mask, other=0.0)
                 d_offset = tl.load(d_meta_ptrs + 1, mask=j_mask, other=0.0)
                 d_sum = tl.load(d_meta_ptrs + 2, mask=j_mask, other=0.0)
-                
+
                 d_ptr_offs = j_offsets[:, None] * stride_d_tokens + byte_offsets[None, :]
                 d_vecs_bytes = tl.load(
                     d_ptr_base + d_ptr_offs,
@@ -701,12 +702,12 @@ def _roq_maxsim_2bit_kernel(
                     mask=j_mask,
                     other=0,
                 ) > 0
-                
+
                 d0 = (d_vecs_bytes >> 6).to(tl.float32)
                 d1 = ((d_vecs_bytes >> 4) & 3).to(tl.float32)
                 d2 = ((d_vecs_bytes >> 2) & 3).to(tl.float32)
                 d3 = (d_vecs_bytes & 3).to(tl.float32)
-                
+
                 dot_val = tl.sum(
                     q0[None, :] * d0
                     + q1[None, :] * d1
@@ -714,25 +715,25 @@ def _roq_maxsim_2bit_kernel(
                     + q3[None, :] * d3,
                     axis=1,
                 )
-                
+
                 term1 = dim * d_offset * q_offset
                 term2 = d_offset * q_scale * q_sum
                 term3 = q_offset * d_scale * d_sum
                 term4 = d_scale * q_scale * dot_val
-                
+
                 est_dot = term1 + term2 + term3 + term4
                 sim = tl.where(j_mask & d_token_active, est_dot, -1.0e9)
                 block_max = tl.max(sim, axis=0)
                 if block_max > max_sim:
                     max_sim = block_max
-                    
+
             total_score += max_sim
 
     out_ptr = OUTPUT_PTR + q_idx * output_q_stride + d_idx * output_d_stride
     tl.store(out_ptr, total_score)
 
 
-def roq_maxsim_2bit(queries_codes, queries_meta, docs_codes, docs_meta, queries_mask=None, documents_mask=None): 
+def roq_maxsim_2bit(queries_codes, queries_meta, docs_codes, docs_meta, queries_mask=None, documents_mask=None):
     scores = torch.empty((queries_codes.shape[0], docs_codes.shape[0]), dtype=torch.float32, device=queries_codes.device)
     A, S, NB = queries_codes.shape
     B, T, NB2 = docs_codes.shape
@@ -746,13 +747,13 @@ def roq_maxsim_2bit(queries_codes, queries_meta, docs_codes, docs_meta, queries_
     else:
         documents_mask = documents_mask.to(device=docs_codes.device, dtype=torch.float32)
     dim = NB * 4 #    dim = NB * 8
-    
+
     # BLOCK_DIM must cover n_bytes (NB)
     # Find next power of 2 >= NB
     block_dim = 32
     while block_dim < NB:
         block_dim *= 2
-        
+
     grid = (A, B)
     _roq_maxsim_2bit_kernel[grid]( # Changed from _roq_maxsim_1bit_kernel to _roq_maxsim_2bit_kernel to match context
         queries_codes, docs_codes, # Changed from queries, docs to queries_codes, docs_codes to match function signature

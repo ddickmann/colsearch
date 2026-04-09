@@ -16,11 +16,11 @@ Usage:
     # Parallel indexing with ColBERT
     colbert_engine = ColBERTEngine(...)
     colpali_engine = ColPaliEngine(...)
-    
+
     # Index same documents with both
     colbert_engine.index(embeddings=colbert_embs, ...)
     colpali_engine.index(embeddings=colpali_embs, ...)
-    
+
     # Search both and combine
     text_results = colbert_engine.search(query_text_emb)
     visual_results = colpali_engine.search(query_visual_emb)
@@ -29,23 +29,24 @@ Author: Latence Team
 License: Apache-2.0
 """
 
-from typing import Dict, Iterable, List, Optional, Any, Union, Tuple
-from pathlib import Path
 import heapq
 import json
+import logging
 import os
 import shutil
 import tempfile
 import time
-import torch
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
 import numpy as np
-import logging
+import torch
 
 from ...kernels.maxsim import fast_colbert_scores
-from ..engines.base import DenseSearchEngine, SearchResult
 from ..config import IndexConfig
+from ..engines.base import DenseSearchEngine, SearchResult
 from ..index_core.centroid_screening import CentroidScreeningIndex
-from ..index_core.gem_screening import GemScreeningIndex, GEM_ROUTER_AVAILABLE
+from ..index_core.gem_screening import GEM_ROUTER_AVAILABLE, GemScreeningIndex
 from ..index_core.prototype_screening import PrototypeScreeningIndex
 from ..index_core.screening_sidecar import (
     SCREENING_HEALTH_DEGRADED,
@@ -63,7 +64,7 @@ logger = logging.getLogger(__name__)
 class ColPaliConfig:
     """Configuration for ColPali engine."""
     SUPPORTED_SCREENING_BACKENDS = {"prototype_hnsw", "centroid", "gem_router"}
-    
+
     def __init__(
         self,
         embed_dim: int = 768,           # ColPali uses 768 or 1024
@@ -97,25 +98,25 @@ class ColPaliConfig:
 class ColPaliEngine(DenseSearchEngine):
     """
     ColPali visual document search engine.
-    
+
     Uses MaxSim late interaction scoring on vision-language embeddings.
     Compatible with ColBERT for parallel multi-modal indexing.
-    
+
     Features:
     - Dense vector search with MaxSim scoring (same as ColBERT)
     - Designed for image/PDF/visual document embeddings
     - Supports parallel indexing with ColBERT for hybrid search
     - GPU-accelerated with Triton MaxSim kernel
-    
+
     Example:
         >>> engine = ColPaliEngine(index_path="/data/colpali_index")
-        >>> 
+        >>>
         >>> # Index visual documents
         >>> engine.index(embeddings=visual_embeddings, doc_ids=doc_ids)
-        >>> 
+        >>>
         >>> # Search with visual query
         >>> results = engine.search(query_embedding=visual_query_emb, top_k=10)
-        >>> 
+        >>>
         >>> # Or use with Latence client
         >>> visual_emb = await latence.colpali.embed_image(image_path)
         >>> results = engine.search(query_embedding=visual_emb, top_k=10)
@@ -127,7 +128,7 @@ class ColPaliEngine(DenseSearchEngine):
     SCREENING_CALIBRATION_MIN_TOPK = 0.60
     SCREENING_RISKY_QUERY_DISPERSION = 0.28
     SCREENING_RISKY_QUERY_TOKEN_COUNT = 96
-    
+
     def __init__(
         self,
         index_path: Union[str, Path],
@@ -137,7 +138,7 @@ class ColPaliEngine(DenseSearchEngine):
     ):
         """
         Initialize ColPali engine.
-        
+
         Args:
             index_path: Path to store/load the index
             config: ColPali configuration
@@ -145,7 +146,7 @@ class ColPaliEngine(DenseSearchEngine):
             load_if_exists: Load existing index if found
         """
         super().__init__(engine_name="colpali")
-        
+
         self.index_path = Path(index_path)
         self.config = config or ColPaliConfig(device=device)
         self.device = device
@@ -190,7 +191,7 @@ class ColPaliEngine(DenseSearchEngine):
                 self._configure_screening_index(load_if_exists=load_if_exists)
         else:
             self._configure_screening_index(load_if_exists=load_if_exists)
-    
+
     def _index_exists(self) -> bool:
         """Check if index exists on disk."""
         return self.manifest_path.exists()
@@ -491,7 +492,7 @@ class ColPaliEngine(DenseSearchEngine):
             "storage_type": self.config.storage_type,
             "save_ms": save_ms,
         }
-    
+
     def _load_index(self):
         """Load index from disk."""
         try:
@@ -522,7 +523,7 @@ class ColPaliEngine(DenseSearchEngine):
             logger.info(f"Loaded ColPali index with {len(self._doc_ids)} documents")
         except Exception as e:
             raise RuntimeError(f"Failed to load ColPali index at {self.index_path}: {e}") from e
-    
+
     def _save_index(self):
         """Persist manifest state to disk."""
         self._save_manifest()
@@ -975,7 +976,7 @@ class ColPaliEngine(DenseSearchEngine):
             **features,
         }
         return selected
-    
+
     def index(
         self,
         documents: Optional[List[str]] = None,
@@ -986,14 +987,14 @@ class ColPaliEngine(DenseSearchEngine):
     ) -> None:
         """
         Index visual documents.
-        
+
         Args:
             documents: Not used (embeddings required for visual)
             doc_ids: Document IDs
             collection_name: Collection name
             embeddings: Pre-computed visual embeddings (N, P, D)
                         P = patches, D = embed_dim
-        
+
         Raises:
             ValueError: If embeddings not provided
         """
@@ -1002,52 +1003,52 @@ class ColPaliEngine(DenseSearchEngine):
                 "ColPali requires pre-computed visual embeddings. "
                 "Use latence.colpali.embed_images() first."
             )
-        
+
         if isinstance(embeddings, np.ndarray):
             embeddings = torch.from_numpy(embeddings)
-        
+
         embeddings = embeddings.to(torch.float32)
-        
+
         # Validate shape
         if embeddings.dim() != 3:
             raise ValueError(
                 f"Expected 3D embeddings (N, patches, dim), got {embeddings.dim()}D"
             )
-        
+
         num_docs = embeddings.shape[0]
         self._reset_storage()
         normalized_doc_ids = self._normalize_doc_ids(doc_ids, num_docs)
         lengths = self._validate_lengths(embeddings, kwargs.get("lengths"))
         self._append_chunk(embeddings, normalized_doc_ids, lengths)
         self.rebuild_prototype_screening_index()
-        
+
         logger.info(
             f"Indexed {num_docs} visual documents "
             f"(shape: {tuple(embeddings.shape)}, quantized: {self.config.use_quantization})"
         )
-    
+
     def _quantize_int8(
         self,
         embeddings: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Quantize embeddings to INT8.
-        
+
         Args:
             embeddings: Float embeddings (N, P, D)
-        
+
         Returns:
             Tuple of (quantized_embeddings, scales)
         """
         # Compute per-document scales
         max_vals = embeddings.abs().amax(dim=(1, 2), keepdim=True)
         scales = max_vals / 127.0
-        
+
         # Quantize
         quantized = (embeddings / (scales + 1e-8)).round().clamp(-128, 127).to(torch.int8)
-        
+
         return quantized, scales.squeeze()
-    
+
     def _dequantize(
         self,
         quantized: torch.Tensor,
@@ -1059,9 +1060,9 @@ class ColPaliEngine(DenseSearchEngine):
             selected_scales = scales[indices].unsqueeze(-1).unsqueeze(-1)
         else:
             selected_scales = scales.unsqueeze(-1).unsqueeze(-1)
-        
+
         return quantized.float() * selected_scales
-    
+
     def search(
         self,
         query: Optional[str] = None,
@@ -1073,29 +1074,29 @@ class ColPaliEngine(DenseSearchEngine):
     ) -> List[SearchResult]:
         """
         Search for similar visual documents.
-        
+
         Args:
             query: Not used (query_embedding required)
             top_k: Number of results
             collection_name: Collection to search
             query_embedding: Visual query embedding (P, D) or (1, P, D)
-        
+
         Returns:
             List of SearchResult objects
-        
+
         Raises:
             RuntimeError: If index not built
             ValueError: If query_embedding not provided
         """
         if not self._indexed:
             raise RuntimeError("Index not built. Call index() first.")
-        
+
         if query_embedding is None:
             raise ValueError(
                 "ColPali requires query_embedding. "
                 "Use latence.colpali.embed_query() first."
             )
-        
+
         if isinstance(query_embedding, np.ndarray):
             query_embedding = torch.from_numpy(query_embedding)
 
@@ -1193,7 +1194,7 @@ class ColPaliEngine(DenseSearchEngine):
         for rank, result in enumerate(results, start=1):
             result.rank = rank
         return results
-    
+
     def _compute_maxsim(
         self,
         query: torch.Tensor,
@@ -1202,13 +1203,13 @@ class ColPaliEngine(DenseSearchEngine):
     ) -> torch.Tensor:
         """
         Compute MaxSim scores between query and documents.
-        
+
         MaxSim = Σ_q max_d(sim(q, d))
-        
+
         Args:
             query: Query embedding (1, Q, D)
             documents: Document embeddings (N, P, D)
-        
+
         Returns:
             Scores (N,)
         """
@@ -1219,7 +1220,7 @@ class ColPaliEngine(DenseSearchEngine):
             documents_mask=documents_mask,
             use_quantization=False,
         )[0]
-    
+
     def add_documents(
         self,
         embeddings: torch.Tensor,
@@ -1228,14 +1229,14 @@ class ColPaliEngine(DenseSearchEngine):
     ) -> None:
         """
         Add documents to existing index.
-        
+
         Args:
             embeddings: Visual embeddings to add
             doc_ids: Document IDs
         """
         if isinstance(embeddings, np.ndarray):
             embeddings = torch.from_numpy(embeddings)
-        
+
         embeddings = embeddings.to(torch.float32)
         if embeddings.dim() != 3:
             raise ValueError("Expected 3D embeddings (N, patches, dim)")
@@ -1250,11 +1251,11 @@ class ColPaliEngine(DenseSearchEngine):
             lengths=lengths,
         )
         logger.info(f"Added {len(embeddings)} visual documents")
-    
+
     def delete_documents(self, doc_ids: List[Any]) -> None:
         """
         Delete documents from index.
-        
+
         Args:
             doc_ids: Document IDs to delete
         """
@@ -1294,7 +1295,7 @@ class ColPaliEngine(DenseSearchEngine):
         self._append_chunk(stacked, active_doc_ids, lengths_array)
         self.rebuild_prototype_screening_index()
         logger.info("Compacted ColPali storage to %s active documents", len(active_doc_ids))
-    
+
     def get_statistics(self) -> dict:
         """Get engine statistics."""
         if not self._chunks:
@@ -1339,11 +1340,11 @@ class ColPaliEngine(DenseSearchEngine):
                 else {"engine": "prototype_screening", "disabled": True}
             ),
         }
-    
+
     def embed_query(self, query: str, model: Any = None) -> torch.Tensor:
         """
         Convert query to visual embedding.
-        
+
         Note: For ColPali, visual queries require an image or the ColPali model.
         This method is a placeholder - use latence.colpali.embed_query() instead.
         """
@@ -1351,11 +1352,11 @@ class ColPaliEngine(DenseSearchEngine):
             "ColPali requires visual query embedding. "
             "Use latence.colpali.embed_query(image) instead."
         )
-    
+
     def embed_documents(self, documents: List[str], model: Any = None) -> torch.Tensor:
         """
         Convert documents to visual embeddings.
-        
+
         Note: For ColPali, document embedding requires images/PDFs.
         This method is a placeholder - use latence.colpali.embed_documents() instead.
         """
@@ -1363,7 +1364,7 @@ class ColPaliEngine(DenseSearchEngine):
             "ColPali requires visual document embedding. "
             "Use latence.colpali.embed_documents(images) instead."
         )
-    
+
     def cleanup(self) -> None:
         """Clean up resources."""
         self._embeddings = None
@@ -1381,23 +1382,23 @@ class ColPaliEngine(DenseSearchEngine):
 class MultiModalEngine:
     """
     Multi-modal search engine combining ColBERT (text) and ColPali (visual).
-    
+
     Enables hybrid search across text and visual documents using
     the same MaxSim scoring mechanism with different embedding models.
-    
+
     Example:
         >>> engine = MultiModalEngine(
         ...     colbert_path="/data/colbert",
         ...     colpali_path="/data/colpali"
         ... )
-        >>> 
+        >>>
         >>> # Index documents with both modalities
         >>> engine.index(
         ...     text_embeddings=colbert_embs,
         ...     visual_embeddings=colpali_embs,
         ...     doc_ids=doc_ids
         ... )
-        >>> 
+        >>>
         >>> # Search with text query
         >>> results = engine.search(
         ...     text_embedding=text_query,
@@ -1405,7 +1406,7 @@ class MultiModalEngine:
         ...     fusion_weight=0.5  # 0=text only, 1=visual only
         ... )
     """
-    
+
     def __init__(
         self,
         colbert_path: Union[str, Path],
@@ -1416,7 +1417,7 @@ class MultiModalEngine:
     ):
         """
         Initialize multi-modal engine.
-        
+
         Args:
             colbert_path: Path for ColBERT text index
             colpali_path: Path for ColPali visual index
@@ -1425,11 +1426,11 @@ class MultiModalEngine:
             device: Compute device
         """
         from .colbert import ColBERTEngine
-        
+
         self.colbert = ColBERTEngine(colbert_path, colbert_config, device)
         self.colpali = ColPaliEngine(colpali_path, colpali_config, device)
         self.device = device
-    
+
     def index(
         self,
         text_embeddings: Optional[torch.Tensor] = None,
@@ -1439,7 +1440,7 @@ class MultiModalEngine:
     ) -> None:
         """
         Index documents with text and/or visual embeddings.
-        
+
         Args:
             text_embeddings: ColBERT text embeddings
             visual_embeddings: ColPali visual embeddings
@@ -1453,14 +1454,14 @@ class MultiModalEngine:
                 collection_name=collection_name,
                 embeddings=text_embeddings,
             )
-        
+
         if visual_embeddings is not None:
             self.colpali.index(
                 embeddings=visual_embeddings,
                 doc_ids=doc_ids,
                 collection_name=collection_name,
             )
-    
+
     def search(
         self,
         text_embedding: Optional[torch.Tensor] = None,
@@ -1472,7 +1473,7 @@ class MultiModalEngine:
     ) -> List[SearchResult]:
         """
         Multi-modal search combining text and visual results.
-        
+
         Args:
             text_embedding: ColBERT query embedding
             visual_embedding: ColPali query embedding
@@ -1480,13 +1481,13 @@ class MultiModalEngine:
             fusion_weight: Weight for visual (0=text only, 1=visual only)
             fusion_method: "weighted" or "rrf"
             collection_name: Collection to search
-        
+
         Returns:
             List of SearchResult objects
         """
         text_results = []
         visual_results = []
-        
+
         # Get text results
         if text_embedding is not None and self.colbert._indexed:
             text_results = self.colbert.search(
@@ -1494,7 +1495,7 @@ class MultiModalEngine:
                 top_k=top_k * 2,  # Get more for fusion
                 collection_name=collection_name,
             )
-        
+
         # Get visual results
         if visual_embedding is not None and self.colpali._indexed:
             visual_results = self.colpali.search(
@@ -1502,7 +1503,7 @@ class MultiModalEngine:
                 top_k=top_k * 2,
                 collection_name=collection_name,
             )
-        
+
         # Fusion
         if fusion_method == "weighted":
             return self._weighted_fusion(
@@ -1511,7 +1512,7 @@ class MultiModalEngine:
             )
         else:
             return self._rrf_fusion(text_results, visual_results, top_k)
-    
+
     def _weighted_fusion(
         self,
         text_results: List[SearchResult],
@@ -1521,19 +1522,19 @@ class MultiModalEngine:
     ) -> List[SearchResult]:
         """Combine results using weighted score fusion."""
         text_weight = 1.0 - visual_weight
-        
+
         # Build score map
         scores = {}
-        
+
         for r in text_results:
             scores[r.doc_id] = scores.get(r.doc_id, 0) + text_weight * r.score
-        
+
         for r in visual_results:
             scores[r.doc_id] = scores.get(r.doc_id, 0) + visual_weight * r.score
-        
+
         # Sort and build results
         sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        
+
         results = []
         for rank, (doc_id, score) in enumerate(sorted_docs):
             results.append(SearchResult(
@@ -1543,9 +1544,9 @@ class MultiModalEngine:
                 source="multimodal",
                 metadata={"fusion_weight": visual_weight}
             ))
-        
+
         return results
-    
+
     def _rrf_fusion(
         self,
         text_results: List[SearchResult],
@@ -1555,15 +1556,15 @@ class MultiModalEngine:
     ) -> List[SearchResult]:
         """Combine results using Reciprocal Rank Fusion."""
         scores = {}
-        
+
         for r in text_results:
             scores[r.doc_id] = scores.get(r.doc_id, 0) + 1.0 / (k + r.rank)
-        
+
         for r in visual_results:
             scores[r.doc_id] = scores.get(r.doc_id, 0) + 1.0 / (k + r.rank)
-        
+
         sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        
+
         results = []
         for rank, (doc_id, score) in enumerate(sorted_docs):
             results.append(SearchResult(
@@ -1573,9 +1574,9 @@ class MultiModalEngine:
                 source="multimodal-rrf",
                 metadata={}
             ))
-        
+
         return results
-    
+
     def get_statistics(self) -> dict:
         """Get combined statistics."""
         return {

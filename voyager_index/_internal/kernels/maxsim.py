@@ -9,8 +9,8 @@ Production guidance for the OSS surface:
 
 from __future__ import annotations
 
-from typing import List, Sequence
 import logging
+from typing import List, Sequence
 
 import numpy as np
 import torch

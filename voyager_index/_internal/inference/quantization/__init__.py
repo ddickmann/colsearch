@@ -26,19 +26,19 @@ from .binary import (
 )
 from .product import (
     ProductQuantizer,
-    train_codebooks,
-    pq_encode,
     pq_decode,
+    pq_encode,
+    train_codebooks,
+)
+from .rotational import (
+    FastWalshHadamard,
+    RoQConfig,
+    RotationalQuantizer,
 )
 from .scalar import (
     ScalarQuantizer,
-    int8_quantize,
     int8_dequantize,
-)
-from .rotational import (
-    RotationalQuantizer,
-    RoQConfig,
-    FastWalshHadamard,
+    int8_quantize,
 )
 
 __all__ = [

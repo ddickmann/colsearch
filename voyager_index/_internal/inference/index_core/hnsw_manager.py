@@ -6,14 +6,15 @@ Manages active + sealed HNSW segments using Qdrant's segment library.
 Integrates with existing ShardedStorage architecture.
 """
 
-import logging
-import json
-import os
-from pathlib import Path
-import tempfile
 import gc
-from typing import List, Tuple, Optional, Dict, Any
+import json
+import logging
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -259,17 +260,18 @@ except ImportError:
         "This path is suitable for development, testing, and small local indexes."
     )
 
-from voyager_index._internal.inference.quantization.rotational import RotationalQuantizer, RoQConfig
+from voyager_index._internal.inference.quantization.rotational import RoQConfig, RotationalQuantizer
+
 
 class HnswSegmentManager:
     """
     Manages HNSW segments for a single shard using Qdrant's library.
-    
+
     Architecture:
     - active_segment: Mutable in-memory HNSW
     - sealed_segments: Read-only mmap'd HNSW segments
     """
-    
+
     def __init__(
         self,
         shard_path: Path,
@@ -283,7 +285,7 @@ class HnswSegmentManager:
     ):
         """
         Initialize segment manager for a shard.
-        
+
         Args:
             shard_path: Base directory for this shard
             dim: Vector dimension
@@ -301,7 +303,7 @@ class HnswSegmentManager:
         self.ef_construct = ef_construct
         self.on_disk = on_disk
         self.roq_bits = roq_bits
-        
+
         # Initialize Quantizer if requested
         self.quantizer = None
         if roq_bits:
@@ -312,10 +314,10 @@ class HnswSegmentManager:
                     num_bits=roq_bits,
                 )
             )
-        
+
         if not self.shard_path.exists():
             self.shard_path.mkdir(parents=True)
-            
+
         active_path = self.shard_path / "active"
         if not active_path.exists():
             active_path.mkdir(parents=True)
@@ -323,7 +325,7 @@ class HnswSegmentManager:
         # Qdrant might create a UUID subdirectory inside the path we give it.
         # Check if we have an existing segment in a subdirectory.
         real_active_path = active_path
-        
+
         # Look for subdirectories containing segment.json
         existing_subdirs = [d for d in active_path.iterdir() if d.is_dir()]
         found_existing = False
@@ -332,7 +334,7 @@ class HnswSegmentManager:
                 real_active_path = d
                 found_existing = True
                 break
-        
+
         if found_existing:
              logger.info(f"Loading existing active segment from: {real_active_path}")
         else:
@@ -351,23 +353,23 @@ class HnswSegmentManager:
             is_appendable=True,  # Active segment is mutable
             multivector_comparator=multivector_comparator  # Pass comparator
         )
-        
+
         # Sealed segments (immutable, mmap HNSW)
         self.sealed_segments: List[HnswSegment] = []
         self._load_sealed_segments()
-        
+
         logger.info(
             f"Initialized HnswSegmentManager: "
             f"{len(self.sealed_segments)} sealed + 1 active segment "
             f"(on_disk={on_disk})"
         )
-    
+
     def _load_sealed_segments(self):
         """Load existing sealed segments from disk."""
         sealed_dir = self.shard_path / "sealed"
         if not sealed_dir.exists():
             return
-        
+
         for seg_dir in sorted(sealed_dir.iterdir()):
             if seg_dir.is_dir():
                 try:
@@ -380,10 +382,10 @@ class HnswSegmentManager:
                         if (sub / "segment.json").exists():
                             target_path = sub
                             break
-                            
+
                     # Sealed segments are immutable and use HNSW
                     segment = HnswSegment(
-                        str(target_path), 
+                        str(target_path),
                         dim=self.dim,
                         distance_metric=self.distance_metric,
                         m=self.m,
@@ -395,7 +397,7 @@ class HnswSegmentManager:
                     logger.info(f"Loaded sealed segment: {seg_dir.name} (path: {target_path})")
                 except Exception as e:
                     logger.warning(f"Failed to load segment {seg_dir}: {e}")
-    
+
     def add(
         self,
         vectors: np.ndarray,
@@ -408,27 +410,27 @@ class HnswSegmentManager:
         # Quantize if enabled
         if hasattr(self, 'quantizer') and self.quantizer:
             q_res = self.quantizer.quantize(vectors, store=False)
-            
+
             # Pack RoQ data into payloads
             # We need to distribute q_res dict items to list of payloads
             # RoQ dict: {'codes': (N, ...), 'scales': (N,), 'offsets': (N,), 'norms_sq': (N,)}
-            
+
             if payloads is None:
                 payloads = [{} for _ in range(len(vectors))]
-                
+
             codes = q_res['codes']
             scales = q_res['scales']
             offsets = q_res['offsets']
             norms = q_res['norms_sq']
-            
+
             # Assuming 4-bit packed codes
             # We store as list/bytes in payload to be JSON serializable?
             # Qdrant payload supports basic types. Binary might need encoding (base64 or list of ints).
             # List of ints (uint8) is safest for generic JSON.
-            
+
             for i in range(len(vectors)):
                 p = payloads[i] if payloads[i] is not None else {}
-                
+
                 # Store RoQ components
                 # Codes: numpy array -> list
                 p['roq_codes'] = codes[i].tolist()
@@ -454,27 +456,27 @@ class HnswSegmentManager:
                      )
                 if 'group_size' in q_res:
                     p['roq_group_size'] = int(q_res['group_size'])
-                
+
                 payloads[i] = p
-        
+
         return self._add_internal(vectors, ids, payloads)
 
     def _add_internal(self, vectors, ids, payloads):
         if vectors.ndim != 2:
             raise ValueError(f"Expected 2D array, got shape {vectors.shape}")
-        
+
         if vectors.shape[1] != self.dim:
             raise ValueError(
                 f"Vector dimension mismatch: expected {self.dim}, "
 f"got {vectors.shape[1]}"
             )
-        
+
         # Convert payloads to Python dicts if needed
         if payloads is not None:
             payloads = [dict(p) if p is not None else {} for p in payloads]
-        
+
         return self.active_segment.add(vectors, ids=ids, payloads=payloads)
-    
+
     def add_multidense(
         self,
         vectors: List[np.ndarray],
@@ -483,7 +485,7 @@ f"got {vectors.shape[1]}"
     ) -> List[int]:
         """
         Add Multi-Vector (ColBERT/MaxSim) points to the active segment.
-        
+
         Args:
             vectors: List of (M, D) matrices. Each item is a single point (document) with M vectors.
             ids: Optional custom IDs
@@ -499,22 +501,22 @@ f"got {vectors.shape[1]}"
                     raise ValueError(f"Expected 2D matrix for point {i}, got {mat.shape}")
             elif mat.shape[1] != self.dim:
                 raise ValueError(f"Dim mismatch at {i}: expected {self.dim}, got {mat.shape[1]}")
-        
+
         # Convert payloads
         if payloads is not None:
              payloads = [dict(p) if p is not None else {} for p in payloads]
-        
+
         # Quantize if enabled
         if hasattr(self, 'quantizer') and self.quantizer:
              if payloads is None:
                   payloads = [{} for _ in range(len(vectors))]
-                  
+
              for i, mat in enumerate(vectors):
                   # mat is (M, D)
                   q_res = self.quantizer.quantize(mat, store=False)
-                  
+
                   p = payloads[i] if payloads[i] is not None else {}
-                  
+
                   # Store RoQ components for Multi-Vector
                   # Codes: (M, D) -> list of lists? or flatten?
                   # We should store as list of lists to preserve M structure in JSON?
@@ -528,11 +530,11 @@ f"got {vectors.shape[1]}"
                        p['roq_sum'] = q_res['code_sums'].tolist()
                   if 'group_size' in q_res:
                        p['roq_group_size'] = int(q_res['group_size'])
-                  
+
                   payloads[i] = p
-             
+
         return self.active_segment.add_multidense(vectors, ids=ids, payloads=payloads)
-    
+
     def search(
         self,
         query: np.ndarray,
@@ -542,36 +544,36 @@ f"got {vectors.shape[1]}"
     ) -> List[Tuple[int, float]]:
         """
         Search across all segments.
-        
+
         Args:
             query: (D,) query vector
             k: Number of neighbors
             ef: HNSW ef search parameter (default: k * 2)
             filters: Optional payload filters
-        
+
         Returns:
             List of (id, score) tuples, sorted by score desc
         """
         if query.ndim != 1:
             raise ValueError(f"Expected 1D query, got shape {query.shape}")
-        
+
         if query.shape[0] != self.dim:
             raise ValueError(
                 f"Query dimension mismatch: expected {self.dim}, "
                 f"got {query.shape[0]}"
             )
-        
+
         if ef is None:
             ef = k * 2
-        
+
         all_results = []
-        
+
         # Search active segment
         results = self.active_segment.search(
             query, k=k, ef=ef, filter=filters
         )
         all_results.extend(results)
-        
+
         # Search sealed segments in parallel
         if self.sealed_segments:
             with ThreadPoolExecutor() as executor:
@@ -584,7 +586,7 @@ f"got {vectors.shape[1]}"
                         all_results.extend(future.result())
                     except Exception as e:
                         logger.warning(f"Sealed segment search failed: {e}")
-        
+
         # Merge and re-rank
         return sorted(all_results, key=lambda x: x[1], reverse=True)[:k]
 
@@ -594,7 +596,7 @@ f"got {vectors.shape[1]}"
         Useful for feeding the Knapsack Solver.
         """
         results = {}
-        
+
         # Check active
         try:
             # Rust retrieve signature is retrieve(ids) -> List[(id, vector, payload)]
@@ -606,7 +608,7 @@ f"got {vectors.shape[1]}"
                      # Only add if we found something (vector or payload)
                      if vec is not None or payload is not None:
                          results[pid] = {"id": pid, "vector": vec, "payload": payload}
-        except (AttributeError, TypeError, ValueError) as e:
+        except (AttributeError, TypeError, ValueError):
              # logging.debug(f"Active segment retrieve failed: {e}")
              pass
 
@@ -624,7 +626,7 @@ f"got {vectors.shape[1]}"
 
         return list(results.values())
 
-    
+
     def seal_active_segment(self):
         """
         Move active segment to sealed (read-only).
@@ -633,25 +635,25 @@ f"got {vectors.shape[1]}"
         if self.active_segment.len() == 0:
             logger.info("Active segment is empty, skipping seal")
             return
-        
+
         # Flush active segment
         self.active_segment.flush()
-        
+
         # Move to sealed directory
         sealed_dir = self.shard_path / "sealed"
         sealed_dir.mkdir(exist_ok=True)
-        
+
         segment_id = len(self.sealed_segments)
         sealed_path = sealed_dir / f"segment_{segment_id:04d}"
-        
+
         # Move active to sealed
         active_path = self.shard_path / "active"
         active_path.rename(sealed_path)
-        
+
         # Load as sealed segment
         sealed_segment = HnswSegment(str(sealed_path), dim=self.dim)
         self.sealed_segments.append(sealed_segment)
-        
+
         # Create new active segment
         self.active_segment = HnswSegment(
             str(active_path),
@@ -660,9 +662,9 @@ f"got {vectors.shape[1]}"
             m=self.m,
             ef_construct=self.ef_construct
         )
-        
+
         logger.info(f"Sealed segment {segment_id}, created new active segment")
-    
+
     def delete(self, ids: List[int]) -> int:
         """
         Delete points by ID from all segments when supported.
@@ -688,7 +690,7 @@ f"got {vectors.shape[1]}"
         for seg in self.sealed_segments:
             total += seg.len()
         return total
-    
+
     def flush(self):
         """Flush active segment to disk."""
         self.active_segment.flush()

@@ -7,17 +7,18 @@ Orchestrates fusion between HNSW (Dense) and BM25 (Sparse) retrieval.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import logging
-from pathlib import Path
 import re
 import shutil
 import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import bm25s
 import numpy as np
 import Stemmer
+
 from voyager_index._internal.inference.stateless_optimizer import (
     GpuFulfilmentPipeline,
 )
@@ -43,19 +44,19 @@ except ImportError as e:
 class HybridSearchManager:
     """
     Manages both HNSW and BM25 indices for hybrid retrieval.
-    
+
     Architecture:
     - Dense: HnswSegmentManager (RocksDB/Mmap)
     - Sparse: bm25s (Memory-mapped)
     - Refiner: canonical stateless fulfilment optimizer backed by `latence_solver`
-    
+
     Fusion Strategy:
     - Parallel Retrieval: Get top-k candidates from both.
     - Candidate Union: Merge candidate IDs.
     - Solver Refinement: Build the canonical optimizer request and select an optimal subset
       from the fused candidate pool.
     """
-    
+
     def __init__(
         self,
         shard_path: Path,
@@ -79,7 +80,7 @@ class HybridSearchManager:
         self.distance_metric = distance_metric
         self.m = m
         self.ef_construct = ef_construct
-        
+
         # Dense Index
         self.hnsw = HnswSegmentManager(
             self.shard_path / "hnsw",
@@ -91,7 +92,7 @@ class HybridSearchManager:
             multivector_comparator=multivector_comparator,
             roq_bits=roq_bits
         )
-        
+
         # Sparse Index
         self.bm25_path = self.shard_path / "bm25"
         self.stemmer = Stemmer.Stemmer(stemmer_lang)
@@ -129,13 +130,13 @@ class HybridSearchManager:
         self.solver_available = self.solver is not None
         self._optimizer_pipeline: Optional[GpuFulfilmentPipeline] = None
         self._last_search_context: Optional[Dict[str, Any]] = None
-        
+
         # Buffer for real-time updates (bm25s is static)
         # TODO: Implement dynamic buffer or periodic re-indexing
         self.corpus_buffer: List[str] = []
         self.ids_buffer: List[int] = []
         self.payload_buffer: List[Dict[str, Any]] = []
-        
+
     def _load_bm25(self):
         """Load BM25 index if exists."""
         self.sparse_index_present = (self.bm25_path / "params.index.json").exists()
@@ -267,7 +268,7 @@ class HybridSearchManager:
     ) -> None:
         """
         Index documents into both HNSW and BM25.
-        
+
         Note: BM25s currently requires full re-indexing for optimization.
         For real-time, we append to buffer and re-index periodically.
         """
@@ -292,7 +293,7 @@ class HybridSearchManager:
         next_ids = [*self.ids_buffer, *[int(item_id) for item_id in ids]]
         next_payloads = [*self.payload_buffer, *[dict(payload or {}) for payload in (payloads or [])]]
         self.mark_sparse_dirty(next_corpus, next_ids, next_payloads)
-        
+
     def search(
         self,
         query_text: str,
@@ -302,7 +303,7 @@ class HybridSearchManager:
     ) -> Dict[str, Any]:
         """
         Perform Hybrid Search.
-        
+
         Returns:
             Dict containing:
             - 'dense': List[(id, score)]
@@ -313,7 +314,7 @@ class HybridSearchManager:
         if query_vector is not None:
             dense_results = self.hnsw.search(query_vector, k=k, filters=filters)
         dense_ids = {rid for rid, _ in dense_results}
-        
+
         sparse_results = []
         if self.retriever and query_text.strip():
             self._ensure_sparse_ready()
@@ -331,12 +332,12 @@ class HybridSearchManager:
         elif query_text.strip() and self.sparse_dirty:
             self._ensure_sparse_ready()
             return self.search(query_text=query_text, query_vector=query_vector, k=k, filters=filters)
-        
+
         sparse_ids = {rid for rid, _ in sparse_results}
-        
+
         # 3. Union
         union_ids = list(dense_ids.union(sparse_ids))
-        
+
         dense_meta = {
             int(doc_id): {"dense_score": float(score), "dense_rank": rank}
             for rank, (doc_id, score) in enumerate(dense_results, start=1)

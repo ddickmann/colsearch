@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +17,12 @@ pub struct FlatDocCodes {
     pub codes: Vec<u16>,
     pub offsets: Vec<u32>,
     pub lengths: Vec<u16>,
+}
+
+impl Default for FlatDocCodes {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FlatDocCodes {
@@ -112,15 +117,18 @@ pub struct GemRouterState {
 
 pub struct GemRouter {
     state: Option<GemRouterState>,
-    /// Pre-allocated buffer for query-centroid scores, reused across queries
-    score_buffer: Mutex<Vec<f32>>,
+}
+
+impl Default for GemRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GemRouter {
     pub fn new() -> Self {
         Self {
             state: None,
-            score_buffer: Mutex::new(Vec::new()),
         }
     }
 
@@ -168,10 +176,6 @@ impl GemRouter {
                 ctop,
             });
         }
-
-        // Pre-allocate score buffer for expected query size
-        let buf_size = 64 * codebook.n_fine;
-        *self.score_buffer.lock() = vec![0.0f32; buf_size];
 
         self.state = Some(GemRouterState {
             codebook,
@@ -236,11 +240,7 @@ impl GemRouter {
         let n_fine = state.codebook.n_fine;
         let needed = n_query_vecs * n_fine;
 
-        // Reuse pre-allocated score buffer
-        let mut buf = self.score_buffer.lock();
-        if buf.len() < needed {
-            buf.resize(needed, 0.0);
-        }
+        let mut buf = vec![0.0f32; needed];
         state.codebook.compute_query_centroid_scores_into(query_vectors, n_query_vecs, &mut buf);
         let query_centroid_scores = &buf[..needed];
 
@@ -268,8 +268,6 @@ impl GemRouter {
                 (doc_idx, combined)
             })
             .collect();
-
-        drop(buf);
 
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(max_candidates);
@@ -352,8 +350,6 @@ impl GemRouter {
     }
 
     pub fn restore_state(&mut self, state: GemRouterState) {
-        let buf_size = 64 * state.codebook.n_fine;
-        *self.score_buffer.lock() = vec![0.0f32; buf_size];
         self.state = Some(state);
     }
 }

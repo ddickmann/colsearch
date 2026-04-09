@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::router::GemRouterState;
 
 const MAGIC: &[u8; 4] = b"GEMR";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub enum PersistenceError {
@@ -51,6 +51,7 @@ pub fn save_state(state: &GemRouterState, path: &Path) -> Result<(), Persistence
     }
 
     let json = serde_json::to_vec(state)?;
+    let checksum = crc32fast::hash(&json);
 
     let tmp_path = path.with_extension("tmp");
     {
@@ -60,6 +61,7 @@ pub fn save_state(state: &GemRouterState, path: &Path) -> Result<(), Persistence
         w.write_all(&VERSION.to_le_bytes())?;
         w.write_all(&(json.len() as u64).to_le_bytes())?;
         w.write_all(&json)?;
+        w.write_all(&checksum.to_le_bytes())?;
         w.flush()?;
     }
     fs::rename(&tmp_path, path)?;
@@ -80,7 +82,7 @@ pub fn load_state(path: &Path) -> Result<GemRouterState, PersistenceError> {
     let mut ver_buf = [0u8; 4];
     r.read_exact(&mut ver_buf)?;
     let version = u32::from_le_bytes(ver_buf);
-    if version != VERSION {
+    if version != VERSION && version != 1 {
         return Err(PersistenceError::UnsupportedVersion(version));
     }
 
@@ -90,6 +92,19 @@ pub fn load_state(path: &Path) -> Result<GemRouterState, PersistenceError> {
 
     let mut json_buf = vec![0u8; json_len];
     r.read_exact(&mut json_buf)?;
+
+    if version >= 2 {
+        let mut crc_buf = [0u8; 4];
+        r.read_exact(&mut crc_buf)?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+        let actual_crc = crc32fast::hash(&json_buf);
+        if stored_crc != actual_crc {
+            return Err(PersistenceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("CRC32 mismatch: stored {stored_crc:#x}, computed {actual_crc:#x}"),
+            )));
+        }
+    }
 
     let state: GemRouterState = serde_json::from_slice(&json_buf)?;
     Ok(state)

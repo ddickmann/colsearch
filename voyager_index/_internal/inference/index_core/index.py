@@ -19,17 +19,19 @@ Author: ColBERT Team
 License: Apache-2.0
 """
 
-import torch
-from pathlib import Path
-from typing import Optional, List, Tuple, Generator, Literal
 import json
-import time
 import logging
 import shutil
+import time
+from pathlib import Path
+from typing import Generator, List, Literal, Optional, Tuple
 
-from .storage import Storage, IndexStatistics
+import torch
+
+from voyager_index._internal.kernels.maxsim import fast_colbert_scores
+
 from .async_storage import AsyncPipelineStorage
-from voyager_index._internal.kernels.maxsim import fast_colbert_scores, TRITON_AVAILABLE
+from .storage import IndexStatistics, Storage
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +48,15 @@ StorageMode = Literal['sync', 'async']
 class ColbertIndex:
     """
     Production-grade ColBERT index with automatic scaling.
-    
+
     This is the main interface for ColBERT indexing and search.
     It automatically selects the optimal search strategy based on corpus size.
-    
+
     Strategies:
     - **Triton (small)**: Entire index cached in VRAM for instant search
     - **Triton+mmap (medium)**: Stream from disk using mmap, GPU scoring
     - **PLAID+Triton (large)**: PLAID for candidate generation, Triton for reranking
-    
+
     Attributes:
         index_path: Path to index directory
         config: Index configuration
@@ -63,27 +65,27 @@ class ColbertIndex:
         use_cache: Whether to use VRAM cache
         plaid_index: PLAID index for large-scale search
         plaid_path: Path to PLAID index
-    
+
     Example:
         >>> # Create new index
         >>> index = ColbertIndex(
         ...     index_path="/data/colbert",
         ...     config=IndexConfig(small_threshold=5000)
         ... )
-        >>> 
+        >>>
         >>> # Build from batches
         >>> def batch_gen():
         ...     for batch in batches:
         ...         yield embeddings, metadata
         >>> index.build_from_batches(batch_gen(), max_tokens=512)
-        >>> 
+        >>>
         >>> # Search
         >>> scores, indices = index.search(queries, top_k=10)
-        >>> 
+        >>>
         >>> # Load existing index
         >>> index = ColbertIndex.load("/data/colbert")
     """
-    
+
     def __init__(
         self,
         index_path: Path,
@@ -93,13 +95,13 @@ class ColbertIndex:
     ):
         """
         Initialize enterprise ColBERT index.
-        
+
         Args:
             index_path: Path to index directory
             config: IndexConfig instance
             create_if_missing: Create directory if it doesn't exist
             storage_mode: 'sync' (default, reliable) or 'async' (2x faster, GPU-optimized)
-        
+
         Notes:
             - 'sync': Simple, reliable, good for <10K docs, CPU-bound during indexing
             - 'async': 2x faster, GPU-optimized, best for >10K docs, uses async pipeline
@@ -108,11 +110,11 @@ class ColbertIndex:
         self.index_path = Path(index_path)
         self.config = config
         self.storage_mode = storage_mode
-        
+
         # Create directory
         if create_if_missing:
             self.index_path.mkdir(parents=True, exist_ok=True)
-        
+
         # Storage layer (sync or async)
         if storage_mode == 'sync':
             self.storage = Storage(self.index_path, self.config)
@@ -125,12 +127,12 @@ class ColbertIndex:
             )
         else:
             raise ValueError(f"Invalid storage_mode: {storage_mode}. Use 'sync' or 'async'")
-        
+
         # Load existing metadata
         if (self.index_path / "metadata.json").exists():
             self.storage.load_metadata()
             logger.info(f"Loaded existing index from {index_path}")
-        
+
         # Cache (for small indexes)
         self.cached_embeddings: Optional[torch.Tensor] = None
         self.cached_doc_ids: List[int] = []
@@ -138,7 +140,7 @@ class ColbertIndex:
         self.use_cache = False
         self.last_search_profile: dict[str, object] = {}
         self.last_write_profile: dict[str, object] = {}
-        
+
         # PLAID index (for large scale)
         self.plaid_index = None
         self.plaid_path = self.index_path / "plaid"
@@ -161,9 +163,9 @@ class ColbertIndex:
 
         # Save config
         self._save_config()
-        
+
         logger.info(f"Initialized ColbertIndex at {index_path}")
-    
+
     def build_from_batches(
         self,
         batch_generator: Generator[Tuple[torch.Tensor, Optional[List[dict]]], None, None],
@@ -172,22 +174,22 @@ class ColbertIndex:
     ) -> List[int]:
         """
         Build index from batch generator (TRUE STREAMING - no RAM spikes!).
-        
+
         Args:
             batch_generator: Generator yielding (embeddings, metadata)
                 embeddings: [batch_size, num_tokens, embed_dim]
                 metadata: Optional list of metadata dicts
             collection_name: Collection name
             max_tokens: Maximum token length (RECOMMENDED for true streaming!)
-        
+
         Returns:
             List of assigned document IDs
-        
+
         Example:
             >>> def batch_gen():
             ...     for i in range(0, len(docs), batch_size):
             ...         yield doc_embeddings[i:i+batch_size], None
-            >>> 
+            >>>
             >>> doc_ids = index.build_from_batches(
             ...     batch_gen(),
             ...     collection_name="main",
@@ -196,7 +198,7 @@ class ColbertIndex:
         """
         logger.info(f"Building index from batches (collection: {collection_name})")
         start_time = time.time()
-        
+
         # Stream to disk via storage layer (sync or async)
         storage_start = time.perf_counter()
         if self.storage_mode == 'sync':
@@ -216,12 +218,12 @@ class ColbertIndex:
         else:
             raise ValueError(f"Invalid storage_mode: {self.storage_mode}")
         storage_elapsed_ms = (time.perf_counter() - storage_start) * 1000.0
-        
+
         # Determine strategy and build secondary indexes
         strategy_start = time.perf_counter()
         self._update_strategy()
         strategy_elapsed_ms = (time.perf_counter() - strategy_start) * 1000.0
-        
+
         build_time = time.time() - start_time
         self.last_write_profile = {
             "mode": "build_from_batches",
@@ -231,9 +233,9 @@ class ColbertIndex:
             "total_ms": build_time * 1000.0,
         }
         logger.info(f"Index built in {build_time:.2f}s ({len(doc_ids)} documents)")
-        
+
         return doc_ids
-    
+
     def add_documents(
         self,
         embeddings: torch.Tensor,
@@ -242,12 +244,12 @@ class ColbertIndex:
     ) -> List[int]:
         """
         Add documents to index.
-        
+
         Args:
             embeddings: Document embeddings [num_docs, num_tokens, embed_dim]
             collection_name: Collection name
             metadata: Optional metadata per document
-        
+
         Returns:
             List of assigned document IDs
         """
@@ -265,17 +267,17 @@ class ColbertIndex:
             "total_ms": storage_elapsed_ms + strategy_elapsed_ms,
         }
         return doc_ids
-    
+
     def delete_documents(self, doc_ids: List[int]) -> None:
         """
         Delete documents from index.
-        
+
         Args:
             doc_ids: Document IDs to delete
         """
         self.storage.delete_documents(doc_ids)
         self._update_strategy()
-    
+
     def update_documents(
         self,
         doc_ids: List[int],
@@ -283,38 +285,38 @@ class ColbertIndex:
     ) -> None:
         """
         Update documents in index.
-        
+
         Args:
             doc_ids: Document IDs to update
             embeddings: New embeddings [len(doc_ids), num_tokens, embed_dim]
         """
         self.storage.update_documents(doc_ids, embeddings)
         self._update_strategy()
-    
+
     def create_collection(self, name: str, doc_ids: List[int]) -> None:
         """
         Create a collection.
-        
+
         Args:
             name: Collection name
             doc_ids: Document IDs in collection
         """
         self.storage.create_collection(name, doc_ids)
-    
+
     def delete_collection(self, name: str) -> None:
         """
         Delete a collection.
-        
+
         Args:
             name: Collection name
         """
         self.storage.delete_collection(name)
-    
+
     def compact(self) -> None:
         """Compact storage (physically remove deleted documents)."""
         self.storage.compact()
         self._update_strategy()
-    
+
     def search(
         self,
         queries: torch.Tensor,
@@ -324,21 +326,21 @@ class ColbertIndex:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Search with automatic mode selection.
-        
+
         Automatically routes to the optimal search mode based on corpus size:
         - 🚀 REAL-TIME MODE: Pure Triton (in-memory, 50+ QPS)
         - 💎 HIGH QUALITY MODE: Triton + mmap (exact search, no compromises)
         - ⚖️ BALANCED MODE: PLAID + Triton (optimized speed-quality ratio)
-        
+
         Args:
             queries: Query embeddings [num_queries, num_tokens, embed_dim]
             top_k: Number of results to return
             collection_name: Optional collection to search
-        
+
         Returns:
             scores: [num_queries, top_k]
             indices: [num_queries, top_k]
-        
+
         Example:
             >>> scores, indices = index.search(query_embeddings, top_k=10)
             >>> for i in range(queries.shape[0]):
@@ -346,7 +348,7 @@ class ColbertIndex:
         """
         queries = queries.to(self.config.device)
         explicit_doc_ids = doc_ids is not None
-        
+
         # Get active document IDs
         if doc_ids is not None:
             doc_ids = [int(doc_id) for doc_id in doc_ids if int(doc_id) not in self.storage.deleted_ids]
@@ -368,14 +370,14 @@ class ColbertIndex:
             if len(doc_ids) < self.config.realtime_threshold:
                 return self._search_triton(queries, top_k, doc_ids)
             return self._search_triton_mmap(queries, top_k, doc_ids)
-        
+
         # Route to appropriate mode
         stats = self.storage.get_statistics(
             self.config.realtime_threshold,
             self.config.balanced_threshold
         )
         strategy = stats.strategy
-        
+
         if strategy == "realtime":
             return self._search_triton(queries, top_k, doc_ids)
         elif strategy == "high_quality":
@@ -397,7 +399,7 @@ class ColbertIndex:
             for row in topk_indices.detach().cpu()
         ]
         return torch.tensor(mapped, device=topk_indices.device, dtype=torch.long)
-    
+
     def _search_triton(
         self,
         queries: torch.Tensor,
@@ -406,7 +408,7 @@ class ColbertIndex:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Small scale: Pure Triton (cached in VRAM).
-        
+
         Fastest strategy for small corpora. Entire index is cached in VRAM.
         """
         load_start = time.perf_counter()
@@ -446,7 +448,7 @@ class ColbertIndex:
             "used_cache": used_cache,
         }
         return topk_scores, self._map_local_indices(topk_indices, doc_ids)
-    
+
     def _search_triton_mmap(
         self,
         queries: torch.Tensor,
@@ -455,7 +457,7 @@ class ColbertIndex:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Medium scale: Triton + mmap streaming.
-        
+
         Streams documents from disk in chunks, scores with Triton kernel.
         Memory-efficient for medium-sized corpora.
         """
@@ -467,7 +469,7 @@ class ColbertIndex:
             score_ms += (time.perf_counter() - score_start) * 1000.0
             all_scores.append(chunk_scores)
             del chunk
-        
+
         scores = torch.cat(all_scores, dim=1)
         topk_start = time.perf_counter()
         topk_scores, topk_indices = torch.topk(scores, k=min(top_k, scores.shape[1]), dim=1)
@@ -481,7 +483,7 @@ class ColbertIndex:
             "chunk_size": self.config.chunk_size,
         }
         return topk_scores, self._map_local_indices(topk_indices, doc_ids)
-    
+
     def _search_plaid_triton(
         self,
         queries: torch.Tensor,
@@ -490,49 +492,49 @@ class ColbertIndex:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Large scale: PLAID candidates → Triton reranking.
-        
+
         Two-stage search:
         1. PLAID generates candidates (fast approximate search)
         2. Triton reranks candidates (exact scoring on subset)
         """
         if self.plaid_index is None:
             self._build_plaid_index()
-        
+
         # Get candidates from PLAID (use reasonable number, not entire small_threshold!)
         num_candidates = min(500, self.storage.num_docs)  # 500 candidates is plenty
         Q_list = [queries[i] for i in range(queries.shape[0])]
-        
+
         plaid_results = self.plaid_index.search(
             queries_embeddings=Q_list,
             top_k=num_candidates,
             n_ivf_probe=self.config.plaid_n_ivf_probe,
             n_full_scores=min(100, num_candidates)  # Also limit full scoring
         )
-        
+
         # Rerank with Triton
         all_scores = []
         all_indices = []
-        
+
         for q_idx in range(queries.shape[0]):
             candidate_ids = [doc_id for doc_id, _ in plaid_results[q_idx]]
-            
+
             if not candidate_ids:
                 all_scores.append(torch.zeros(top_k, device=self.config.device))
                 all_indices.append(torch.zeros(top_k, dtype=torch.long, device=self.config.device))
                 continue
-            
+
             # Sort candidate IDs (HDF5 requires sorted indices)
             candidate_ids_sorted = sorted(candidate_ids)
-            
+
             # Load candidates
             candidates = self.storage.load_documents(
                 doc_ids=candidate_ids_sorted,
                 device=self.config.device
             )
-            
+
             # Score with Triton
             candidate_scores = fast_colbert_scores(queries[q_idx:q_idx+1], candidates).squeeze(0)
-            
+
             # Top-k
             k = min(top_k, len(candidate_ids))
             topk_scores, topk_local = torch.topk(candidate_scores, k=k)
@@ -540,15 +542,15 @@ class ColbertIndex:
                 [candidate_ids_sorted[i] for i in topk_local.cpu().numpy()],
                 device=self.config.device
             )
-            
+
             all_scores.append(topk_scores)
             all_indices.append(topk_global)
-        
+
         scores = torch.stack(all_scores, dim=0)
         indices = torch.stack(all_indices, dim=0)
-        
+
         return scores, indices
-    
+
     def _search_gem_triton(
         self,
         queries: torch.Tensor,
@@ -693,32 +695,32 @@ class ColbertIndex:
         except ImportError:
             logger.warning("fast-plaid not installed, falling back to triton_mmap")
             return
-        
+
         logger.info("Building PLAID index...")
-        
+
         # Load documents
         doc_list = []
         for chunk in self.storage.load_documents_streaming(device='cpu'):
             doc_list.extend([chunk[i] for i in range(chunk.shape[0])])
-        
+
         self.plaid_path.mkdir(parents=True, exist_ok=True)
-        
+
         self.plaid_index = fast_plaid_search.FastPlaid(
             index=str(self.plaid_path),
             preload_index=True
         )
-        
+
         self.plaid_index.create(
             documents_embeddings=doc_list,
             nbits=self.config.plaid_nbits
         )
-        
+
         logger.info("PLAID index built")
-    
+
     def _update_strategy(self) -> None:
         """
         Update strategy based on corpus size.
-        
+
         Automatically selects optimal mode:
         - REAL-TIME MODE: < realtime_threshold (default 1000 docs)
         - HIGH QUALITY MODE: realtime_threshold to balanced_threshold
@@ -728,7 +730,7 @@ class ColbertIndex:
             self.config.realtime_threshold,
             self.config.balanced_threshold
         )
-        
+
         if stats.strategy == "realtime" and self.config.cache_realtime_index:
             # REAL-TIME MODE: Pure Triton, cached in VRAM
             self.cached_doc_ids = [i for i in range(self.storage.num_docs) if i not in self.storage.deleted_ids]
@@ -752,11 +754,11 @@ class ColbertIndex:
             if self.plaid_index is None:
                 self._build_plaid_index()
             logger.info("⚖️ BALANCED MODE: PLAID + Triton (optimized speed-quality ratio)")
-    
+
     def get_statistics(self) -> IndexStatistics:
         """
         Get index statistics.
-        
+
         Returns:
             IndexStatistics object with all metrics and selected mode
         """
@@ -764,37 +766,37 @@ class ColbertIndex:
             self.config.realtime_threshold,
             self.config.balanced_threshold
         )
-    
+
     def _save_config(self) -> None:
         """Save configuration to JSON."""
         config_path = self.index_path / "config.json"
         with open(config_path, 'w') as f:
             json.dump(self.config.to_dict(), f, indent=2)
-    
+
     @classmethod
     def load(cls, index_path: Path, device: str = 'cuda') -> 'ColbertIndex':
         """
         Load existing index from disk.
-        
+
         Args:
             index_path: Path to index directory
             device: Compute device ('cuda' or 'cpu')
-        
+
         Returns:
             Loaded index instance
-        
+
         Example:
             >>> index = ColbertIndex.load("/data/colbert", device='cuda')
             >>> scores, indices = index.search(queries, top_k=10)
         """
         index_path = Path(index_path)
-        
+
         # Load config
         config_path = index_path / "config.json"
         if config_path.exists():
             with open(config_path, 'r') as f:
                 config_dict = json.load(f)
-            
+
             # Import IndexConfig from config module
             from ..config import IndexConfig
             config = IndexConfig.from_dict(config_dict)
@@ -802,13 +804,13 @@ class ColbertIndex:
         else:
             from ..config import IndexConfig
             config = IndexConfig(device=device)
-        
+
         return cls(index_path, config, create_if_missing=False)
-    
+
     def cleanup(self) -> None:
         """
         Clean up resources and delete index from disk.
-        
+
         Warning: This permanently deletes the index!
         """
         if self.index_path.exists():

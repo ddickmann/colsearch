@@ -1,3 +1,5 @@
+#![allow(clippy::useless_conversion, clippy::too_many_arguments)]
+
 pub mod visited;
 pub mod id_tracker;
 pub mod emd;
@@ -227,6 +229,7 @@ impl GemSegment {
             let query_ctop = compute_ctop(codebook, &query_cids, n_probes.max(inner_ctop_r));
             let mut entries: Vec<u32> = postings.representatives_for_clusters(&query_ctop);
             entries.push(cur_entry);
+            entries.sort_unstable();
             entries.dedup();
 
             let results = beam_search(
@@ -426,6 +429,7 @@ impl GemSegment {
                 let query_ctop = compute_ctop(codebook, &query_cids, n_probes.max(ctop_r));
                 let mut entries: Vec<u32> = postings.representatives_for_clusters(&query_ctop);
                 entries.push(cur_entry);
+                entries.sort_unstable();
                 entries.dedup();
 
                 let hits = beam_search(
@@ -543,15 +547,17 @@ impl PyMutableGemSegment {
         Ok(())
     }
 
-    /// Search the mutable segment.
-    #[pyo3(signature = (query_vectors, k = 10, ef = 100, _n_probes = 4))]
+    /// Search the mutable segment. `n_probes` is accepted for API parity but
+    /// unused: mutable segments use a flat single-layer graph.
+    #[pyo3(signature = (query_vectors, k = 10, ef = 100, n_probes = 4))]
     fn search(
         &self,
         py: Python<'_>,
         query_vectors: PyReadonlyArray2<f32>,
         k: usize,
         ef: usize,
-        _n_probes: usize,
+        #[allow(unused_variables)]
+        n_probes: usize,
     ) -> PyResult<Vec<(u64, f32)>> {
         let seg = self.inner.as_ref().ok_or_else(|| {
             PyValueError::new_err("segment not built")

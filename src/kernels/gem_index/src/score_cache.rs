@@ -55,6 +55,10 @@ impl ScoreCache {
         self.cache.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }

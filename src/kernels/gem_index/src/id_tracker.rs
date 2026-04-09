@@ -9,6 +9,12 @@ pub struct IdTracker {
     n_deleted: usize,
 }
 
+impl Default for IdTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IdTracker {
     pub fn new() -> Self {
         Self {
@@ -77,7 +83,7 @@ impl IdTracker {
 
     #[inline]
     pub fn int_to_ext(&self, int_id: u32) -> u64 {
-        self.int_to_ext.get(int_id as usize).copied().unwrap_or(0)
+        self.int_to_ext.get(int_id as usize).copied().unwrap_or(u64::MAX)
     }
 
     pub fn int_to_ext_checked(&self, int_id: u32) -> Option<u64> {

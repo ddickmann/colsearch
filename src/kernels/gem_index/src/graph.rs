@@ -168,11 +168,10 @@ impl GemGraph {
 
             for (cand_idx, _) in candidates.iter().take(max_per_node) {
                 let cand = *cand_idx as usize;
-                if cand != target && !self.shortcuts[target].contains(cand_idx) {
-                    if self.shortcuts[target].len() < max_per_node {
+                if cand != target && !self.shortcuts[target].contains(cand_idx)
+                    && self.shortcuts[target].len() < max_per_node {
                         self.shortcuts[target].push(*cand_idx);
                     }
-                }
             }
         }
     }
@@ -392,14 +391,22 @@ pub fn build_graph_with_payload(
 
     let mut entry_point: u32 = 0;
 
-    for i in 1..n_docs {
+    for i in 0..n_docs {
         let (start, end) = doc_offsets[i];
         let n_tokens = end - start;
         let doc_vecs = &all_vectors[start * dim..end * dim];
         let query_scores = codebook.compute_query_centroid_scores(doc_vecs, n_tokens);
         let node_level = node_levels[i];
-        let ep_level = node_levels[entry_point as usize];
 
+        if i == 0 {
+            // First node: no neighbors to search yet, just update entry point
+            if node_level > node_levels[entry_point as usize] {
+                entry_point = i as u32;
+            }
+            continue;
+        }
+
+        let ep_level = node_levels[entry_point as usize];
         let mut cur_entry = entry_point;
 
         // Greedy search from top to node_level+1 (upper layers, ef=1)
@@ -423,22 +430,21 @@ pub fn build_graph_with_payload(
             let mut entries = vec![cur_entry];
             if level == 0 {
                 for &cluster in &doc_profiles[i].ctop {
-                    if let Some(reps) = postings.cluster_reps.get(cluster as usize) {
-                        if let Some(rep) = reps {
-                            if (*rep as usize) < i && !entries.contains(rep) {
-                                entries.push(*rep);
-                            }
+                    if let Some(Some(rep)) = postings.cluster_reps.get(cluster as usize) {
+                        if (*rep as usize) < i && !entries.contains(rep) {
+                            entries.push(*rep);
                         }
                     }
                 }
             }
 
-            let adj = VecAdjacency(&levels[level]);
-            let candidates = beam_search_construction(
-                &adj, &entries, &query_scores, n_tokens,
-                flat_codes, n_fine, ef_construction, i,
-            );
-            drop(adj);
+            let candidates = {
+                let adj = VecAdjacency(&levels[level]);
+                beam_search_construction(
+                    &adj, &entries, &query_scores, n_tokens,
+                    flat_codes, n_fine, ef_construction, i,
+                )
+            };
 
             if let Some(&(best, _)) = candidates.first() {
                 cur_entry = best;
@@ -494,7 +500,7 @@ pub fn build_graph_with_payload(
 
 /// Bridge repair on a mutable adjacency layer.
 pub fn bridge_repair(
-    adjacency: &mut Vec<Vec<u32>>,
+    adjacency: &mut [Vec<u32>],
     max_degree: usize,
     postings: &ClusterPostings,
     codebook: &TwoStageCodebook,

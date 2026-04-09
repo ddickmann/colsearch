@@ -12,17 +12,12 @@ Provides implementations for various search engines:
 All engines implement the BaseSearchEngine interface.
 """
 
-from ..engines.base import (
-    BaseSearchEngine,
-    DenseSearchEngine,
-    SparseSearchEngine,
-    GraphSearchEngine,
-    SearchResult
-)
-from ..engines.colbert import ColBERTEngine
-from ..engines.colpali import ColPaliEngine, ColPaliConfig, MultiModalEngine
-from ..engines.bm25 import BM25Engine as LegacyBM25Engine, InvertedIndex, BM25Tokenizer
+from ..engines.base import BaseSearchEngine, DenseSearchEngine, GraphSearchEngine, SearchResult, SparseSearchEngine
+from ..engines.bm25 import BM25Engine as LegacyBM25Engine
+from ..engines.bm25 import BM25Tokenizer, InvertedIndex
 from ..engines.bm25s_engine import BM25sEngine
+from ..engines.colbert import ColBERTEngine
+from ..engines.colpali import ColPaliConfig, ColPaliEngine, MultiModalEngine
 from ..engines.neo4j import Neo4jEngine
 
 # Canonical sparse engine surface for OSS callers.
@@ -30,7 +25,7 @@ BM25Engine = BM25sEngine
 
 # HNSW is optional (requires hnswlib)
 try:
-    from ..engines.hnsw import HNSWEngine, HNSWConfig
+    from ..engines.hnsw import HNSWConfig, HNSWEngine
     _HNSW_AVAILABLE = True
 except ImportError:
     HNSWEngine = None

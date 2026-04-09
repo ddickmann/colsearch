@@ -6,6 +6,11 @@ use crate::id_tracker::IdTracker;
 use crate::search::{beam_search, beam_search_construction};
 
 /// Mutable GEM segment supporting insert, delete, upsert, and compaction.
+///
+/// Uses a single flat adjacency layer (not multi-level HNSW). This is a deliberate
+/// trade-off: mutable segments sacrifice navigability for O(1) insert. Sealed segments
+/// use multi-level HNSW and provide better recall/latency. Keep mutable segments small
+/// and seal promptly.
 pub struct MutableGemSegment {
     pub adjacency: Vec<Vec<u32>>,
     pub max_degree: usize,
@@ -171,18 +176,19 @@ impl MutableGemSegment {
         }
 
         if !entries.is_empty() {
-            let adj = VecAdjacency(&self.adjacency);
-            let candidates = beam_search_construction(
-                &adj,
-                &entries,
-                &query_scores,
-                n_tokens,
-                &self.flat_codes,
-                n_fine,
-                self.ef_construction,
-                idx,
-            );
-            drop(adj);
+            let candidates = {
+                let adj = VecAdjacency(&self.adjacency);
+                beam_search_construction(
+                    &adj,
+                    &entries,
+                    &query_scores,
+                    n_tokens,
+                    &self.flat_codes,
+                    n_fine,
+                    self.ef_construction,
+                    idx,
+                )
+            };
 
             let doc_codes = self.flat_codes.doc_codes(idx);
             let neighbors = select_neighbors_heuristic(
@@ -428,11 +434,11 @@ impl MutableGemSegment {
 
         final_results
             .into_iter()
-            .take(k)
-            .map(|(int_id, score)| {
+            .filter_map(|(int_id, score)| {
                 let ext_id = self.id_tracker.int_to_ext(int_id);
-                (ext_id, score)
+                if ext_id == u64::MAX { None } else { Some((ext_id, score)) }
             })
+            .take(k)
             .collect()
     }
 

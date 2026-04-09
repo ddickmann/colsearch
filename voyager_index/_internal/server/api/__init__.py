@@ -1,15 +1,15 @@
 """API routes and models."""
 
-from .routes import router
 from .models import (
-    CreateCollectionRequest,
     AddPointsRequest,
-    SearchRequest,
-    OptimizeRequest,
-    SearchResponse,
     CollectionInfo,
+    CreateCollectionRequest,
     HealthResponse,
+    OptimizeRequest,
+    SearchRequest,
+    SearchResponse,
 )
+from .routes import router
 
 __all__ = [
     'router',

@@ -1,3 +1,5 @@
+#![allow(clippy::useless_conversion, clippy::too_many_arguments)]
+
 pub mod codebook;
 pub mod router;
 pub mod persistence;

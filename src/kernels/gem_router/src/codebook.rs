@@ -423,8 +423,8 @@ unsafe fn qch_proxy_score_u16_avx2(
         let mut row_max = _mm_cvtss_f32(max32);
 
         // Handle remaining codes with scalar
-        for i in (chunks * 8)..n_codes {
-            let idx = doc_codes[i] as usize;
+        for &code in &doc_codes[(chunks * 8)..n_codes] {
+            let idx = code as usize;
             if idx < n_centroids {
                 let s = *row_ptr.add(idx);
                 if s > row_max {

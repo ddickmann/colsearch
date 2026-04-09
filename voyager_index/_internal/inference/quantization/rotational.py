@@ -15,13 +15,13 @@ References:
 - NumPy FWHT implementation
 """
 
-from typing import Any, Optional, Tuple, Union, List
+import logging
 from dataclasses import dataclass
+from typing import Any, Optional, Tuple, Union
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-import logging
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class RoQConfig:
     seed: int = 42                 # Random seed for reproducibility
     group_size: Optional[int] = None  # Optional group-wise scale size (2-bit/4-bit)
     query_bits: Optional[int] = None  # Optional asymmetric query quantization for screening
-    
+
     def __post_init__(self):
         if self.num_bits not in (1, 2, 4, 8):
             raise ValueError("num_bits must be one of 1, 2, 4, or 8")
@@ -67,37 +67,37 @@ class RoQConfig:
 class FastWalshHadamard:
     """
     Fast Walsh-Hadamard Transform (FWHT) based pseudorandom rotation.
-    
+
     Applies multiple rounds of:
     1. Random sign flipping D_i
     2. Blocked Walsh-Hadamard Transform H
     3. Random permutation P_i (swapping entries)
-    
+
     R(x) = ... P_2 H D_2 P_1 H D_1 x
     """
-    
+
     def __init__(self, dim: int, num_rounds: int = 3, block_size: int = 256, seed: int = 42):
         self.dim = dim
         self.num_rounds = num_rounds
         self.block_size = block_size
         self.seed = seed
-        
+
         # Verify block size is power of 2
         assert (block_size & (block_size - 1) == 0) and block_size > 0
-        
+
         # Precompute random signs and permutations
         self.rng = np.random.RandomState(seed)
         self.signs = []
         self.permutations = []
-        
+
         # Calculate padded dimension (multiple of block_size)
         self.padded_dim = ((dim + block_size - 1) // block_size) * block_size
-        
+
         for _ in range(num_rounds):
             # Random signs {-1, 1}
             s = self.rng.choice([-1.0, 1.0], size=self.padded_dim).astype(np.float32)
             self.signs.append(torch.from_numpy(s))
-            
+
             # Random permutation
             p = self.rng.permutation(self.padded_dim)
             self.permutations.append(torch.from_numpy(p))
@@ -128,10 +128,10 @@ class FastWalshHadamard:
             x: Input embeddings (N, D)
         Returns:
             Rotated embeddings (N, D) - padded dimensions are trimmed if needed
-            Wait, we want to keep them somewhat padded/permuted? 
-            No, we should probably return original dimension for simplicity, 
+            Wait, we want to keep them somewhat padded/permuted?
+            No, we should probably return original dimension for simplicity,
             or keep padded for quantization efficiency.
-            
+
             Weaviate keeps them padded/transformed for quantization.
             For simplicity here, we'll return original dim but typically entire pipeline uses padded.
             Let's return padded for now, quantization handles it.
@@ -139,35 +139,35 @@ class FastWalshHadamard:
         # Move params to x device if needed
         device = x.device
         dtype = x.dtype
-        
+
         N = x.shape[0]
-        
+
         # Pad input
         if self.padded_dim > self.dim:
             padding = torch.zeros(N, self.padded_dim - self.dim, device=device, dtype=dtype)
             x_curr = torch.cat([x, padding], dim=1)
         else:
             x_curr = x.clone()
-            
+
         for i in range(self.num_rounds):
             # 1. Random signs
             signs = self.signs[i].to(device)
             x_curr = x_curr * signs
-            
+
             # 2. Blocked FWHT
             # Reshape to (Batch, Blocks, BlockSize)
             reshaped = x_curr.view(N, -1, self.block_size)
             transformed = self._fwht(reshaped)
             x_curr = transformed.view(N, -1)
-            
+
             # 3. Random permutation (swapping)
             if i < self.num_rounds - 1: # Permute between rounds, maybe not last?
                 # Weaviate says: "Between each round of block-smoothening we randomly swap elements"
                 perm = self.permutations[i].to(device)
                 x_curr = x_curr[:, perm]
-                
+
         # Trim back to original dim?
-        # Rotation spreads info across ALL dimensions (including padding). 
+        # Rotation spreads info across ALL dimensions (including padding).
         # Trimming would lose info. We must start with padded dim.
         # But for 'quantization', we usually quantize the rotated vector.
         # We will return the full padded rotated vector.
@@ -177,14 +177,14 @@ class FastWalshHadamard:
 class RotationalQuantizer:
     """
     8-bit Rotational Quantizer.
-    
+
     Structure per vector:
     - code: D bytes (uint8)
     - scale: float32
-    - offset: float32 
+    - offset: float32
     - norm_sq: float32
     """
-    
+
     def __init__(self, config: RoQConfig):
         self.config = config
         self.rotator = FastWalshHadamard(
@@ -194,7 +194,7 @@ class RotationalQuantizer:
             seed=config.seed
         )
         self.effective_dim = self.rotator.padded_dim
-        
+
         # Storage
         self._codes: Optional[np.ndarray] = None    # (N, D_padded) uint8
         self._scales: Optional[np.ndarray] = None   # (N,) float32
@@ -206,7 +206,7 @@ class RotationalQuantizer:
                 raise ValueError(
                     f"{self.config.num_bits}-bit group_size={self.config.group_size} must divide the padded dimension {self.effective_dim}"
                 )
-        
+
     def fit(self, x: Union[np.ndarray, torch.Tensor]):
         """Nothing to train for FWHT rotation."""
         pass
@@ -547,31 +547,31 @@ class RotationalQuantizer:
             torch.as_tensor(codes.reshape(batch_size, item_count, -1), dtype=torch.uint8, device=device),
             torch.as_tensor(meta.reshape(batch_size, item_count, meta.shape[1]), dtype=torch.float32, device=device),
         )
-        
+
     def quantize(self, x: Union[np.ndarray, torch.Tensor], store: bool = True) -> dict:
         """
         Quantize embeddings.
-        
+
         Args:
             x: Embeddings (N, D)
             store: Whether to update internal index
-            
+
         Returns:
             Dictionary with quantized data
         """
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
         x = x.float()
-        
+
         # 1. Compute original norms (squared)
         # Store ||x||^2 for distance correction (needed for 8-bit, less critical for 1-bit but good to have)
         norms_sq = torch.sum(x ** 2, dim=1)
-        
+
         # 2. Rotate
         rotated = self.rotator.forward(x)
-        
+
         results = {}
-        
+
         if self.config.num_bits == 1:
             bits = (rotated >= 0).to(torch.uint8)
             packed = self._pack_lowbit_codes(bits, 1)
@@ -585,7 +585,7 @@ class RotationalQuantizer:
                 'query_bits': self.config.query_bits,
                 'meta_layout': 'binary_screening',
             }
-            
+
         elif self.config.num_bits == 2:
             group_size = self.config.group_size or self.effective_dim
             if group_size == self.effective_dim:
@@ -624,7 +624,7 @@ class RotationalQuantizer:
                     'group_size': group_size,
                     'meta_layout': 'grouped',
                 }
-            
+
         elif self.config.num_bits == 4:
             # 4-bit Quantization: [0, 15]
             # Optional group-wise scaling materially improves fidelity on real corpora.
@@ -673,21 +673,21 @@ class RotationalQuantizer:
         else:
             # 8-bit Quantization
             min_vals = rotated.min(dim=1).values
-            
+
             # ... (rest of 8-bit logic) ...
             max_vals = rotated.max(dim=1).values
             ranges = max_vals - min_vals
             ranges = torch.where(ranges < 1e-6, torch.ones_like(ranges), ranges)
-            
+
             deltas = ranges / 255.0
             offsets = min_vals
-            
+
             deltas_col = deltas.unsqueeze(1)
             offsets_col = offsets.unsqueeze(1)
-            
+
             quantized = (rotated - offsets_col) / deltas_col
             quantized = quantized.round().clamp(0, 255).byte()
-            
+
             results = {
                 'codes': quantized.cpu().numpy(),
                 'scales': deltas.cpu().numpy(),
@@ -695,7 +695,7 @@ class RotationalQuantizer:
                 'norms_sq': norms_sq.cpu().numpy(),
                 'code_sums': quantized.float().sum(dim=1).cpu().numpy()
             }
-        
+
         if store:
              self._codes = results['codes']
              self._scales = results['scales']
@@ -703,22 +703,22 @@ class RotationalQuantizer:
              self._norms_sq = results['norms_sq']
              self._code_sums = results.get('code_sums')
              logger.info(f"Stored {len(x)} vectors in index (bits={self.config.num_bits})")
-             
+
         return results
 
-    def decode(self, 
-               codes: Union[np.ndarray, torch.Tensor], 
-               scales: Union[np.ndarray, torch.Tensor], 
+    def decode(self,
+               codes: Union[np.ndarray, torch.Tensor],
+               scales: Union[np.ndarray, torch.Tensor],
                offsets: Union[np.ndarray, torch.Tensor]
                ) -> torch.Tensor:
         """
         Reconstruct vectors from quantized codes.
-        
+
         Args:
             codes: Quantized codes (N, D_packed)
             scales: Scales (N, 1) or (N,)
             offsets: Offsets (N, 1) or (N,)
-            
+
         Returns:
             Reconstructed vectors (N, D) - float32
         """
@@ -729,27 +729,27 @@ class RotationalQuantizer:
             scales = torch.from_numpy(scales)
         if isinstance(offsets, np.ndarray):
             offsets = torch.from_numpy(offsets)
-            
+
         codes = codes.to(device)
         scales = scales.to(device).float()
         offsets = offsets.to(device).float()
-        
+
         scales = self._reshape_meta(scales, batch_size=codes.shape[0], effective_dim=self.effective_dim).to(device)
         offsets = self._reshape_meta(offsets, batch_size=codes.shape[0], effective_dim=self.effective_dim).to(device)
-        
+
         N = codes.shape[0]
-        
+
         if self.config.num_bits == 8:
             # 8-bit: Direct mapping
             # x ~= (code * scale) + offset
             rotated_recon = (codes.float() * scales) + offsets
-            
+
         elif self.config.num_bits == 4:
             # 4-bit: Unpack
             # Byte = (High << 4) | Low
             high = (codes >> 4) & 0x0F
             low = codes & 0x0F
-            
+
             # Stack [High, Low] -> (N, D/2, 2)
             unpacked = torch.stack([high, low], dim=2)
             # Flatten -> (N, D)
@@ -762,7 +762,7 @@ class RotationalQuantizer:
                 rotated_recon = (
                     unpacked.float() * scales.unsqueeze(-1) + offsets.unsqueeze(-1)
                 ).view(N, -1)
-            
+
         elif self.config.num_bits == 2:
             unpacked = torch.stack(
                 [
@@ -795,13 +795,13 @@ class RotationalQuantizer:
         # Inverse is ... D_k H P_k^T (since H is symmetric unitary-ish, D is symmetric)
         # Actually H is symmetric. H^-1 = H (normalized).
         # We need to apply inverse steps in REVERSE order.
-        
+
         # Check Rotator param storage
         # It stores signs and permutations.
         # We assume self.rotator is the SAME one used for encoding (seed match).
-        
+
         x_recon = rotated_recon
-        
+
         # Reverse loop
         for i in range(self.rotator.num_rounds - 1, -1, -1):
             # 3. Inverse Permutation
@@ -813,24 +813,24 @@ class RotationalQuantizer:
                 perm = self.rotator.permutations[i].to(device)
                 inv_perm = torch.argsort(perm)
                 x_recon = x_recon[:, inv_perm]
-            
+
             # 2. Blocked FWHT (Self-inverse)
             # x_recon is (N, D_padded)
             reshaped = x_recon.view(N, -1, self.rotator.block_size)
             transformed = self.rotator._fwht(reshaped)
             x_recon = transformed.view(N, -1)
-            
+
             # 1. Inverse Signs (Self-inverse since {-1, 1})
             signs = self.rotator.signs[i].to(device)
             x_recon = x_recon * signs
-            
+
         # Trim padding if needed
         if self.config.dim < x_recon.shape[1]:
              x_recon = x_recon[:, :self.config.dim]
-             
+
         return x_recon
 
-    def _symmetric_distance(self, 
+    def _symmetric_distance(self,
                             q_codes: torch.Tensor, q_scale: torch.Tensor, q_offset: torch.Tensor, q_norm_sq: torch.Tensor,
                             doc_codes: torch.Tensor, doc_scale: torch.Tensor, doc_offset: torch.Tensor, doc_norm_sq: torch.Tensor
                             ) -> torch.Tensor:
