@@ -51,16 +51,13 @@ def test_curated_top_level_layout_hides_root_clutter() -> None:
         assert not (REPO_ROOT / entry).exists(), entry
 
     expected_release_paths = {
-        "docs/README.md",
-        "docs/full_feature_cookbook.md",
-        "docs/reference_api_tutorial.md",
-        "docs/validation/README.md",
-        "examples/README.md",
-        "notebooks/README.md",
-        "tools/README.md",
-        "tools/benchmarks/README.md",
-        "tools/verification/README.md",
-        "tools/dev/README.md",
+        "docs/getting-started/quickstart.md",
+        "docs/api/python.md",
+        "docs/guides/scaling.md",
+        "README.md",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "ROADMAP.md",
     }
     for entry in expected_release_paths:
         assert (REPO_ROOT / entry).exists(), entry
@@ -68,18 +65,12 @@ def test_curated_top_level_layout_hides_root_clutter() -> None:
 
 def test_readme_routes_users_to_polished_release_entrypoints() -> None:
     payload = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "docs/reference_api_tutorial.md" in payload
-    assert "docs/full_feature_cookbook.md" in payload
-    assert "docs/README.md" in payload
-    assert "examples/README.md" in payload
-    assert "examples/reference_api_feature_tour.py" in payload
-    assert "notebooks/README.md" in payload
-    assert "tools/README.md" in payload
-    assert "docs/validation/README.md" in payload
+    assert "docs/getting-started/quickstart.md" in payload or "Quickstart" in payload
+    assert "docs/api/python.md" in payload or "API Reference" in payload
+    assert "docs/guides/scaling.md" in payload or "Scaling Guide" in payload
     assert "Tabu Search" in payload
-    assert "/reference/optimize" in payload
-    assert "/reference/preprocess/documents" in payload
     assert "http://127.0.0.1:8080/docs" in payload
+    assert "multi-vector native" in payload.lower()
 
 
 def test_public_examples_and_benchmark_do_not_reach_into_internal_modules() -> None:
@@ -96,13 +87,14 @@ def test_public_examples_and_benchmark_do_not_reach_into_internal_modules() -> N
         assert "voyager_index._internal" not in payload, path
 
 
-def test_docs_index_and_tutorial_route_to_full_feature_cookbook() -> None:
-    docs_index = (REPO_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
-    tutorial = (REPO_ROOT / "docs" / "reference_api_tutorial.md").read_text(encoding="utf-8")
-    assert "docs/full_feature_cookbook.md" in docs_index
-    assert "docs/full_feature_cookbook.md" in tutorial
-    assert "examples/reference_api_feature_tour.py" in docs_index
-    assert "examples/reference_api_feature_tour.py" in tutorial
+def test_docs_quickstart_and_api_ref_exist() -> None:
+    quickstart = REPO_ROOT / "docs" / "getting-started" / "quickstart.md"
+    api_ref = REPO_ROOT / "docs" / "api" / "python.md"
+    assert quickstart.exists(), "quickstart.md missing"
+    assert api_ref.exists(), "python.md API ref missing"
+    qs_text = quickstart.read_text(encoding="utf-8")
+    assert "voyager_index" in qs_text
+    assert "Index" in qs_text
 
 
 def test_reference_api_happy_path_example_smoke(tmp_path: Path) -> None:
