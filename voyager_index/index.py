@@ -128,14 +128,34 @@ class Index:
         Keyword Args (passed through to GemNativeSegmentManager):
             rerank_device: Device for MaxSim reranking ('cuda', 'cpu', or None
                 to disable reranking). When set, GEM proxy results are reranked
-                with exact late-interaction scoring.
-            roq_rerank: Enable ROQ 4-bit quantized MaxSim reranking.
-                Requires ``rerank_device`` to be a CUDA device.
-            roq_bits: Bit width for ROQ quantization (default 4).
-            use_emd: Use qEMD (Sinkhorn) for graph construction instead of qCH.
-            dual_graph: Build per-cluster local graphs with cross-cluster bridges.
-            warmup_kernels: Pre-compile Triton kernels at init (default True).
-            seed_batch_size: Docs to buffer before building the first graph.
+                with exact late-interaction scoring on GPU.
+            roq_rerank: Enable ROQ quantized MaxSim reranking with a fused
+                Triton kernel (~8x memory reduction vs FP32). Requires CUDA.
+                When enabled and ``rerank_device`` is None, auto-selects CUDA.
+            roq_bits: Bit width for ROQ quantization (default 4). The fused
+                Triton rerank kernel uses 4-bit regardless; this controls the
+                quantizer's compression level.
+            use_emd: Use qEMD (Sinkhorn OT) for graph construction (default
+                True in the manager). qEMD provides metric-decoupled
+                construction for stable navigation; qCH is faster but
+                non-metric. Set False to use qCH for both build and search.
+            dual_graph: Build per-cluster local graphs with cross-cluster
+                bridge enforcement (default True). Algorithms 1-3 from the
+                GEM paper.
+            warmup_kernels: Pre-compile Triton kernels at init for zero
+                cold-start latency (default True). Only runs when
+                ``rerank_device`` is set and not 'cpu'.
+            seed_batch_size: Minimum documents to buffer before training the
+                codebook and building the first mutable graph (default 256).
+            max_kmeans_iter: Maximum K-means iterations for codebook training
+                (default 15).
+            ctop_r: Number of top coarse clusters per document for routing
+                (default 3).
+            enable_shortcuts: Enable semantic shortcut edges from training
+                pairs (default False).
+            store_raw_vectors: Keep raw float32 vectors in sealed segments
+                for in-segment MaxSim reranking (default True). Set False
+                to save memory when using external GPU reranking.
         """
         self._path = Path(path)
         self._path.mkdir(parents=True, exist_ok=True)

@@ -20,14 +20,18 @@ Index(
     ef_construction: int = 200,  # beam width during build
     n_probes: int = 4,           # clusters to probe during search
     enable_wal: bool = True,     # write-ahead log
-    # GEM keyword args (passed through):
-    rerank_device: str = None,   # "cuda" for GPU MaxSim reranking
-    roq_rerank: bool = False,    # enable ROQ 4-bit reranking
-    roq_bits: int = 4,           # ROQ quantization bit width
-    use_emd: bool = False,       # qEMD for graph construction
-    dual_graph: bool = True,     # per-cluster + cross-cluster bridges
-    warmup_kernels: bool = True, # vLLM-style Triton pre-compilation
-    seed_batch_size: int = 256,  # docs before codebook training
+    # GEM keyword args (passed through to GemNativeSegmentManager):
+    rerank_device: str = None,       # "cuda" for GPU MaxSim reranking
+    roq_rerank: bool = False,        # enable ROQ 4-bit fused Triton reranking
+    roq_bits: int = 4,               # ROQ quantization bit width
+    use_emd: bool = True,            # qEMD (metric) for graph construction
+    dual_graph: bool = True,         # per-cluster + cross-cluster bridges
+    warmup_kernels: bool = True,     # vLLM-style Triton pre-compilation
+    seed_batch_size: int = 256,      # docs before first codebook + graph
+    max_kmeans_iter: int = 15,       # K-means iterations for codebook
+    ctop_r: int = 3,                 # top coarse clusters per document
+    enable_shortcuts: bool = False,  # learned shortcut edges
+    store_raw_vectors: bool = True,  # keep FP32 for in-segment reranking
 )
 ```
 
@@ -348,17 +352,28 @@ For power users who need direct access to the Rust GEM segments.
 
 | Method | Description |
 |---|---|
-| `build(all_vectors, doc_ids, doc_offsets, ...)` | Build graph from vectors |
-| `search(query_vectors, k=10, ef=100, n_probes=4, filter=None)` | Search → `List[(doc_id, score)]` |
-| `search_with_stats(query_vectors, k, ef, n_probes)` | Search + `(nodes_visited, dist_computations)` |
-| `search_batch(queries, k, ef, n_probes)` | Batch search |
-| `brute_force_proxy(query_vectors, k)` | Exhaustive qCH (oracle baseline) |
+| `build(all_vectors, doc_ids, doc_offsets, n_fine=0, n_coarse=32, max_degree=32, ef_construction=200, max_kmeans_iter=15, ctop_r=3, payload_clusters=None, use_emd=True, dual_graph=True, store_raw_vectors=True)` | Build graph from vectors |
+| `search(query_vectors, k=10, ef=100, n_probes=4, enable_shortcuts=False, filter=None, min_cluster_ratio=0.01)` | Search → `List[(doc_id, score)]` |
+| `search_with_stats(query_vectors, k=10, ef=100, n_probes=4, enable_shortcuts=False, filter=None, min_cluster_ratio=0.01)` | Search + `(nodes_visited, distance_computations)` |
+| `search_batch(queries, k=10, ef=100, n_probes=4, enable_shortcuts=False)` | Batch search |
+| `brute_force_proxy(query_vectors, k=10)` | Exhaustive qCH proxy ranking (oracle baseline) |
+| `brute_force_maxsim(query_vectors, k=10)` | Exhaustive exact MaxSim ranking (requires `store_raw_vectors=True`) |
 | `save(path)` / `load(path)` | Persist with CRC32 integrity |
-| `set_doc_payloads(payloads)` | Build filter index for filtered search |
+| `set_doc_payloads(payloads)` | Build Roaring bitmap filter index for filtered search |
+| `inject_shortcuts(training_pairs, max_shortcuts_per_node=4)` | Add learned shortcut edges |
+| `prune_stale_shortcuts(deleted_flags, max_age=None, current_generation=0)` | Remove stale shortcuts |
 | `graph_connectivity_report()` | BFS connectivity → `(n_components, giant_frac, cross_cluster_ratio)` |
 | `get_codebook_centroids()` | → `ndarray (n_fine, dim)` |
-| `get_idf()` / `get_flat_codes()` | Codebook internals |
+| `get_idf()` | → `ndarray (n_fine,)` — IDF weights per centroid |
+| `get_flat_codes()` | → `(codes, offsets, lengths)` — per-document centroid codes |
 | `n_docs()` / `n_nodes()` / `n_edges()` / `dim()` | Graph stats |
+| `is_ready()` / `total_shortcuts()` | Segment state |
+
+**`build()` key parameters:**
+- `store_raw_vectors`: Keep raw FP32 vectors for in-segment `brute_force_maxsim`. Set `False` to save ~50% memory when using external GPU reranking.
+- `use_emd`: Use qEMD (Sinkhorn OT, metric) for graph edge construction. Default `True`. Set `False` to use qCH (faster, non-metric).
+- `filter`: List of `(field, value)` tuples for filter-aware routing (AND semantics with cluster-level bitmap pruning).
+- `min_cluster_ratio`: Skip clusters with fewer than this fraction of matching docs (default 0.01).
 
 ### `PyMutableGemSegment` (writable)
 
@@ -382,7 +397,11 @@ For power users who need direct access to the Rust GEM segments.
 | `build(..., modality_tags, n_modalities)` | Build per-modality graphs |
 | `search(query_vectors, query_modality_tags, k, ef, n_probes)` | Search with RRF fusion |
 
-### `GpuQchScorer`
+### `GpuQchScorer` (GPU brute-force proxy)
+
+For small-to-medium corpora (<50K), brute-force qCH on GPU can be faster than
+graph traversal. This scorer computes proxy distances for all documents in a
+single GPU launch.
 
 ```python
 from voyager_index._internal.inference.index_core.gpu_qch import GpuQchScorer
@@ -391,3 +410,35 @@ scorer = GpuQchScorer.from_gem_segment(segment, device="cuda")
 scores = scorer.score_query(query_vecs)            # → (n_docs,) lower = closer
 scores = scorer.score_query_filtered(query_vecs, mask)  # masked scoring
 ```
+
+**Typical pipeline (brute-force qCH → MaxSim rerank):**
+
+```python
+from voyager_index._internal.inference.index_core.gpu_qch import GpuQchScorer
+from voyager_index import fast_colbert_scores
+import torch
+
+scorer = GpuQchScorer.from_gem_segment(segment, device="cuda")
+proxy = scorer.score_query(query_gpu)               # qCH proxy for all docs
+_, top_idxs = proxy.topk(500, largest=False)         # top-500 candidates
+# ... gather candidate vectors, rerank with fast_colbert_scores ...
+```
+
+---
+
+## Feature Matrix: What's Available Where
+
+| Feature | `Index` (high-level) | `GemSegment` (low-level) | Notes |
+|---|---|---|---|
+| Graph search (qCH proxy) | `search(ef=..., n_probes=...)` | `search(...)` | |
+| GPU MaxSim reranking | `rerank_device="cuda"` | External via `fast_colbert_scores` | Auto-applied after proxy search |
+| ROQ 4-bit reranking | `roq_rerank=True` | External via `roq_maxsim_4bit` | Fused Triton kernel |
+| Brute-force qCH (GPU) | — | `GpuQchScorer.score_query()` | Low-level only |
+| Brute-force MaxSim | — | `brute_force_maxsim()` | Requires `store_raw_vectors=True` |
+| Brute-force proxy (CPU) | — | `brute_force_proxy()` | |
+| Search stats | — | `search_with_stats()` | Returns `(nodes_visited, dist_computations)` |
+| Filter-aware search | `search(filters={...})` | `search(filter=[...])` | Cluster-level bitmap pruning |
+| Kernel warmup | `warmup_kernels=True` | — | vLLM-style pre-compilation |
+| Semantic shortcuts | `enable_shortcuts=True` | `inject_shortcuts()` | Learned edges |
+| Self-healing | Automatic (background) | `heal()`, `needs_healing()` | Mutable segment only |
+| Multi-modal ensemble | — | `PyEnsembleGemSegment` | Per-modality RRF fusion |
