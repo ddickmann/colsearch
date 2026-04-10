@@ -1,0 +1,8 @@
+{
+  "n_docs": 100,
+  "n_deleted": 10,
+  "search_coverage": 1.0,
+  "valid_result_ids": 30,
+  "n_sample_queries": 10,
+  "passed": true
+}

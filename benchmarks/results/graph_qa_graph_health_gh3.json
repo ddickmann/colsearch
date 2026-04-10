@@ -1,0 +1,8 @@
+{
+  "reachable_fraction": 1.0,
+  "median_nodes_visited": 200.0,
+  "p95_nodes_visited": 200.0,
+  "n_samples": 200,
+  "threshold": 0.95,
+  "passed": true
+}

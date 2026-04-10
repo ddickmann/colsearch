@@ -1,0 +1,10 @@
+{
+  "n_components": 1,
+  "giant_component_frac": 1.0,
+  "cross_cluster_edge_ratio": 0.7402097902097902,
+  "n_nodes": 200,
+  "n_edges": 2860,
+  "n_docs": 200,
+  "mean_degree": 28.6,
+  "passed": true
+}

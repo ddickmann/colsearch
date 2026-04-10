@@ -1,0 +1,7 @@
+{
+  "coverage_fraction": 1.0,
+  "threshold": 0.5,
+  "n_queries": 1770,
+  "n_buckets": 16,
+  "passed": true
+}

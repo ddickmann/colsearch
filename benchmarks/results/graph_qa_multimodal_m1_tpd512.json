@@ -1,0 +1,7 @@
+{
+  "tpd": 512,
+  "n_docs": 50,
+  "build_time_s": 0.5565821677446365,
+  "p99_latency_us": 4893.224369734526,
+  "passed": true
+}

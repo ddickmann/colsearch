@@ -1,0 +1,18 @@
+{
+  "c1_1_connectivity": {
+    "ref_giant_frac": 1.0,
+    "prod_giant_frac": 1.0,
+    "delta": 0.0
+  },
+  "c1_2_recall": {
+    "ref_recall": 1.0,
+    "prod_recall": 1.0,
+    "delta": 0.0
+  },
+  "c1_3_cross_cluster": {
+    "ref_cross_ratio": 0.7401189227002448,
+    "prod_cross_ratio": 0.8098976109215017
+  },
+  "n_hard_queries": 354,
+  "passed": true
+}

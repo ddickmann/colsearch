@@ -705,8 +705,9 @@ class GemNativeSegmentManager:
                 elif entry.op == WalOp.UPDATE_PAYLOAD and entry.payload is not None:
                     self._payloads[entry.external_id] = entry.payload
 
-            if self._seed_buffer_ids and not self._codebook_trained:
-                if len(self._seed_buffer_ids) >= self._seed_batch_size:
+            active_missing = self._active is None or not self._active.is_ready()
+            if self._seed_buffer_ids and (not self._codebook_trained or active_missing):
+                if len(self._seed_buffer_ids) >= self._seed_batch_size or active_missing:
                     self._init_active_from_seed()
                 else:
                     logger.info(

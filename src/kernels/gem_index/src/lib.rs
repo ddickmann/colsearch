@@ -19,7 +19,7 @@ use latence_gem_router::codebook::{TwoStageCodebook, compute_ctop, compute_ctop_
 use latence_gem_router::adaptive_cutoff::CutoffTree;
 use latence_gem_router::router::{ClusterPostings, DocProfile, FlatDocCodes, FilterIndex};
 
-use graph::GemGraph;
+use graph::{Adjacency, GemGraph};
 use persistence::{SegmentData, save_segment, load_segment};
 use search::{beam_search, beam_search_with_stats};
 use mutable::MutableGemSegment;
@@ -843,14 +843,47 @@ impl GemSegment {
 
     /// BFS connectivity report on the bottom graph layer.
     ///
-    /// Returns (n_components, giant_component_frac):
+    /// Returns (n_components, giant_component_frac, cross_cluster_edge_ratio):
     ///   - n_components: number of connected components
     ///   - giant_component_frac: fraction of nodes in the largest component (1.0 = fully connected)
-    fn graph_connectivity_report(&self) -> PyResult<(usize, f64)> {
+    ///   - cross_cluster_edge_ratio: fraction of edges connecting different clusters
+    fn graph_connectivity_report(&self) -> PyResult<(usize, f64, f64)> {
         let inner = self.inner.as_ref().ok_or_else(|| {
             PyValueError::new_err("segment not built; call build() or load() first")
         })?;
-        Ok(inner.graph.connectivity_report())
+        let (n_components, giant_frac) = inner.graph.connectivity_report();
+
+        let n_docs = inner.doc_ids.len();
+        let mut node_cluster = vec![u32::MAX; n_docs];
+        for (c, members) in inner.postings.lists.iter().enumerate() {
+            for &doc_int_id in members {
+                let d = doc_int_id as usize;
+                if d < n_docs {
+                    node_cluster[d] = c as u32;
+                }
+            }
+        }
+        let adj = inner.graph.bottom_adjacency();
+        let mut total_edges: u64 = 0;
+        let mut cross_edges: u64 = 0;
+        for node in 0..adj.n_nodes().min(n_docs) {
+            for &nbr in adj.neighbors(node) {
+                let n = nbr as usize;
+                if n < n_docs {
+                    total_edges += 1;
+                    if node_cluster[node] != node_cluster[n] {
+                        cross_edges += 1;
+                    }
+                }
+            }
+        }
+        let cross_ratio = if total_edges > 0 {
+            cross_edges as f64 / total_edges as f64
+        } else {
+            0.0
+        };
+
+        Ok((n_components, giant_frac, cross_ratio))
     }
 
     /// Set per-document payload field-value pairs for filter-aware routing.

@@ -145,3 +145,7 @@ testpaths = [
 pythonpath = [
   ".",
 ]
+markers = [
+  "graph_qa_quick: fast graph QA gates for per-PR CI (~15-20s build on 500-doc subset)",
+  "graph_qa_nightly: thorough graph QA gates for nightly runs (~2-3 min build on full 2.5K corpus)",
+]

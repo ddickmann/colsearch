@@ -1,0 +1,7 @@
+{
+  "qps": 545.4444589095921,
+  "n_queries": 100,
+  "elapsed_s": 0.18333672359585762,
+  "threshold": 50,
+  "passed": true
+}

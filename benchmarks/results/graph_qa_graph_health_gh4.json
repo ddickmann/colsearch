@@ -1,0 +1,19 @@
+{
+  "before": {
+    "delete_ratio": 0.2,
+    "avg_degree": 10.94,
+    "isolated_ratio": 0.0,
+    "stale_rep_ratio": 0.25806451612903225,
+    "n_components": 1,
+    "giant_frac": 1.0
+  },
+  "after": {
+    "delete_ratio": 0.2,
+    "avg_degree": 9.33,
+    "isolated_ratio": 0.0,
+    "stale_rep_ratio": 0.06451612903225806,
+    "n_components": 1,
+    "giant_frac": 1.0
+  },
+  "passed": true
+}
