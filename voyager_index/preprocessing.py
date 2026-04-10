@@ -34,6 +34,14 @@ def enumerate_renderable_documents(
 
     JSON and other unsupported files are reported in ``skipped`` rather than
     silently ignored so callers can audit corpus coverage.
+
+    Returns:
+        Dict with keys:
+
+        - ``root`` (str): Resolved source root path.
+        - ``documents`` (List[Path]): Renderable source files found.
+        - ``skipped`` (List[dict]): Each entry has ``path`` and ``reason``
+          (e.g. ``"excluded"``, ``"unsupported_suffix:.json"``).
     """
 
     source_root = Path(root).expanduser().resolve()
@@ -84,6 +92,22 @@ def render_documents(
 ) -> dict[str, Any]:
     """
     Render supported documents into page-image assets and PageBundle-like JSON.
+
+    Returns:
+        Dict with keys:
+
+        - ``status`` (str): ``"passed"`` if any pages rendered, ``"skipped"`` otherwise.
+        - ``output_dir`` (str): Resolved output directory.
+        - ``bundles`` (List[dict]): Per-document bundles with ``doc_id``,
+          ``source_uri``, ``metadata``, and ``pages`` list.
+        - ``rendered`` (List[dict]): Flat list of all page dicts. Each has
+          ``source``, ``image_path``, ``page_number``, ``page_id``,
+          ``doc_id``, ``renderer``, ``text``, ``width``, ``height``.
+        - ``skipped`` (List[dict]): Files that couldn't be rendered
+          (``path``, ``reason``).
+        - ``summary`` (dict): Aggregate counts: ``documents_requested``,
+          ``documents_rendered``, ``pages_rendered``, ``by_source``,
+          ``renderer_counts``.
     """
 
     output_root = Path(output_dir).expanduser().resolve()

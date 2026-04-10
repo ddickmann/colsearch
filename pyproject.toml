@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "voyager-index"
 version = "0.1.2"
-description = "Native multi-vector graph index for ColBERT/ColPali retrieval — 52x faster than HNSW with filter-aware routing, GPU-accelerated scoring, self-healing graphs, and multi-modal ensemble fusion."
+description = "The first open-source native multi-vector index. GEM graph over document vector sets for ColBERT/ColPali late-interaction retrieval — 52x faster than HNSW, full CRUD+WAL, GPU Triton MaxSim, ROQ 4-bit quantization, filter-aware routing, self-healing graphs."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -21,22 +21,32 @@ authors = [
 keywords = [
   "retrieval",
   "late-interaction",
-  "multimodal",
+  "multi-vector",
   "colbert",
   "colpali",
   "maxsim",
-  "bm25",
-  "knapsack",
+  "graph-index",
+  "gem",
   "vector-search",
+  "quantization",
+  "roq",
+  "triton",
+  "multimodal",
+  "rag",
+  "bm25",
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Rust",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Database :: Database Engines/Servers",
+  "Typing :: Typed",
 ]
 dependencies = [
   "numpy>=1.26,<3",
@@ -88,7 +98,7 @@ native = [
   "latence-hnsw>=0.1.1",
   "latence-solver>=0.1.1",
   "latence-gem-router>=0.1.1",
-  "latence-gem-index>=0.1.0",
+  "latence-gem-index>=0.1.2",
 ]
 dev = [
   "pytest>=8,<9",

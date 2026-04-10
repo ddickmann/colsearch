@@ -10,6 +10,18 @@ from typing import Any, Iterable, Mapping
 
 @dataclass(frozen=True)
 class MultimodalModelSpec:
+    """Metadata for a supported multimodal embedding model.
+
+    Attributes:
+        plugin_name: Short alias used in config files and CLI.
+        model_id: HuggingFace model ID or path.
+        architecture: Human-readable description of the backbone.
+        embedding_style: ``"colpali"`` (patch-level) or ``"colbert"`` (token-level).
+        modalities: Tuple of supported modality names (e.g. ``("text", "image")``).
+        pooling_task: vLLM pooling task name (e.g. ``"token_embed"``).
+        serve_command: Example CLI command to launch the model with vLLM.
+    """
+
     plugin_name: str
     model_id: str
     architecture: str
@@ -57,10 +69,17 @@ DEFAULT_MULTIMODAL_MODEL_SPEC = SUPPORTED_MULTIMODAL_MODELS[DEFAULT_MULTIMODAL_M
 
 class VllmPoolingProvider:
     """
-    Thin client for multimodal pooling endpoints exposed by vLLM-based providers.
+    Thin HTTP client for vLLM-hosted multimodal pooling endpoints.
 
-    The provider intentionally stays generic: callers control the input payload
-    and optional `extra_kwargs`, while the helper standardizes the request shape.
+    Sends embedding requests to a running vLLM server that exposes a
+    ``/v1/pooling`` endpoint (OpenAI-compatible).  Callers control the
+    input payload; this class standardizes the request shape and handles
+    serialization.
+
+    Args:
+        endpoint: Base URL of the vLLM server (e.g. ``"http://localhost:8200"``).
+        model: Model identifier matching the served model.
+        timeout: HTTP timeout in seconds (default 60).
     """
 
     def __init__(self, endpoint: str, model: str, timeout: float = 60.0):
@@ -74,6 +93,11 @@ class VllmPoolingProvider:
         extra_kwargs: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Build a JSON-serializable request body without sending it.
+
+        Returns:
+            Dict with ``model``, ``input``, and optional ``extra_kwargs``.
+        """
         payload: dict[str, Any] = {
             "model": self.model,
             "input": input_data,
@@ -89,6 +113,12 @@ class VllmPoolingProvider:
         extra_kwargs: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Send a single pooling request and return the parsed JSON response.
+
+        Raises:
+            ImportError: If ``httpx`` is not installed.
+            httpx.HTTPStatusError: On non-2xx response.
+        """
         try:
             import httpx
         except ImportError as exc:
@@ -107,6 +137,11 @@ class VllmPoolingProvider:
         extra_kwargs: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
+        """Sequentially pool each input and collect results.
+
+        Returns:
+            List of parsed JSON responses, one per input.
+        """
         return [self.pool(item, extra_kwargs=extra_kwargs, **kwargs) for item in inputs]
 
 

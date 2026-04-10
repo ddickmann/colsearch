@@ -12,7 +12,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 
@@ -359,12 +359,18 @@ class Index:
             for doc_id in ids:
                 self._payloads.pop(doc_id, None)
 
-    def update_payload(self, id: int, payload: Dict[str, Any]):
-        """Update the payload for a specific document."""
+    def update_payload(self, doc_id: int, payload: Dict[str, Any]):
+        """
+        Update the payload for a specific document.
+
+        Args:
+            doc_id: The document ID whose payload to update.
+            payload: New metadata dict (replaces the old payload entirely).
+        """
         self._check_open()
         with self._lock:
-            self._payloads[id] = payload
-            self._manager.upsert_payload(id, payload)
+            self._payloads[doc_id] = payload
+            self._manager.upsert_payload(doc_id, payload)
 
     def search(
         self,
@@ -375,22 +381,25 @@ class Index:
         n_probes: int = 4,
         filters: Optional[Dict] = None,
         explain: bool = False,
-        **search_kwargs,
     ) -> List[SearchResult]:
         """
         Search the index for the k nearest documents.
 
         Args:
-            query: (n_tokens, dim) float32 query vectors.
-            k: number of results to return.
-            ef: search beam width.
-            n_probes: number of coarse clusters to probe.
-            filters: Qdrant-compatible payload filters.
-            explain: if True, include per-query-token score attribution
-                     in each SearchResult (token_scores, matched_tokens).
+            query: ``(n_tokens, dim)`` float32 query vectors.
+            k: Number of results to return.
+            ef: Search beam width — higher values improve recall at the
+                cost of latency.
+            n_probes: Number of coarse clusters to probe (GEM only).
+            filters: Qdrant-compatible payload filters (``$eq``, ``$in``,
+                ``$contains``, etc.). Applied natively during graph traversal
+                via cluster-level bitmap pruning.
+            explain: If True, include per-query-token score attribution
+                in each :class:`SearchResult` (``token_scores``,
+                ``matched_tokens``).
 
         Returns:
-            List of SearchResult(doc_id, score, payload).
+            List of :class:`SearchResult` ordered by descending score.
         """
         self._check_open()
 
@@ -553,8 +562,17 @@ class Index:
             engine=self._engine,
         )
 
-    def set_metrics_hook(self, hook):
-        """Set a callback for internal metrics. hook(name, value)."""
+    def set_metrics_hook(self, hook: Callable[[str, float], None]) -> None:
+        """
+        Register a callback for internal search metrics (e.g. Prometheus).
+
+        The hook is called with ``(metric_name, value)`` after each search
+        operation.  Metric names include ``"search_latency_us"``,
+        ``"candidates_scored"``, and ``"nodes_visited"``.
+
+        Args:
+            hook: Callable accepting ``(name: str, value: float)``.
+        """
         self._metrics_hook = hook
         if hasattr(self._manager, 'set_metrics_hook'):
             self._manager.set_metrics_hook(hook)
@@ -606,37 +624,60 @@ class Index:
 
 class IndexBuilder:
     """
-    Fluent builder for creating an Index with custom configuration.
+    Fluent builder for creating an :class:`Index` with custom configuration.
 
-    Example::
+    Every ``with_*`` method returns ``self`` so calls can be chained::
 
         idx = (IndexBuilder("my_index", dim=128)
-               .with_gem(n_fine=64, seed_batch_size=128)
+               .with_gem(seed_batch_size=64, n_fine=128)
+               .with_gpu_rerank(device="cuda")
                .with_wal(enabled=True)
                .build())
+
+    Args:
+        path: Directory to store the index.
+        dim: Vector dimensionality (must match the embedding model).
     """
 
-    def __init__(self, path: str, dim: int):
+    def __init__(self, path: str, dim: int) -> None:
         self._path = path
         self._dim = dim
         self._engine = "auto"
         self._kwargs: Dict[str, Any] = {}
 
-    def with_gem(self, **kwargs) -> IndexBuilder:
+    def with_gem(self, **kwargs: Any) -> "IndexBuilder":
+        """Select the GEM engine with optional keyword overrides.
+
+        Common kwargs: ``seed_batch_size``, ``n_fine``, ``n_coarse``,
+        ``max_degree``, ``ef_construction``, ``dual_graph``, ``use_emd``.
+        """
         self._engine = "gem"
         self._kwargs.update(kwargs)
         return self
 
-    def with_hnsw(self, **kwargs) -> IndexBuilder:
+    def with_hnsw(self, **kwargs: Any) -> "IndexBuilder":
+        """Select the HNSW engine (legacy single-vector backend)."""
         self._engine = "hnsw"
         self._kwargs.update(kwargs)
         return self
 
-    def with_wal(self, enabled: bool = True) -> IndexBuilder:
+    def with_wal(self, enabled: bool = True) -> "IndexBuilder":
+        """Enable or disable the write-ahead log for crash recovery.
+
+        Args:
+            enabled: ``True`` (default) enables WAL + CRC32 checkpointing.
+        """
         self._kwargs["enable_wal"] = enabled
         return self
 
-    def with_quantization(self, n_fine: int = 256, n_coarse: int = 32) -> IndexBuilder:
+    def with_quantization(self, n_fine: int = 256, n_coarse: int = 32) -> "IndexBuilder":
+        """Configure the two-stage codebook for qCH proxy scoring.
+
+        Args:
+            n_fine: Number of fine centroids (higher = better proxy accuracy,
+                more build time). Recommended: 128–2048 depending on corpus.
+            n_coarse: Number of coarse routing clusters.
+        """
         self._kwargs["n_fine"] = n_fine
         self._kwargs["n_coarse"] = n_coarse
         return self

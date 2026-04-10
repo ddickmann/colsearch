@@ -4,7 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/voyager-index)](https://pypi.org/project/voyager-index/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**The first open-source native multi-vector index.**
+**The first open-source, completely multi-vector native index.**
 Built for ColBERT, ColPali, and late-interaction retrieval at scale.
 
 `voyager-index` ships a Rust-native **GEM graph index** — a proximity graph
@@ -13,6 +13,43 @@ multi-vector workloads. Search is **52x faster** than HNSW at 1024-token
 sequence length, with native support for insert, delete, upsert, compaction,
 WAL-based crash recovery, and sealed/active segment lifecycle.
 
+### Who is this for?
+
+Teams building **retrieval systems with token-level or patch-level embeddings**:
+ColBERT, ColPali, ColQwen, or any late-interaction model. If you store documents
+as sets of vectors and need sub-100ms search at 100K+ scale — with full CRUD,
+durability, and GPU acceleration — this is the engine.
+
+### Why does it exist?
+
+Every other open-source vector database treats multi-vector retrieval as a
+**two-stage hack**: build a single-vector ANN index (HNSW/IVF), retrieve
+candidates, then rerank with MaxSim. This works at small scale but breaks
+down as corpora grow — the single-vector proxy discards the token-level
+signal that makes late interaction powerful.
+
+`voyager-index` is built differently. The index structure itself is set-aware:
+built and traversed on set-level proxies (qCH), with MaxSim as the final truth
+scorer. For small corpora the system can optionally use GPU brute-force qCH
+as a fast path; at larger scales, traversal is graph-native.
+
+### What "multi-vector native" means
+
+We call it **multi-vector native** because all four layers operate on vector sets,
+not pooled single vectors:
+
+1. **Storage**: documents are stored and indexed as vector sets (token/patch vectors)
+2. **ANN structure**: the graph is built over set-level distances (qCH/qEMD), not pooled vectors
+3. **Traversal**: search uses set-aware proxies (qCH) and returns candidates without
+   requiring a separate single-vector index
+4. **Exact ranking**: final scoring uses late-interaction MaxSim (GPU Triton kernel),
+   optionally with ROQ 4-bit quantization
+
+This differentiates `voyager-index` from:
+- "vector DB + rerank" — single-vector index with MaxSim bolted on
+- "ColBERT reranker on top of single-vector ANN" — pooled proxy, non-native traversal
+- "multi-vector in API only" — stores token vectors but indexes centroids
+
 ```python
 from voyager_index import Index
 
@@ -20,6 +57,22 @@ idx = Index("my_index", dim=128, engine="gem", seed_batch_size=64)
 idx.add(embeddings, ids=[1, 2, 3], payloads=[{"title": "doc1"}, ...])
 results = idx.search(query_vectors, k=10)
 ```
+
+## Core Innovations
+
+| Innovation | What it does |
+|---|---|
+| **GEM graph index** | Proximity graph over document vector sets — single beam search scores entire documents ([paper](https://arxiv.org/abs/2603.20336)) |
+| **Set-aware graph construction** | qCH/qEMD-based edge selection ensures neighbors are semantically close at the set level, not just centroid level |
+| **Metric decoupling** | Graph built with qEMD (metric, stable navigation), traversed with qCH (fast proxy), reranked with MaxSim (exact) |
+| **Triton Flash MaxSim** | Fused GPU kernel for exact late-interaction scoring — FP16/INT8/FP8/ROQ profiles with autotune |
+| **ROQ 4-bit quantization** | Rotational quantization with fused Triton kernel — ~8x memory reduction vs FP32, p50 2.8ms rerank |
+| **GPU qCH scorer** | Triton-autotuned brute-force proxy scoring on GPU for small-corpus fast path |
+| **Tabu Search solver** | Constraint-aware context packing as an alternative to RRF — knapsack optimization over retrieved chunks |
+| **Full CRUD + WAL** | Insert, delete, upsert with crash-safe write-ahead log and checkpoint recovery |
+| **Self-healing graphs** | Automatic drift detection and local repair under heavy deletes |
+| **Multimodal preprocessing** | Built-in PDF/DOCX/XLSX/image → page-image pipeline for ColPali-family models |
+| **vLLM-style kernel warmup** | Pre-compilation of all Triton kernels at init for zero cold-start latency |
 
 ## Key Features
 
@@ -39,6 +92,7 @@ results = idx.search(query_vectors, k=10)
 - **ROQ 4-bit reranking** — rotational quantization with fused Triton kernel (~8x memory reduction, p50 2.8ms)
 - **Pre-autotune kernel warmup** — vLLM-style Triton kernel pre-compilation at init for zero cold-start latency
 - **Tabu Search solver** — constraint-aware context packing as an alternative to RRF
+- **Fully multimodal** — built-in preprocessing for PDF, DOCX, XLSX, and images via ColPali-family models
 - **Docker + FastAPI** — production reference server with CRUD, preprocessing, and optimization endpoints
 
 ## Why It Is Fast
@@ -159,15 +213,59 @@ transfer, and shape-bucketed Triton autotune for stable kernel selection.
 Triton kernels are pre-compiled at initialization (vLLM-style warmup) so
 the first query sees no compilation overhead.
 
-### Full-Scale Benchmarks (1M+ docs)
+### Benchmark Modes
 
-> Comprehensive benchmarks at scale (1M documents x 1024 tokens, recall-latency
-> Pareto curves, memory scaling, build time extrapolation) are in progress and
-> will be published here shortly.
+The benchmark suite (`benchmarks/eval_100k.py`) evaluates six pipelines that
+prove the "multi-vector native" claim at scale:
+
+| # | Pipeline | Candidate generation | Reranking | Proves |
+|---|---|---|---|---|
+| 1 | CPU graph search | GEM qCH traversal | — (proxy only) | Graph navigability |
+| 2 | GPU qCH → FP16 MaxSim | Brute-force qCH (GPU) | Triton MaxSim FP16 | Quality ceiling |
+| 3 | GPU qCH → ROQ 4-bit | Brute-force qCH (GPU) | Triton ROQ 4-bit | Production target |
+| 4 | Graph → ROQ 4-bit | GEM qCH traversal | Triton ROQ 4-bit | Hybrid sweet spot |
+| 5 | **FAISS baseline** | Single-vector HNSW (mean-pooled) | Triton MaxSim FP16 | Non-native comparison |
+| 6 | Fixed-recall QPS | — | — | Honest throughput at recall targets |
+
+The benchmark reports: recall@K, p50/p95/p99 latency, QPS, nodes visited,
+proxy comparisons, MaxSim dot products, and GPU memory reads — preventing
+"you're just doing more work" accusations.
+
+### Scaling Crossover Story
+
+| Corpus | Winner | Why |
+|---|---|---|
+| **7.5K docs** | Graph traversal (88ms p50 @ R@10=1.0) | Already faster than brute-force (141ms) at perfect recall |
+| **75K–100K** | Graph traversal (sub-linear growth) | Graph visits a fraction of corpus; brute-force grows linearly |
+| **1M+** | Graph (only viable path) | Brute-force cost grows O(N); graph is sub-linear |
+
+The single-vector FAISS baseline loses recall at the same latency budget
+because mean-pooling discards the token-level information that GEM's set-aware
+qCH proxy preserves. See `benchmarks/results/benchmark_report.md` for full
+data once the benchmark completes.
+
+### Benchmark Results (Placeholder)
+
+> Full Pareto curves, cost accounting tables, and fixed-recall QPS numbers at
+> 75K and 100K scale are in progress. Raw data: `benchmarks/results/eval_100k.json`.
+> Report: `benchmarks/results/benchmark_report.md`.
 
 ### Future Work
 
+- Full-scale benchmarks at 1M+ documents (v1.2 streaming build)
 - Learned search policy for adaptive ef/n_probes (trained model, deferred)
+
+### Scale Path — When to Use What
+
+| Corpus size | Recommended mode | Default `ef` | Default `n_probes` |
+|---|---|---|---|
+| < 10K | Brute-force qCH → MaxSim (`GpuQchScorer`) | N/A | N/A |
+| 10K – 100K | Graph → ROQ 4-bit rerank | 2000–5000 | 4 |
+| 100K – 1M | Graph → ROQ 4-bit rerank (aggressive ef) | 5000–10000 | 4–8 |
+| > 1M | Graph → ROQ 4-bit rerank (v1.2 streaming build) | tuned per corpus | 4–8 |
+
+See [`docs/guides/scaling.md`](docs/guides/scaling.md) for memory formulas,
+hard limits, and the v1.2/v2.0 roadmap.
 
 ## Additional Components
 
@@ -178,12 +276,13 @@ the first query sees no compilation overhead.
 
 ## Documentation
 
-- **Quickstart**: `docs/getting-started/quickstart.md`
-- **API Reference**: `docs/api/python.md`
-- **Benchmarks**: `docs/benchmarks.md`
-- **GEM Guide**: `docs/guides/gem-native.md`
-- **ColBERT Guide**: `docs/guides/colbert.md`
-- **ColPali Guide**: `docs/guides/colpali.md`
+- **[Quickstart](docs/getting-started/quickstart.md)** — 5-minute install to first search
+- **[API Reference](docs/api/python.md)** — `Index`, `IndexBuilder`, `GemSegment`, GPU scorers
+- **[GEM Guide](docs/guides/gem-native.md)** — production config and hyperparameter tuning
+- **[Scaling Guide](docs/guides/scaling.md)** — memory formulas, hard limits, v1.2/v2.0 roadmap
+- **[ColBERT Guide](docs/guides/colbert.md)** — text-only late-interaction retrieval
+- **[ColPali Guide](docs/guides/colpali.md)** — multimodal document retrieval
+- **[Benchmarks](docs/benchmarks.md)** — methodology and results
 
 ## Install
 
@@ -228,24 +327,65 @@ Collection types: `dense`, `late_interaction`, `multimodal`
 
 ## Multimodal Support
 
-Supported ColPali models:
+`voyager-index` ships a complete multimodal pipeline: ingest any document
+format, render to page images, embed with ColPali-family models, and index
+natively in GEM — all in one system.
 
-- `collfm2` — `VAGOsolutions/SauerkrautLM-ColLFM2-450M-v0.1`
-- `colqwen3` — `VAGOsolutions/SauerkrautLM-ColQwen3-1.7b-Turbo-v0.1`
-- `nemotron_colembed` — `nvidia/nemotron-colembed-vl-4b-v2`
+**Preprocessing** (`voyager_index.preprocessing`):
+- PDF → page images via PyMuPDF
+- DOCX → rendered text pages via python-docx + Pillow
+- XLSX → per-sheet rendered tables via openpyxl + Pillow
+- Images passed through directly (PNG, JPG, WebP, GIF)
+
+**Embedding models** (via vLLM pooling):
+
+| Alias | Model | Architecture |
+|---|---|---|
+| `collfm2` | `VAGOsolutions/SauerkrautLM-ColLFM2-450M-v0.1` | LFM2-VL + ColPali pooling |
+| `colqwen3` | `VAGOsolutions/SauerkrautLM-ColQwen3-1.7b-Turbo-v0.1` | Qwen3-VL + ColPali pooling |
+| `nemotron_colembed` | `nvidia/nemotron-colembed-vl-4b-v2` | Qwen3-VL bidirectional + ColBERT output |
+
+**Multi-modal ensemble** (`PyEnsembleGemSegment`): builds per-modality
+codebooks and graphs, searches each independently, and fuses results via
+Reciprocal Rank Fusion.
+
+```python
+from voyager_index.preprocessing import enumerate_renderable_documents, render_documents
+
+docs = enumerate_renderable_documents("./my_docs/")
+pages = render_documents(docs["documents"], "./rendered/")
+# → pages["rendered"] = list of {image_path, page_number, doc_id, ...}
+# embed page images with ColPali, then idx.add(embeddings)
+```
+
+## Architecture Pipeline
+
+```
+Documents (PDF/DOCX/XLSX/images)
+  → Preprocessing (page rendering)
+  → Embedding (ColBERT / ColPali via vLLM)
+  → Two-stage codebook (K-means quantization)
+  → GEM graph index (set-aware proximity graph)
+  → Search: qCH proxy traversal → candidate set
+  → Rerank: Triton MaxSim (FP16 / ROQ 4-bit)
+  → Results with payload filters
+```
 
 ## Precision Profiles
 
-| Profile | Default | Notes |
-|---|---|---|
-| Exact (FP32/FP16) | Yes | Triton MaxSim, truthful baseline |
-| Fast (INT8) | Opt-in | Fused Triton MaxSim |
-| FP8 | Experimental | Under evaluation |
-| ROQ 4-bit | Opt-in | Fused Triton kernel, ~8x memory reduction vs FP32 |
+| Profile | Kernel | Memory per token | Notes |
+|---|---|---|---|
+| Exact (FP16) | `fast_colbert_scores` | 256 B | Truthful baseline |
+| Fast (INT8) | `fast_colbert_scores` | 128 B | Fused Triton MaxSim |
+| FP8 | `fast_colbert_scores` | 128 B | Experimental |
+| ROQ 8-bit | `roq_maxsim_8bit` | ~136 B | Full ROQ ladder |
+| ROQ 4-bit | `roq_maxsim_4bit` | ~68 B | **Production recommended** — ~8x reduction vs FP32 |
+| ROQ 2-bit | `roq_maxsim_2bit` | ~36 B | Aggressive compression |
+| ROQ 1-bit | `roq_maxsim_1bit` | ~20 B | Maximum compression |
 
 ## License
 
-The OSS foundation is Apache-2.0. See `LICENSE`.
+Apache-2.0. See `LICENSE`.
 
 Vendored Qdrant code under `src/kernels/vendor/qdrant/` remains Apache-2.0 under
-its upstream terms. See `QDRANT_VENDORING.md` and `THIRD_PARTY_NOTICES.md`.
+its upstream terms. See `THIRD_PARTY_NOTICES.md`.

@@ -5,7 +5,11 @@ by priority tier.  Items here are **acknowledged gaps** in production readiness
 or differentiation that require external resources (datasets, compute, larger
 engineering effort) beyond what can be addressed in a single session.
 
-Last updated: 2026-04-09 (post v0.2.0 Elite Innovation Layer release).
+Last updated: 2026-04-10 (post v0.2.0 + scaling hardening).
+
+> **Scaling to millions?** See [`docs/guides/scaling.md`](docs/guides/scaling.md)
+> for memory formulas, hyperparameter recommendations, and the v1.2/v2.0
+> streaming + sharding roadmap.
 
 ---
 
@@ -247,22 +251,56 @@ exists (adaptive cutoff tree is a precursor).
 
 ---
 
-### R11. Distributed / Sharded Deployment
+### R11. Streaming Build for Million-Scale Corpora (v1.2)
 
-**Problem:** Single-node only.  For datasets > 100M docs, sharding is
-necessary.
+**Problem:** The monolithic builder requires all float32 vectors in RAM
+simultaneously.  At 1M documents (~128M tokens, dim=128), this costs
+~131 GB — impractical on commodity hardware.  The persistent index is only
+~1.2 GB; the bottleneck is build-time memory.
 
 **Deliverables:**
-- Shard-aware query routing
-- Cross-shard result merging
-- Replication for HA
+- Codebook training on a random sample (1-5% of tokens, < 1 GB)
+- Streaming centroid code assignment in batches of 10K-50K docs
+- Integration with `MutableGemSegment` for incremental graph insertion
+  using only centroid codes (qCH scoring, no raw vectors needed)
+- On-the-fly ROQ 4-bit quantization written to memory-mapped storage
+  for query-time MaxSim reranking
 
-**Prerequisites:** R1 (single-node must be rock-solid first), R3 (graph
-health monitoring), production adoption feedback.
+**Working set:** < 5 GB regardless of corpus size.
+
+**Acceptance criteria:**
+- 1M-document index built with < 8 GB peak RAM
+- Recall@10 within 2% of monolithic build on held-out queries
+- Build time < 2x monolithic (graph insertion is incremental, not batch)
+
+**Prerequisites:** v1.0 release proven at 75K scale; MutableGemSegment
+already exists and is tested.
+
+See [`docs/guides/scaling.md`](docs/guides/scaling.md) for full architecture.
 
 ---
 
-### R12. Index-Agnostic Optimizer Interface (Voyager-Zero Hooks)
+### R12. Distributed / Sharded Deployment (v2.0)
+
+**Problem:** Single-node only.  For datasets > 10M docs, sharding across
+multiple index segments is necessary for both build parallelism and
+query-time throughput.
+
+**Deliverables:**
+- `GemCollection` managing multiple `GemSegment` shards
+- Parallel query dispatch with async result collection
+- Cross-shard score normalization (shared codebook or z-normalization)
+- Shard balancing by cluster affinity
+- Optional cross-shard graph edges for hard queries
+
+**Scaling target:** 10M docs on a single 64 GB machine (10 shards of 1M).
+
+**Prerequisites:** R11 (streaming build), R1 (single-node benchmarks),
+production adoption feedback.
+
+---
+
+### R13. Index-Agnostic Optimizer Interface (Voyager-Zero Hooks)
 
 **Problem:** The solver API exists (`/reference/optimize`) but is not
 integrated with the index's search frontier.
