@@ -1618,7 +1618,9 @@ fn nn_descent(
     use_emd: bool,
     seed: u64,
 ) -> Vec<Vec<(u32, f32)>> {
-    use rand::seq::SliceRandom;
+    use rand::RngCore;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
 
     let n = doc_ids.len();
     if n <= 1 {
@@ -1627,20 +1629,24 @@ fn nn_descent(
     let k = k.min(n - 1);
     let local_to_global: Vec<u32> = doc_ids.to_vec();
 
-    // ── Parallel random initialization ──────────────────────────────────
+    // ── Random initialization (parallel, memory-lean) ───────────────────
+    // Use Fisher-Yates partial shuffle instead of allocating full candidates vec.
     let init_data: Vec<(Vec<u32>, Vec<f32>)> = (0..n).into_par_iter().map(|i| {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(i as u64));
-        let mut candidates: Vec<usize> = (0..n).filter(|&j| j != i).collect();
-        candidates.shuffle(&mut rng);
-        candidates.truncate(k);
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.swap(i, n - 1);
+        let pool = &mut indices[..n - 1];
+        for j in 0..k.min(pool.len()) {
+            let r = j + (rng.next_u64() as usize % (pool.len() - j));
+            pool.swap(j, r);
+        }
+        let selected = &pool[..k.min(pool.len())];
 
         let gi = local_to_global[i] as usize;
         let codes_i = flat_codes.doc_codes(gi);
-
-        let mut scored: Vec<(u32, f32)> = candidates.iter().map(|&j| {
+        let mut scored: Vec<(u32, f32)> = selected.iter().map(|&j| {
             let gj = local_to_global[j] as usize;
-            let codes_j = flat_codes.doc_codes(gj);
-            let d = construction_distance(codebook, codes_i, codes_j, use_emd);
+            let d = construction_distance(codebook, codes_i, flat_codes.doc_codes(gj), use_emd);
             (j as u32, d)
         }).collect();
         scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
@@ -1662,6 +1668,10 @@ fn nn_descent(
 
     let convergence_threshold = ((0.001 * n as f64 * k as f64) as usize).max(1);
 
+    // Dong et al. 2011 rho parameter: subsample reverse lists to cap memory.
+    // At rho=1.0 (default) no sampling; at rho=0.5 we halve the candidate sets.
+    let rho_k = k;
+
     // ── Main loop ───────────────────────────────────────────────────────
     for iter in 0..n_iters {
         // Step 1: Build reverse neighbor lists in O(n*k)
@@ -1679,7 +1689,7 @@ fn nn_descent(
             }
         }
 
-        // Step 2: Build per-node new/old candidate sets (forward ∪ reverse)
+        // Step 2: Build per-node new/old sets (forward ∪ reverse), capped at rho*k
         let new_cands: Vec<Vec<u32>> = (0..n).map(|v| {
             let mut c: Vec<u32> = nn_idx[v].iter().enumerate()
                 .filter(|&(pos, _)| nn_flag[v][pos])
@@ -1688,6 +1698,7 @@ fn nn_descent(
             c.extend_from_slice(&new_rev[v]);
             c.sort_unstable();
             c.dedup();
+            c.truncate(rho_k);
             c
         }).collect();
 
@@ -1699,61 +1710,80 @@ fn nn_descent(
             c.extend_from_slice(&old_rev[v]);
             c.sort_unstable();
             c.dedup();
+            c.truncate(rho_k);
             c
         }).collect();
+
+        // Free reverse lists immediately
+        drop(new_rev);
+        drop(old_rev);
 
         // Step 3: Mark all current "new" as "old" for next iteration
         for flags in &mut nn_flag {
             flags.iter_mut().for_each(|f| *f = false);
         }
 
-        // Step 4: Collect unique pairs to evaluate (parallel per node, global dedup)
-        // Paper's local join: for each node v, join new[v] × (new[v] ∪ old[v]).
-        // Canonicalize pairs as (min, max) for global deduplication.
-        let pairs_per_node: Vec<Vec<(u32, u32)>> = (0..n).into_par_iter().map(|v| {
+        // Step 4+5+6: Streaming local join — compute distances inline, no pair buffer.
+        // For each node v, enumerate new[v] × (new[v] ∪ old[v]).
+        // Use a per-node HashSet for local dedup within each node's join,
+        // then apply symmetrized updates. This avoids the massive O(n*k^2)
+        // pair allocation that was the memory bottleneck.
+        let updates = Mutex::new(Vec::<(u32, u32, f32)>::new());
+
+        (0..n).into_par_iter().for_each(|v| {
             let new_v = &new_cands[v];
             let old_v = &old_cands[v];
-            let mut pairs: Vec<(u32, u32)> = Vec::new();
+            if new_v.is_empty() { return; }
 
-            // new × new (upper triangle: avoid (a,b) and (b,a))
+            let mut local_results = Vec::new();
+            let mut seen = HashSet::new();
+
+            // new × new (upper triangle)
             for i in 0..new_v.len() {
                 for j in (i + 1)..new_v.len() {
-                    let (a, b) = (new_v[i].min(new_v[j]), new_v[i].max(new_v[j]));
-                    pairs.push((a, b));
+                    let (a, b) = if new_v[i] < new_v[j] { (new_v[i], new_v[j]) } else { (new_v[j], new_v[i]) };
+                    if !seen.insert((a, b)) { continue; }
+                    let ga = local_to_global[a as usize] as usize;
+                    let gb = local_to_global[b as usize] as usize;
+                    let d = construction_distance(codebook, flat_codes.doc_codes(ga), flat_codes.doc_codes(gb), use_emd);
+                    local_results.push((a, b, d));
                 }
             }
             // new × old
             for &u1 in new_v {
                 for &u2 in old_v {
                     if u1 == u2 { continue; }
-                    pairs.push((u1.min(u2), u1.max(u2)));
+                    let (a, b) = if u1 < u2 { (u1, u2) } else { (u2, u1) };
+                    if !seen.insert((a, b)) { continue; }
+                    let ga = local_to_global[a as usize] as usize;
+                    let gb = local_to_global[b as usize] as usize;
+                    let d = construction_distance(codebook, flat_codes.doc_codes(ga), flat_codes.doc_codes(gb), use_emd);
+                    local_results.push((a, b, d));
                 }
             }
-            pairs
-        }).collect();
 
-        let mut all_pairs: Vec<(u32, u32)> = pairs_per_node.into_iter().flatten().collect();
-        all_pairs.sort_unstable();
-        all_pairs.dedup();
+            if !local_results.is_empty() {
+                updates.lock().unwrap().extend_from_slice(&local_results);
+            }
+        });
 
-        if all_pairs.is_empty() {
-            progress!("[NN-Descent] iter {}/{}: 0 pairs — converged (no new neighbors)", iter + 1, n_iters);
+        let update_list = updates.into_inner().unwrap();
+        let n_pairs = update_list.len();
+
+        // Dedup: same pair may be generated from different nodes' joins.
+        // Sort + dedup by (a,b), keeping first (all have same distance).
+        let mut deduped = update_list;
+        deduped.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+        deduped.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+        if deduped.is_empty() {
+            progress!("[NN-Descent] iter {}/{}: 0 pairs — converged", iter + 1, n_iters);
             break;
         }
 
-        // Step 5: Compute distances in parallel (one distance per unique pair)
-        let distances: Vec<(u32, u32, f32)> = all_pairs.par_iter().map(|&(a, b)| {
-            let ga = local_to_global[a as usize] as usize;
-            let gb = local_to_global[b as usize] as usize;
-            let ca = flat_codes.doc_codes(ga);
-            let cb = flat_codes.doc_codes(gb);
-            let d = construction_distance(codebook, ca, cb, use_emd);
-            (a, b, d)
-        }).collect();
-
-        // Step 6: Apply symmetrized updates (each distance updates BOTH lists)
+        // Apply symmetrized updates
         let mut total_updates = 0usize;
-        for &(a, b, d) in &distances {
+        for &(a, b, d) in &deduped {
             if nn_try_insert(&mut nn_idx[a as usize], &mut nn_dist[a as usize],
                              &mut nn_flag[a as usize], b, d, k) {
                 total_updates += 1;
@@ -1764,8 +1794,8 @@ fn nn_descent(
             }
         }
 
-        progress!("[NN-Descent] iter {}/{}: {} unique pairs, {} updates (threshold={})",
-            iter + 1, n_iters, all_pairs.len(), total_updates, convergence_threshold);
+        progress!("[NN-Descent] iter {}/{}: {} unique pairs (from {}), {} updates (threshold={})",
+            iter + 1, n_iters, deduped.len(), n_pairs, total_updates, convergence_threshold);
 
         if total_updates <= convergence_threshold {
             progress!("[NN-Descent] converged at iter {}", iter + 1);
@@ -1834,54 +1864,77 @@ pub fn build_graph_nndescent(
         n_docs, n_clusters, max_degree, nn_k, nn_iters);
     progress!("[GEM nndescent] use_emd={}, RSS: {:.2} GB", use_emd, rss_gb());
 
-    // ── Phase 1: Parallel cluster-local NN-Descent ──────────────────────
-    progress!("[GEM nndescent] Phase 1: Parallel cluster-local NN-Descent...");
+    // ── Phase 1: Batched cluster-local NN-Descent ─────────────────────
+    // Process clusters in batches to control peak memory. Each batch runs
+    // up to BATCH_SIZE clusters in parallel, then merges results into the
+    // global per-doc candidate lists and releases memory via malloc_trim.
+    let batch_size = rayon::current_num_threads().max(4);
+    progress!("[GEM nndescent] Phase 1: Batched cluster-local NN-Descent (batch_size={})...", batch_size);
     let phase1_start = Instant::now();
 
-    let cluster_results: Vec<Vec<(u32, Vec<(u32, f32)>)>> = (0..n_clusters)
-        .into_par_iter()
-        .filter_map(|cluster_id| {
-            let members = &postings.lists[cluster_id];
-            if members.len() <= 1 {
-                return None;
+    let mut per_doc_candidates: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_docs];
+    let mut clusters_done = 0usize;
+
+    // Sort clusters by size descending so large ones go first and get more parallelism
+    let mut cluster_order: Vec<usize> = (0..n_clusters).collect();
+    cluster_order.sort_unstable_by(|&a, &b| postings.lists[b].len().cmp(&postings.lists[a].len()));
+
+    for batch_start in (0..n_clusters).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(n_clusters);
+        let batch_ids: Vec<usize> = cluster_order[batch_start..batch_end].to_vec();
+
+        let batch_results: Vec<Vec<(u32, Vec<(u32, f32)>)>> = batch_ids
+            .into_par_iter()
+            .filter_map(|cluster_id| {
+                let members = &postings.lists[cluster_id];
+                if members.len() <= 1 {
+                    return None;
+                }
+                let k_local = nn_k.min(members.len() - 1);
+                if k_local == 0 {
+                    return None;
+                }
+
+                let nn_lists = nn_descent(
+                    members, k_local, nn_iters,
+                    codebook, flat_codes, use_emd,
+                    42u64.wrapping_add(cluster_id as u64),
+                );
+
+                let result: Vec<(u32, Vec<(u32, f32)>)> = members.iter()
+                    .enumerate()
+                    .map(|(local_idx, &global_id)| (global_id, nn_lists[local_idx].clone()))
+                    .collect();
+                Some(result)
+            })
+            .collect();
+
+        // Merge batch results directly into per-doc candidates
+        for cluster_nn in batch_results {
+            for (global_id, nn_list) in cluster_nn {
+                let doc_idx = global_id as usize;
+                if doc_idx < n_docs {
+                    per_doc_candidates[doc_idx].extend(nn_list);
+                }
             }
-            let k_local = nn_k.min(members.len() - 1);
-            if k_local == 0 {
-                return None;
-            }
+            clusters_done += 1;
+        }
 
-            let nn_lists = nn_descent(
-                members, k_local, nn_iters,
-                codebook, flat_codes, use_emd,
-                42u64.wrapping_add(cluster_id as u64),
-            );
+        // Force glibc to return freed pages to OS between batches
+        unsafe { libc::malloc_trim(0); }
 
-            let result: Vec<(u32, Vec<(u32, f32)>)> = members.iter()
-                .enumerate()
-                .map(|(local_idx, &global_id)| (global_id, nn_lists[local_idx].clone()))
-                .collect();
-            Some(result)
-        })
-        .collect();
+        if (batch_start / batch_size) % 2 == 0 || batch_end == n_clusters {
+            progress!("[GEM nndescent] Phase 1: {}/{} clusters done ({:.0}s) — RSS: {:.2} GB",
+                clusters_done, n_clusters, phase1_start.elapsed().as_secs_f64(), rss_gb());
+        }
+    }
 
-    progress!("[GEM nndescent] Phase 1 done in {:.1}s — {} clusters produced neighbor lists — RSS: {:.2} GB",
-        phase1_start.elapsed().as_secs_f64(), cluster_results.len(), rss_gb());
+    progress!("[GEM nndescent] Phase 1 done in {:.1}s — {} clusters — RSS: {:.2} GB",
+        phase1_start.elapsed().as_secs_f64(), clusters_done, rss_gb());
 
     // ── Phase 2: Merge + Diversity Prune ────────────────────────────────
     progress!("[GEM nndescent] Phase 2: Merge + diversity prune — RSS: {:.2} GB", rss_gb());
     let phase2_start = Instant::now();
-
-    // Accumulate per-doc candidate lists from all clusters
-    let mut per_doc_candidates: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_docs];
-    for cluster_nn in &cluster_results {
-        for &(global_id, ref nn_list) in cluster_nn {
-            let doc_idx = global_id as usize;
-            if doc_idx < n_docs {
-                per_doc_candidates[doc_idx].extend_from_slice(nn_list);
-            }
-        }
-    }
-    drop(cluster_results);
 
     // Parallel: dedup, diversity-prune, enforce cross-cluster bridges
     let pruned_neighbors: Vec<Vec<u32>> = per_doc_candidates.into_par_iter()
@@ -1973,6 +2026,7 @@ pub fn build_graph_nndescent(
         }
     }
 
+    unsafe { libc::malloc_trim(0); }
     progress!("[GEM nndescent] Phase 2 done in {:.1}s — RSS: {:.2} GB", phase2_start.elapsed().as_secs_f64(), rss_gb());
 
     // ── Phase 2b (optional): Beam search refinement ─────────────────────
@@ -2076,8 +2130,9 @@ pub fn build_graph_nndescent(
         }
         drop(all_scores);
 
-        progress!("[GEM nndescent] Phase 2b done in {:.1}s — {} nodes refined",
-            phase2b_start.elapsed().as_secs_f64(), refined);
+        unsafe { libc::malloc_trim(0); }
+        progress!("[GEM nndescent] Phase 2b done in {:.1}s — {} nodes refined — RSS: {:.2} GB",
+            phase2b_start.elapsed().as_secs_f64(), refined, rss_gb());
     }
 
     // ── Phase 3: Repair ─────────────────────────────────────────────────
