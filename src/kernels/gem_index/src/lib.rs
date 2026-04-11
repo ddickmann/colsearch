@@ -246,12 +246,24 @@ impl GemSegment {
                 );
             }
 
+            fn rss_gb() -> f64 {
+                if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+                    if let Some(rss_pages) = s.split_whitespace().nth(1) {
+                        if let Ok(p) = rss_pages.parse::<u64>() {
+                            return (p * 4096) as f64 / 1e9;
+                        }
+                    }
+                }
+                -1.0
+            }
+
             progress!("[GEM build] ══════════════════════════════════════════════════");
             progress!("[GEM build] {} docs, {} vectors, dim={}", n_docs, n_vectors, dim);
             progress!("[GEM build] n_fine={}, n_coarse={}, max_degree={}, ef_construction={}",
                 n_fine, n_coarse, max_degree, ef_construction);
             progress!("[GEM build] use_emd={}, dual_graph={}, store_raw={}", use_emd, dual_graph, store_raw_vectors);
             progress!("[GEM build] zero-copy vectors (no .to_vec() copy)");
+            progress!("[GEM build] RSS: {:.2} GB", rss_gb());
             progress!("[GEM build] ══════════════════════════════════════════════════");
 
             progress!("[GEM build] Phase 1/5: L2-normalization already done (zero-copy)");
@@ -261,11 +273,12 @@ impl GemSegment {
             let mut codebook = TwoStageCodebook::build_prenorm(
                 flat, n_vectors, dim, n_fine, n_coarse, max_kmeans_iter, 42,
             );
-            progress!("[GEM build] Phase 2/5 done in {:.1}s", t.elapsed().as_secs_f64());
+            progress!("[GEM build] Phase 2/5 done in {:.1}s — RSS: {:.2} GB", t.elapsed().as_secs_f64(), rss_gb());
 
             progress!("[GEM build] Phase 3/5: Assigning vectors + IDF refinement...");
             let t = Instant::now();
             let all_assignments = codebook.assign_vectors_prenorm(flat, n_vectors);
+            progress!("[GEM build]   assign_vectors_prenorm → RSS: {:.2} GB", rss_gb());
 
             let mut doc_centroid_sets = Vec::with_capacity(n_docs);
             for &(start, end) in &doc_offsets {
@@ -274,13 +287,14 @@ impl GemSegment {
             codebook.update_idf(&doc_centroid_sets);
 
             codebook.refine_centroids_idf_prenorm(flat, n_vectors, 1);
+            progress!("[GEM build]   after refine_centroids_idf → RSS: {:.2} GB", rss_gb());
             let all_assignments = codebook.assign_vectors_prenorm(flat, n_vectors);
             let mut doc_centroid_sets = Vec::with_capacity(n_docs);
             for &(start, end) in &doc_offsets {
                 doc_centroid_sets.push(all_assignments[start..end].to_vec());
             }
             codebook.update_idf(&doc_centroid_sets);
-            progress!("[GEM build] Phase 3/5 done in {:.1}s", t.elapsed().as_secs_f64());
+            progress!("[GEM build] Phase 3/5 done in {:.1}s — RSS: {:.2} GB", t.elapsed().as_secs_f64(), rss_gb());
 
             progress!("[GEM build] Phase 4/5: Building doc profiles + postings...");
             let t = Instant::now();
@@ -298,10 +312,14 @@ impl GemSegment {
             }
 
             postings.compute_medoids(&codebook, &flat_codes);
-            progress!("[GEM build] Phase 4/5 done in {:.1}s", t.elapsed().as_secs_f64());
+            progress!("[GEM build] Phase 4/5 done in {:.1}s — RSS: {:.2} GB", t.elapsed().as_secs_f64(), rss_gb());
+
+            // Explicitly drop all_assignments — no longer needed, free 38 MB
+            drop(all_assignments);
 
             progress!("[GEM build] Phase 5/5: Graph construction ({})...",
                 if dual_graph { "nndescent" } else { "payload-graph" });
+            progress!("[GEM build] Phase 5/5 entry RSS: {:.2} GB", rss_gb());
             let t = Instant::now();
             let gem_graph = if dual_graph {
                 let refine = if refine_graph {

@@ -48,12 +48,13 @@ BUILD_PARAMS = dict(
     n_fine=2048,
     n_coarse=128,
     max_degree=48,
-    ef_construction=200,
+    ef_construction=400,
     max_kmeans_iter=20,
     ctop_r=4,
     use_emd=False,
     dual_graph=True,
     store_raw_vectors=False,
+    refine_graph=True,
 )
 
 
@@ -127,6 +128,11 @@ def build_index(max_docs: int = 0):
     seg = GemSegment()
     log.info("Building with params: %s", BUILD_PARAMS)
     log.info("Pre-build RSS: %.1f GB", _mem_gb())
+
+    rust_log = Path("/tmp/gem_build_progress.log")
+    if rust_log.exists():
+        rust_log.unlink()
+    log.info("Rust build progress → tail -f /tmp/gem_build_progress.log")
 
     t0 = time.time()
     seg.build(all_vectors, doc_ids, offsets, **BUILD_PARAMS)
@@ -924,7 +930,7 @@ def main():
     parser.add_argument("--skip-gpu", action="store_true")
     parser.add_argument("--skip-gt", action="store_true",
                         help="Skip GT computation (reuse cached)")
-    parser.add_argument("--max-docs", type=int, default=0,
+    parser.add_argument("--max-docs", type=int, default=75000,
                         help="Truncate to N docs (0 = use all)")
     args = parser.parse_args()
 

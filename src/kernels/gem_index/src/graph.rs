@@ -1818,10 +1818,21 @@ pub fn build_graph_nndescent(
     let nn_k = (max_degree * 2).min(96);
     let nn_iters = 12;
 
+    fn rss_gb() -> f64 {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(rss_pages) = s.split_whitespace().nth(1) {
+                if let Ok(p) = rss_pages.parse::<u64>() {
+                    return (p * 4096) as f64 / 1e9;
+                }
+            }
+        }
+        -1.0
+    }
+
     progress!("[GEM nndescent] ══════════════════════════════════════════════════");
     progress!("[GEM nndescent] {} docs, {} clusters, max_degree={}, nn_k={}, nn_iters={}",
         n_docs, n_clusters, max_degree, nn_k, nn_iters);
-    progress!("[GEM nndescent] use_emd={}", use_emd);
+    progress!("[GEM nndescent] use_emd={}, RSS: {:.2} GB", use_emd, rss_gb());
 
     // ── Phase 1: Parallel cluster-local NN-Descent ──────────────────────
     progress!("[GEM nndescent] Phase 1: Parallel cluster-local NN-Descent...");
@@ -1853,11 +1864,11 @@ pub fn build_graph_nndescent(
         })
         .collect();
 
-    progress!("[GEM nndescent] Phase 1 done in {:.1}s — {} clusters produced neighbor lists",
-        phase1_start.elapsed().as_secs_f64(), cluster_results.len());
+    progress!("[GEM nndescent] Phase 1 done in {:.1}s — {} clusters produced neighbor lists — RSS: {:.2} GB",
+        phase1_start.elapsed().as_secs_f64(), cluster_results.len(), rss_gb());
 
     // ── Phase 2: Merge + Diversity Prune ────────────────────────────────
-    progress!("[GEM nndescent] Phase 2: Merge + diversity prune...");
+    progress!("[GEM nndescent] Phase 2: Merge + diversity prune — RSS: {:.2} GB", rss_gb());
     let phase2_start = Instant::now();
 
     // Accumulate per-doc candidate lists from all clusters
@@ -1962,7 +1973,7 @@ pub fn build_graph_nndescent(
         }
     }
 
-    progress!("[GEM nndescent] Phase 2 done in {:.1}s", phase2_start.elapsed().as_secs_f64());
+    progress!("[GEM nndescent] Phase 2 done in {:.1}s — RSS: {:.2} GB", phase2_start.elapsed().as_secs_f64(), rss_gb());
 
     // ── Phase 2b (optional): Beam search refinement ─────────────────────
     // At small scale (<10K) NN-Descent quality already matches beam search
@@ -2070,7 +2081,7 @@ pub fn build_graph_nndescent(
     }
 
     // ── Phase 3: Repair ─────────────────────────────────────────────────
-    progress!("[GEM nndescent] Phase 3: Repair...");
+    progress!("[GEM nndescent] Phase 3: Repair — RSS: {:.2} GB", rss_gb());
     let phase3_start = Instant::now();
 
     let isolated_count = adjacency.iter().filter(|a| a.is_empty()).count();
