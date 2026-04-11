@@ -239,6 +239,14 @@ impl GemSegment {
             } else {
                 n_fine
             };
+            // Auto-tune n_coarse: scale with sqrt(n_docs) to keep cluster sizes
+            // bounded. Larger corpora need more coarse clusters to prevent NN-Descent
+            // from spending O(n^2) time on oversized clusters.
+            let n_coarse = if n_coarse == 0 {
+                ((n_docs as f64).sqrt() as usize).clamp(16, 1024)
+            } else {
+                n_coarse
+            };
             if n_fine < 128 && n_docs > 500 {
                 log::warn!(
                     "n_fine={} may cause poor ranking for {} docs; consider n_fine >= 128",

@@ -31,11 +31,12 @@ index_bytes ≈ 6 * n_tokens              # flat_codes + centroid_ids
             + 24 * n_docs               # doc_ids + offsets
 ```
 
-The **build-time peak** (current monolithic builder):
+The **build-time peak** (zero-copy builder, v1.1+):
 
 ```
-build_bytes ≈ 2 * (4 * n_tokens * dim)  # Python float32 + Rust copy
+build_bytes ≈ 4 * n_tokens * dim        # Python float32 array (zero-copy, no Rust copy)
             + index_bytes               # structures being constructed
+            + ~0.5 * n_docs * max_degree # NN-Descent working memory (batched)
 ```
 
 ### Scaling Table
@@ -46,10 +47,10 @@ max_degree=48:
 | Corpus Size | Tokens     | Persistent Index | Build-Time RAM | Status     |
 |-------------|------------|------------------|----------------|------------|
 | 7,500       | 950K       | ~9 MB            | ~1 GB          | Verified   |
-| 75,000      | 9.5M       | ~91 MB           | ~10 GB         | Verified   |
-| 100,000     | 13.3M      | ~127 MB          | ~14 GB         | Needs 28GB |
-| 1,000,000   | 128M       | ~1.2 GB          | ~131 GB        | v1.2       |
-| 10,000,000  | 1.28B      | ~12 GB           | ~1.3 TB        | v2.0       |
+| 75,000      | 9.5M       | ~91 MB           | ~8 GB          | Verified   |
+| 100,000     | 13.3M      | ~127 MB          | ~10 GB         | Verified   |
+| 1,000,000   | 128M       | ~1.2 GB          | ~68 GB         | v1.2       |
+| 10,000,000  | 1.28B      | ~12 GB           | ~660 GB        | v2.0       |
 
 The persistent index is remarkably compact: **~1.2 GB for 1M documents**.
 The bottleneck is entirely build-time memory — the monolithic builder must
@@ -80,6 +81,12 @@ None of these limits are a concern below 10M documents.
 **Rule of thumb for n_fine**: `n_fine ≈ sqrt(total_tokens)`.  The auto-tuner
 applies this when `n_fine=0` is passed to `build()`.
 
+**Rule of thumb for n_coarse**: `n_coarse ≈ sqrt(n_docs)`.  The auto-tuner
+applies this when `n_coarse=0` is passed to `build()`.  This is critical for
+build speed: the graph construction algorithm (NN-Descent) runs per-cluster,
+and its cost is roughly O(cluster_size^2).  Doubling `n_coarse` halves the
+largest cluster size, giving ~4x faster graph construction.
+
 ## Production Configuration
 
 For maximum quality at scale, use the full acceleration stack:
@@ -87,8 +94,8 @@ For maximum quality at scale, use the full acceleration stack:
 ```python
 seg.build(
     vectors, doc_ids, offsets,
-    n_fine=2048,          # or 0 for auto-tune
-    n_coarse=128,
+    n_fine=0,             # auto: sqrt(n_tokens), clamped [64, 2048]
+    n_coarse=0,           # auto: sqrt(n_docs), clamped [16, 1024]
     max_degree=48,
     ef_construction=400,
     ctop_r=4,

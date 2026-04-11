@@ -45,8 +45,8 @@ GT_PATH = CACHE_DIR / "beir_100k_gt.npz"
 RESULTS_PATH = Path(__file__).resolve().parent / "results" / "eval_100k.json"
 
 BUILD_PARAMS = dict(
-    n_fine=2048,
-    n_coarse=128,
+    n_fine=0,       # auto: sqrt(n_vectors), clamped [64, 2048]
+    n_coarse=0,     # auto: sqrt(n_docs), clamped [16, 1024]
     max_degree=48,
     ef_construction=400,
     max_kmeans_iter=20,
