@@ -965,6 +965,255 @@ New centroids are swapped atomically via manifest update.
 
 ---
 
+## 17. Feature Parity Checklist
+
+Every feature in the existing `voyager_index` codebase, mapped to its shard engine
+integration status. This is the acceptance gate: the shard engine is production-ready
+when all **Required** items are ✅.
+
+### Legend
+
+- ✅ = Already works or trivially inherited
+- 🔧 = Needs implementation (with phase number)
+- ⏭️ = Deferred (not required for production launch)
+- 🚫 = Not applicable to shard engine architecture
+
+---
+
+### 17.1 Core Index Operations (`voyager_index/index.py`)
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 1 | `add` / `add_batch` multivector ingest | `Index.add` | 🔧 Phase 2 — WAL + memtable |
+| 2 | `upsert` multivector | `Index.upsert` | 🔧 Phase 2 — DELETE + INSERT in WAL |
+| 3 | `delete` by doc_id | `Index.delete` | 🔧 Phase 2 — tombstone in WAL |
+| 4 | `update_payload` metadata update | `Index.update_payload` | 🔧 Phase 2 — payload store alongside shards |
+| 5 | `search` with k, ef, n_probes | `Index.search` | 🔧 Phase 1 — route → fetch → MaxSim |
+| 6 | `search_batch` batched queries | `Index.search_batch` | 🔧 Phase 1 — batch over queries, share shard fetches |
+| 7 | `get` payloads by doc_id | `Index.get` | 🔧 Phase 2 — payload store lookup |
+| 8 | `scroll` with pagination and filters | `Index.scroll` | 🔧 Phase 6 — iterate shards with filter |
+| 9 | `snapshot` tarball backup | `Index.snapshot` | ✅ Shards are files — tar the index directory |
+| 10 | `stats` (doc count, token count, memory) | `Index.stats` | 🔧 Phase 1 — from manifest metadata |
+| 11 | `set_metrics_hook` (latency, candidates, nodes) | `Index.set_metrics_hook` | 🔧 Phase 1 — emit from profiler |
+| 12 | `flush` / `close` / context manager | `Index` lifecycle | 🔧 Phase 2 — flush memtable, sync WAL |
+| 13 | Engine selection: `"gem"` / `"hnsw"` / `"shard"` / `"auto"` | `IndexBuilder` | 🔧 Phase 6 — register `"shard"` |
+| 14 | Mode hints `colbert` / `colpali` | `IndexBuilder` | ✅ Shard engine is mode-agnostic (stores token embeddings) |
+| 15 | `embedding_fn` for `add_texts` / `search_text` | `Index` | ✅ Inherited — embedding hook is at `Index` level |
+| 16 | Payload filters (Qdrant-style nested ops) | `GemNativeSegmentManager` | 🔧 Phase 6 — filter during top-k merge |
+| 17 | Token attribution / `_explain_score` | `GemNativeSegmentManager` | 🔧 Phase 6 — per-token MaxSim decomposition |
+| 18 | `IndexBuilder` fluent API (`with_gem`, `with_shard`, etc.) | `IndexBuilder` | 🔧 Phase 6 — add `with_shard()` |
+
+### 17.2 Write-Ahead Log and Recovery
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 19 | WAL operations: INSERT, DELETE, UPSERT, UPDATE_PAYLOAD | `gem_wal.py` | 🔧 Phase 2 — reuse WalOp enum |
+| 20 | CRC32 integrity on WAL entries | `WalWriter` | 🔧 Phase 2 — reuse existing format |
+| 21 | Corruption-tolerant replay | `WalReader.replay` | 🔧 Phase 2 — reuse skip logic |
+| 22 | Atomic checkpoint save/load | `CheckpointManager` | 🔧 Phase 2 — checkpoint = manifest snapshot |
+| 23 | Crash recovery: replay WAL from last checkpoint | `GemNativeSegmentManager` | 🔧 Phase 2 — replay into memtable |
+
+### 17.3 Concurrency and I/O Safety
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 24 | Reader-writer lock for concurrent search + write | `io_utils.RWLock` | 🔧 Phase 2 — lock manifest swaps |
+| 25 | File lock for cross-process safety | `io_utils.FileLock` | 🔧 Phase 2 — lock index directory |
+| 26 | Atomic JSON writes (manifest updates) | `io_utils.atomic_json_write` | 🔧 Phase 2 — for manifest.json |
+| 27 | Snapshot isolation (readers see consistent state during compaction) | `GemNativeSegmentManager` | 🔧 Phase 2 — manifest versioning |
+
+### 17.4 Kernels and Scoring
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 28 | Triton MaxSim FP16 | `fast_colbert_scores` | ✅ Already used in benchmark |
+| 29 | Triton MaxSim INT8 mode | `fast_colbert_scores(quantization_mode="int8")` | ✅ Available, wire to shard compression |
+| 30 | Triton MaxSim FP8 mode | `fast_colbert_scores(quantization_mode="fp8")` | ✅ Available (experimental) |
+| 31 | ROQ 4-bit MaxSim (1/2/4/8-bit ladder) | `roq_maxsim_4bit` | 🔧 Phase 3 — wire to shard scoring |
+| 32 | Rust BLAS MaxSim fallback (no GPU) | `gem_index/lib.rs maxsim_score` | 🔧 Phase 3 — CPU fallback path |
+| 33 | PyTorch fallback MaxSim (no Triton, no Rust) | `_fallback_maxsim` | ✅ Already in benchmark scorer |
+| 34 | Triton kernel warmup (cold-start mitigation) | `kernel_warmup.py` | 🔧 Phase 1 — call on first query |
+| 35 | GPU qCH proxy scoring | `GpuQchScorer` | 🚫 Not needed (no graph construction) |
+| 36 | Triton qCH pairwise kernels | `triton_qch_kernel.py` | 🚫 Not needed (no graph construction) |
+
+### 17.5 Quantization and Compression
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 37 | Scalar INT8 quantization | `ScalarQuantizer` | ✅ Already in shard store |
+| 38 | ROQ rotational quantization (1-8 bit) | `RotationalQuantizer` | 🔧 Phase 3 — build-time encode, Triton decode |
+| 39 | Binary quantization + Hamming search | `BinaryQuantizer` | ⏭️ Coarse pre-filter for ultra-large corpora |
+| 40 | Product quantization (PQ) | `ProductQuantizer` | ⏭️ Alternative compression for 10M+ scale |
+| 41 | Walsh-Hadamard transform for ROQ | `FastWalshHadamard` | 🔧 Phase 3 — part of ROQ pipeline |
+
+### 17.6 Hybrid Search, BM25, and Fusion
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 42 | BM25s sparse search (Cython engine) | `BM25sEngine` / `bm25s` | 🔧 Phase 5 — co-locate BM25 index with shards |
+| 43 | Pure-Python BM25 engine (fallback) | `BM25Engine` | ✅ Available as fallback |
+| 44 | BM25 stemmed tokenization (PyStemmer) | `HybridSearchManager` | ✅ Inherited from existing sparse pipeline |
+| 45 | Reciprocal Rank Fusion (RRF) | `fusion/strategies.py` | ✅ Reuse existing `reciprocal_rank_fusion` |
+| 46 | Weighted sum fusion | `fusion/strategies.py` | ✅ Reuse existing `weighted_sum_fusion` |
+| 47 | Max / min fusion | `fusion/strategies.py` | ✅ Reuse existing |
+| 48 | Score normalization (min-max, z-score, softmax) | `fusion/strategies.py` | ✅ Reuse existing normalizers |
+| 49 | **Tabu Search Solver refinement** | `latence_solver` / `TabuSearchSolver` | 🔧 Phase 5 — replace RRF with solver when available |
+| 50 | `GpuFulfilmentPipeline` (GPU precompute for solver) | `stateless_optimizer.py` | 🔧 Phase 5 — optional GPU features for solver |
+| 51 | Rich payload feature scoring (ontology, recency, density) | `HybridSearchManager` | 🔧 Phase 5 — pass shard doc features to solver |
+| 52 | Sparse index rebuild with staged swap | `HybridSearchManager` | 🔧 Phase 5 — atomic BM25 index update |
+| 53 | `HybridSearchManager` dense + sparse fan-out | `hybrid_manager.py` | 🔧 Phase 5 — shard engine as dense backend |
+| 54 | `SearchPipeline` wrapping hybrid manager | `search_pipeline.py` | 🔧 Phase 6 — register shard dense backend |
+
+### 17.7 Knowledge Graph Integration
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 55 | `Neo4jEngine` (in-memory stub, production needs `neo4j` driver) | `engines/neo4j.py` | ⏭️ Stub — production wiring deferred |
+| 56 | `Neo4jConfig` for connection settings | `config.py` | ✅ Config exists, engine is stub |
+| 57 | Optional KG entity enrichment in hybrid pipeline | Architectural | ⏭️ Design: KG results as additional signal to fusion/solver |
+
+**Knowledge graph integration path**: The Tabu solver's feature scoring already
+supports arbitrary payload features (ontology, entity type, etc.). The integration
+point is:
+
+1. At **ingest time**: if a KG is available, annotate documents with entity IDs,
+   categories, and relationship types. Store these as payload metadata in the shard
+   manifest or a sidecar payload store.
+
+2. At **query time**: optionally query the KG for entities related to the query.
+   Pass entity matches as boosting signals to the Tabu solver's feature vector.
+
+3. At **fusion time**: KG-derived results can be a third signal alongside dense
+   (shard-routed MaxSim) and sparse (BM25), fused via RRF or the solver.
+
+This is architecturally clean because the shard engine doesn't need to know about
+the KG — it just stores payloads and returns scored candidates. The KG integration
+happens at the `SearchPipeline` / `HybridSearchManager` level.
+
+### 17.8 Multimodal and ColPali
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 58 | `ColBERTEngine` wrapping `ColbertIndex` | `engines/colbert.py` | 🔧 Phase 6 — add shard-routed strategy |
+| 59 | `ColPaliEngine` + screening backends | `engines/colpali.py` | 🔧 Phase 6 — add shard-routed screening |
+| 60 | `MultiModalEngine` (ColBERT + ColPali fusion) | `engines/colpali.py` | 🔧 Phase 6 — shard engine supports any token embeddings |
+| 61 | `MultimodalModelSpec` registry | `multimodal.py` | ✅ Model-agnostic — shard engine stores embeddings |
+| 62 | `VllmPoolingProvider` (vLLM `/v1/pooling` HTTP) | `multimodal.py` | ✅ Embedding provider, not index-level |
+| 63 | Document preprocessing (PDF/DOCX/images) | `preprocessing.py` | ✅ Preprocessing pipeline, not index-level |
+
+### 17.9 Screening and Routing
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 64 | `GemScreeningIndex` (Rust `PyGemRouter`) | `gem_screening.py` | 🚫 Replaced by centroid router |
+| 65 | `PrototypeScreeningIndex` (HNSW-style) | `prototype_screening.py` | 🚫 Replaced by centroid router |
+| 66 | `CentroidScreeningIndex` | `centroid_screening.py` | ✅ Conceptually identical to shard centroid router |
+| 67 | `ScreeningSidecar` protocol + calibration | `screening_sidecar.py` | ⏭️ Calibration for adaptive budget |
+
+### 17.10 Storage and Persistence
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 68 | Safetensors shard files | `shard_store.py` | ✅ Already implemented |
+| 69 | JSON manifest with shard metadata | `shard_store.py` | ✅ Already implemented |
+| 70 | HDF5 + mmap storage | `storage.py` | 🚫 Replaced by safetensors shards |
+| 71 | Async HDF5 pipeline + triple buffer | `async_storage.py` | 🚫 Replaced — shard writes are sequential |
+| 72 | `PinnedMemoryPool` for GPU staging | `async_storage.py` | ✅ Available if needed for double-buffered mode |
+| 73 | Sharded storage / shard manager | `sharded_storage.py` | ✅ Superseded by shard engine's own ShardStore |
+
+### 17.11 Graph Construction (NOT needed for shard engine)
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 74 | GEM HNSW multi-level graph | `gem_index graph.rs` | 🚫 No graph needed |
+| 75 | NN-Descent graph construction | `gem_index graph.rs` | 🚫 No graph needed |
+| 76 | RNN-Descent (MRNG + navigating node) | `gem_index graph.rs` | 🚫 No graph needed |
+| 77 | Dual-graph / bridge repair | `gem_index graph.rs` | 🚫 No graph needed |
+| 78 | Semantic shortcuts | `gem_manager.py` | 🚫 No graph needed |
+| 79 | qEMD / Sinkhorn OT distances | `gem_index emd.rs` | 🚫 No graph needed |
+| 80 | Background self-healing thread | `gem_manager.py` | 🚫 No graph to heal — compaction serves this role |
+
+### 17.12 HTTP API and Server
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 81 | `GET /health` (version, collections, GPU) | `server/api/routes.py` | ✅ Server-level, engine-agnostic |
+| 82 | `GET /ready` readiness report | `server/api/routes.py` | ✅ Server-level |
+| 83 | `GET /metrics` Prometheus text | `server/api/routes.py` | ✅ Server-level |
+| 84 | Collections CRUD (list, create, delete, info) | `server/api/routes.py` | 🔧 Phase 9 — register shard engine as collection kind |
+| 85 | Points add / delete | `server/api/routes.py` | 🔧 Phase 9 — delegates to ShardSegmentManager |
+| 86 | `POST .../search` | `server/api/routes.py` | 🔧 Phase 9 — add `"shard_routed"` strategy |
+| 87 | `POST /reference/optimize` (stateless optimizer) | `server/api/routes.py` | ✅ Optimizer is engine-agnostic |
+| 88 | `POST /reference/preprocess/documents` | `server/api/routes.py` | ✅ Preprocessing, engine-agnostic |
+| 89 | Collection kinds: `dense`, `late_interaction`, `multimodal` | `server/api/models.py` | 🔧 Phase 9 — shard engine serves `late_interaction` |
+| 90 | Screening modes in server models | `server/api/models.py` | 🔧 Phase 9 — add `"centroid_routed"` mode |
+| 91 | Shard admin endpoints (list, compact, checkpoint) | NEW | 🔧 Phase 9 |
+| 92 | `SearchService` journal recovery + mutation backup | `server/api/service.py` | 🔧 Phase 9 — adapt for WAL-based recovery |
+
+### 17.13 Distributed
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 93 | `DistributedRouter` scatter-gather skeleton | `distributed/router.py` | 🔧 Phase 8 — coordinator-level shard routing |
+| 94 | Cross-node top-k merge (RRF / score merge) | `distributed/router.py` | 🔧 Phase 8 |
+| 95 | Shard rebalancing on node add/remove | NEW | 🔧 Phase 8 — file copy + manifest update |
+
+### 17.14 Configuration
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 96 | `IndexConfig` (PLAID, ColBERT, GEM fields) | `config.py` | 🔧 Phase 6 — add shard engine fields |
+| 97 | `BM25Config` | `config.py` | ✅ Reused as-is for hybrid search |
+| 98 | `FusionConfig` | `config.py` | ✅ Reused as-is for hybrid fusion |
+| 99 | `Neo4jConfig` | `config.py` | ✅ Reused as-is (stub integration) |
+| 100 | `ShardEngineConfig` | NEW | 🔧 Phase 1 |
+
+### 17.15 Observability and Debugging
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 101 | Per-query profiler (routing/fetch/h2d/maxsim/total) | `shard_bench/profiler.py` | ✅ Already implemented |
+| 102 | Memory snapshot (CPU RSS, GPU allocated/reserved) | `shard_bench/profiler.py` | ✅ Already implemented |
+| 103 | Metrics hook (search_latency_us, candidates_scored) | `Index.set_metrics_hook` | 🔧 Phase 1 — emit from profiler |
+| 104 | Page cache hit rate tracking | NEW | 🔧 Phase 9 — `mincore()` or `/proc/meminfo` |
+
+### 17.16 Experimental / Research (Low Priority)
+
+| # | Feature | Source | Shard Engine Status |
+|---|---------|--------|---------------------|
+| 105 | `VectorGym` RL environment | `gym/vector_env.py` | ⏭️ Experimental, not production |
+| 106 | `TabuPotentialField` control manifold | `control/potential.py` | ⏭️ Research utility |
+| 107 | `FeatureBridge` (OSS stub) | `feature_bridge.py` | ⏭️ Removed from OSS |
+
+---
+
+### 17.17 Summary Counts
+
+| Status | Count | Meaning |
+|--------|-------|---------|
+| ✅ Already works / inherited | 37 | No action needed |
+| 🔧 Needs implementation | 49 | Covered by Phases 1-9 |
+| 🚫 Not applicable | 11 | Graph-specific, replaced by shard architecture |
+| ⏭️ Deferred | 10 | Post-launch, experimental, or stubs |
+| **Total** | **107** | |
+
+### 17.18 Critical Path Features (must ship)
+
+These are the features that **must** work before the shard engine can be used as a
+drop-in replacement for GEM/HNSW in production:
+
+1. **Search**: route → fetch → per-shard MaxSim → top-k merge (Phase 1)
+2. **CRUD**: add / delete / upsert via WAL + memtable (Phase 2)
+3. **Recovery**: WAL replay on crash (Phase 2)
+4. **ROQ 4-bit**: bandwidth reduction for scale (Phase 3)
+5. **Hybrid search**: BM25 + shard-routed + Tabu solver (Phase 5)
+6. **Public API**: `Index(engine="shard")` registration (Phase 6)
+
+Everything else (scroll, filters, explain, distributed, admin endpoints) is
+important for feature parity but not blocking for initial production use.
+
+---
+
 ## Implementation Priority
 
 | Phase | Deliverable | Dependencies | Effort |
