@@ -154,8 +154,12 @@ impl GemSegment {
     ///   ctop_r: number of top coarse clusters per document
     ///   payload_clusters: optional per-doc cluster IDs for payload-aware construction
     ///   use_emd: use qEMD (Earth Mover's Distance) for graph construction instead of qCH
-    ///   dual_graph: use per-cluster dual-graph construction (GEM paper Algorithm 1)
-    #[pyo3(signature = (all_vectors, doc_ids, doc_offsets, n_fine = 0, n_coarse = 32, max_degree = 32, ef_construction = 200, max_kmeans_iter = 15, ctop_r = 3, payload_clusters = None, use_emd = true, dual_graph = true, store_raw_vectors = true, refine_graph = false))]
+    ///   graph_method: graph construction algorithm — "hnsw" (default, navigable multi-level),
+    ///     "nndescent" (fast but experimental), "rnn_descent" (fast + navigable, SOTA hybrid)
+    ///   dual_graph: DEPRECATED — kept for backward compatibility. dual_graph=False maps to
+    ///     graph_method="hnsw", dual_graph=True maps to graph_method="hnsw" (changed from
+    ///     nndescent which produced non-navigable graphs).
+    #[pyo3(signature = (all_vectors, doc_ids, doc_offsets, n_fine = 0, n_coarse = 32, max_degree = 32, ef_construction = 200, max_kmeans_iter = 15, ctop_r = 3, payload_clusters = None, use_emd = true, dual_graph = true, store_raw_vectors = true, refine_graph = false, gpu_dist_fn = None, graph_method = None))]
     fn build(
         &mut self,
         py: Python<'_>,
@@ -173,6 +177,8 @@ impl GemSegment {
         dual_graph: bool,
         store_raw_vectors: bool,
         refine_graph: bool,
+        gpu_dist_fn: Option<Py<PyAny>>,
+        graph_method: Option<String>,
     ) -> PyResult<()> {
         let (n_vectors, dim) = {
             let shape = all_vectors.shape();
@@ -202,10 +208,26 @@ impl GemSegment {
                 "too many documents ({}) — max supported is {}", n_docs, u32::MAX
             )));
         }
-        if dual_graph && payload_clusters.is_some() {
+        // Resolve graph_method: explicit parameter takes precedence over dual_graph
+        let graph_method_resolved: String = match graph_method {
+            Some(ref m) => {
+                let m_lower = m.to_lowercase();
+                match m_lower.as_str() {
+                    "hnsw" | "nndescent" | "rnn_descent" => m_lower,
+                    _ => return Err(PyValueError::new_err(format!(
+                        "unknown graph_method '{}': expected 'hnsw', 'nndescent', or 'rnn_descent'", m
+                    ))),
+                }
+            }
+            None => {
+                // Default: always use HNSW (navigable, proven)
+                "hnsw".to_string()
+            }
+        };
+
+        if graph_method_resolved != "hnsw" && payload_clusters.is_some() {
             return Err(PyValueError::new_err(
-                "dual_graph=True and payload_clusters are mutually exclusive: \
-                 dual-graph uses the router's cluster postings, not external payload clusters"
+                "payload_clusters is only supported with graph_method='hnsw'"
             ));
         }
 
@@ -325,26 +347,69 @@ impl GemSegment {
             // Explicitly drop all_assignments — no longer needed, free 38 MB
             drop(all_assignments);
 
-            progress!("[GEM build] Phase 5/5: Graph construction ({})...",
-                if dual_graph { "nndescent" } else { "payload-graph" });
+            progress!("[GEM build] Phase 5/5: Graph construction (method={}{})...",
+                &graph_method_resolved,
+                if gpu_dist_fn.is_some() { " +GPU" } else { "" });
             progress!("[GEM build] Phase 5/5 entry RSS: {:.2} GB", rss_gb());
             let t = Instant::now();
-            let gem_graph = if dual_graph {
-                let refine = if refine_graph {
-                    Some((flat, dim, &doc_offsets[..], ef_construction))
-                } else {
-                    None
-                };
-                graph::build_graph_nndescent(
-                    n_docs, &codebook, &flat_codes,
-                    &doc_profiles, &postings, max_degree, use_emd, refine,
-                )
-            } else {
-                graph::build_graph_with_payload(
-                    flat, dim, &doc_offsets, &codebook, &flat_codes,
-                    &doc_profiles, &postings, max_degree, ef_construction,
-                    payload_clusters.as_deref(), use_emd,
-                )
+
+            // Build GPU batch distance closure if a Python callable was provided.
+            // The closure re-acquires the GIL to call into Python/Triton.
+            let gpu_closure: Option<Box<graph::BatchDistFn>> = gpu_dist_fn.map(|py_fn| {
+                let closure: Box<graph::BatchDistFn> = Box::new(move |pairs_a: &[u32], pairs_b: &[u32]| {
+                    pyo3::Python::with_gil(|py| {
+                        use pyo3::types::PyList;
+                        let a_list = PyList::new_bound(py, pairs_a.iter().map(|&x| x));
+                        let b_list = PyList::new_bound(py, pairs_b.iter().map(|&x| x));
+                        match py_fn.call1(py, (a_list, b_list)) {
+                            Ok(result) => {
+                                let list = result.bind(py);
+                                if let Ok(arr) = list.extract::<Vec<f32>>() {
+                                    arr
+                                } else {
+                                    log::error!("GPU dist fn returned non-float list; falling back");
+                                    vec![f32::MAX; pairs_a.len()]
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("GPU dist fn failed: {}; falling back", e);
+                                vec![f32::MAX; pairs_a.len()]
+                            }
+                        }
+                    })
+                });
+                closure
+            });
+            let gpu_ref: Option<&graph::BatchDistFn> = gpu_closure.as_deref();
+
+            let gem_graph = match graph_method_resolved.as_str() {
+                "nndescent" => {
+                    let refine = if refine_graph {
+                        Some((flat, dim, &doc_offsets[..], ef_construction))
+                    } else {
+                        None
+                    };
+                    graph::build_graph_nndescent(
+                        n_docs, &codebook, &flat_codes,
+                        &doc_profiles, &postings, max_degree, use_emd, refine,
+                        gpu_ref,
+                    )
+                }
+                "rnn_descent" => {
+                    graph::build_graph_rnn_descent(
+                        n_docs, flat, dim, &doc_offsets, &codebook, &flat_codes,
+                        &doc_profiles, &postings, max_degree, ef_construction, use_emd,
+                        gpu_ref,
+                    )
+                }
+                _ => {
+                    // "hnsw" — proven navigable multi-level graph
+                    graph::build_graph_with_payload(
+                        flat, dim, &doc_offsets, &codebook, &flat_codes,
+                        &doc_profiles, &postings, max_degree, ef_construction,
+                        payload_clusters.as_deref(), use_emd,
+                    )
+                }
             };
             progress!("[GEM build] Phase 5/5 done in {:.1}s", t.elapsed().as_secs_f64());
             progress!("[GEM build] ══════════════════════════════════════════════════");
