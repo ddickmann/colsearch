@@ -1620,7 +1620,6 @@ fn nn_descent(
 ) -> Vec<Vec<(u32, f32)>> {
     use rand::RngCore;
     use std::collections::HashSet;
-    use std::sync::Mutex;
 
     let n = doc_ids.len();
     if n <= 1 {
@@ -1725,17 +1724,13 @@ fn nn_descent(
 
         // Step 4+5+6: Streaming local join — compute distances inline, no pair buffer.
         // For each node v, enumerate new[v] × (new[v] ∪ old[v]).
-        // Use a per-node HashSet for local dedup within each node's join,
-        // then apply symmetrized updates. This avoids the massive O(n*k^2)
-        // pair allocation that was the memory bottleneck.
-        let updates = Mutex::new(Vec::<(u32, u32, f32)>::new());
-
-        (0..n).into_par_iter().for_each(|v| {
+        // Per-thread collection (no Mutex contention), then merge + dedup + apply.
+        let all_updates: Vec<Vec<(u32, u32, f32)>> = (0..n).into_par_iter().filter_map(|v| {
             let new_v = &new_cands[v];
             let old_v = &old_cands[v];
-            if new_v.is_empty() { return; }
+            if new_v.is_empty() { return None; }
 
-            let mut local_results = Vec::new();
+            let mut results = Vec::new();
             let mut seen = HashSet::new();
 
             // new × new (upper triangle)
@@ -1746,7 +1741,7 @@ fn nn_descent(
                     let ga = local_to_global[a as usize] as usize;
                     let gb = local_to_global[b as usize] as usize;
                     let d = construction_distance(codebook, flat_codes.doc_codes(ga), flat_codes.doc_codes(gb), use_emd);
-                    local_results.push((a, b, d));
+                    results.push((a, b, d));
                 }
             }
             // new × old
@@ -1758,21 +1753,16 @@ fn nn_descent(
                     let ga = local_to_global[a as usize] as usize;
                     let gb = local_to_global[b as usize] as usize;
                     let d = construction_distance(codebook, flat_codes.doc_codes(ga), flat_codes.doc_codes(gb), use_emd);
-                    local_results.push((a, b, d));
+                    results.push((a, b, d));
                 }
             }
 
-            if !local_results.is_empty() {
-                updates.lock().unwrap().extend_from_slice(&local_results);
-            }
-        });
+            if results.is_empty() { None } else { Some(results) }
+        }).collect();
 
-        let update_list = updates.into_inner().unwrap();
-        let n_pairs = update_list.len();
-
-        // Dedup: same pair may be generated from different nodes' joins.
-        // Sort + dedup by (a,b), keeping first (all have same distance).
-        let mut deduped = update_list;
+        // Flatten, dedup, apply
+        let mut deduped: Vec<(u32, u32, f32)> = all_updates.into_iter().flatten().collect();
+        let n_pairs = deduped.len();
         deduped.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
         deduped.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
@@ -1868,7 +1858,9 @@ pub fn build_graph_nndescent(
     // Process clusters in batches to control peak memory. Each batch runs
     // up to BATCH_SIZE clusters in parallel, then merges results into the
     // global per-doc candidate lists and releases memory via malloc_trim.
-    let batch_size = rayon::current_num_threads().max(4);
+    // The streaming join already keeps per-cluster memory small, so we use
+    // large batches (half the clusters) for maximum parallelism.
+    let batch_size = (n_clusters / 2).max(rayon::current_num_threads()).max(4);
     progress!("[GEM nndescent] Phase 1: Batched cluster-local NN-Descent (batch_size={})...", batch_size);
     let phase1_start = Instant::now();
 
