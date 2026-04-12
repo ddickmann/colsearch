@@ -12,9 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
 
-from benchmarks.shard_bench.build_index import DEFAULT_NPZ, _index_dir, build, load_corpus
-from benchmarks.shard_bench.colbandit_reranker import ColBanditConfig as _CBConfig, ColBanditReranker
-from benchmarks.shard_bench.config import (
+from voyager_index._internal.inference.shard_engine.builder import DEFAULT_NPZ, _index_dir, build, load_corpus
+from voyager_index._internal.inference.shard_engine.colbandit_reranker import ColBanditConfig as _CBConfig, ColBanditReranker
+from voyager_index._internal.inference.shard_engine.config import (
     BenchmarkConfig,
     BuildConfig,
     Compression,
@@ -23,13 +23,13 @@ from benchmarks.shard_bench.config import (
     StorageLayout,
     TransferMode,
 )
-from benchmarks.shard_bench.fetch_pipeline import FetchPipeline, PinnedBufferPool
-from benchmarks.shard_bench.lemur_router import LemurRouter
-from benchmarks.shard_bench.maxsim_scorer import brute_force_maxsim, score_all_docs_topk, warmup_maxsim
+from voyager_index._internal.inference.shard_engine.fetch_pipeline import FetchPipeline, PinnedBufferPool
+from voyager_index._internal.inference.shard_engine.lemur_router import LemurRouter
+from voyager_index._internal.inference.shard_engine.scorer import brute_force_maxsim, score_all_docs_topk, warmup_maxsim
 from benchmarks.shard_bench.metrics import compute_all_metrics
-from benchmarks.shard_bench.profiler import QueryProfile, aggregate_profiles
+from voyager_index._internal.inference.shard_engine.profiler import QueryProfile, aggregate_profiles
 from benchmarks.shard_bench.run_benchmark import compute_ground_truth, search_shard_routed
-from benchmarks.shard_bench.shard_store import ShardStore
+from voyager_index._internal.inference.shard_engine.shard_store import ShardStore
 
 CORPUS_SIZE = 7500
 N_EVAL = 100

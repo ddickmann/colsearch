@@ -17,10 +17,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from benchmarks.shard_bench.baselines import BaselineDenseSingleVector, BaselineGpuMaxSim
-from benchmarks.shard_bench.build_index import DEFAULT_NPZ, _index_dir, build, load_corpus
-from benchmarks.shard_bench.centroid_router import CentroidRouter
-from benchmarks.shard_bench.colbandit_reranker import ColBanditConfig as _CBConfig, ColBanditReranker
-from benchmarks.shard_bench.config import (
+from voyager_index._internal.inference.shard_engine.builder import DEFAULT_NPZ, _index_dir, build, load_corpus
+from voyager_index._internal.inference.shard_engine.centroid_router import CentroidRouter
+from voyager_index._internal.inference.shard_engine.colbandit_reranker import ColBanditConfig as _CBConfig, ColBanditReranker
+from voyager_index._internal.inference.shard_engine.config import (
     BenchmarkConfig,
     BuildConfig,
     Compression,
@@ -33,12 +33,12 @@ from benchmarks.shard_bench.config import (
     SWEEP_TOP_SHARDS,
     SWEEP_TRANSFER,
 )
-from benchmarks.shard_bench.fetch_pipeline import FetchPipeline, PinnedBufferPool
-from benchmarks.shard_bench.lemur_router import LemurRouter
-from benchmarks.shard_bench.maxsim_scorer import brute_force_maxsim, score_all_docs_topk, warmup_maxsim, PreloadedGpuCorpus
+from voyager_index._internal.inference.shard_engine.fetch_pipeline import FetchPipeline, PinnedBufferPool
+from voyager_index._internal.inference.shard_engine.lemur_router import LemurRouter
+from voyager_index._internal.inference.shard_engine.scorer import brute_force_maxsim, score_all_docs_topk, warmup_maxsim, PreloadedGpuCorpus
 from benchmarks.shard_bench.metrics import compute_all_metrics
-from benchmarks.shard_bench.profiler import QueryProfile, Timer, aggregate_profiles, memory_snapshot
-from benchmarks.shard_bench.shard_store import ShardStore
+from voyager_index._internal.inference.shard_engine.profiler import QueryProfile, Timer, aggregate_profiles, memory_snapshot
+from voyager_index._internal.inference.shard_engine.shard_store import ShardStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
