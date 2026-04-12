@@ -396,8 +396,76 @@ class ShardSegmentManager:
         """Alias for search_multivector."""
         return self.search_multivector(query, k=k, filters=filters)
 
+    def scroll(self, limit: int = 100, offset: int = 0,
+               filters: Optional[Dict] = None) -> Tuple[List[int], Optional[int]]:
+        """Paginate through all document IDs.
+
+        Returns:
+            (page_ids, next_offset) — next_offset is None when done.
+        """
+        all_ids = sorted(set(self._doc_ids or []))
+        if self._memtable:
+            docs, _, tombstones = self._memtable.snapshot()
+            all_ids = sorted(set(all_ids) | set(docs.keys()) - tombstones)
+
+        if filters:
+            all_ids = [did for did in all_ids if self._match_filter(did, filters)]
+
+        page = all_ids[offset:offset + limit]
+        next_off = offset + limit if offset + limit < len(all_ids) else None
+        return page, next_off
+
+    def _explain_score(
+        self, query: np.ndarray, doc_id: int,
+    ) -> Tuple[Optional[List[float]], Optional[List[int]]]:
+        """Per-query-token score attribution for a single document.
+
+        Returns (token_scores, matched_doc_tokens) or (None, None) if unavailable.
+        """
+        if self._memtable:
+            docs, _, _ = self._memtable.snapshot()
+            if doc_id in docs:
+                doc_vec = docs[doc_id]
+                q = torch.from_numpy(query).float()
+                d = torch.from_numpy(doc_vec).float()
+                sim = q @ d.T  # (n_q, n_d)
+                max_sim, matched = sim.max(dim=1)
+                return max_sim.tolist(), matched.tolist()
+        return None, None
+
+    @staticmethod
+    def _evaluate_filter(payload: dict, filters: Dict, doc_id: int = 0) -> bool:
+        """Evaluate Qdrant-style payload filters."""
+        if not filters:
+            return True
+        for key, condition in filters.items():
+            val = payload.get(key)
+            if isinstance(condition, dict):
+                if "$eq" in condition and val != condition["$eq"]:
+                    return False
+                if "$in" in condition and val not in condition["$in"]:
+                    return False
+                if "$contains" in condition:
+                    if not isinstance(val, (list, str)) or condition["$contains"] not in val:
+                        return False
+                if "$gt" in condition and (val is None or val <= condition["$gt"]):
+                    return False
+                if "$lt" in condition and (val is None or val >= condition["$lt"]):
+                    return False
+            elif val != condition:
+                return False
+        return True
+
+    def _match_filter(self, doc_id: int, filters: Dict) -> bool:
+        """Check if a document matches the given filters."""
+        payload = {}
+        if self._memtable:
+            _, payloads, _ = self._memtable.snapshot()
+            payload = payloads.get(doc_id, {})
+        return self._evaluate_filter(payload, filters, doc_id)
+
     # ------------------------------------------------------------------
-    # CRUD stubs (implemented in Chunk 3)
+    # CRUD
     # ------------------------------------------------------------------
 
     def add_multidense(
