@@ -35,7 +35,7 @@ from benchmarks.shard_bench.config import (
 )
 from benchmarks.shard_bench.fetch_pipeline import FetchPipeline, PinnedBufferPool
 from benchmarks.shard_bench.lemur_router import LemurRouter
-from benchmarks.shard_bench.maxsim_scorer import brute_force_maxsim, score_all_docs_topk, warmup_maxsim
+from benchmarks.shard_bench.maxsim_scorer import brute_force_maxsim, score_all_docs_topk, warmup_maxsim, PreloadedGpuCorpus
 from benchmarks.shard_bench.metrics import compute_all_metrics
 from benchmarks.shard_bench.profiler import QueryProfile, Timer, aggregate_profiles, memory_snapshot
 from benchmarks.shard_bench.shard_store import ShardStore
@@ -111,6 +111,7 @@ def search_shard_routed(
     router_type: RouterType,
     k: int = 10,
     device: str = "cuda",
+    gpu_corpus: PreloadedGpuCorpus = None,
 ) -> QueryProfile:
     prof = QueryProfile()
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -126,6 +127,23 @@ def search_shard_routed(
             )
     prof.routing_ms = t_route.elapsed_ms
 
+    # ---- GEM fast path: GPU-resident corpus, zero fetch ----
+    if gpu_corpus is not None and router_type == RouterType.LEMUR:
+        candidate_ids = routed.doc_ids[:search_cfg.max_docs_exact]
+        prof.num_docs_scored = len(candidate_ids)
+        prof.num_shards_fetched = 0
+        prof.fetch_ms = 0.0
+        prof.h2d_bytes = 0
+
+        with Timer(sync_cuda=True) as t_score:
+            ids, scores = gpu_corpus.score_candidates(query, candidate_ids, k=k)
+        prof.maxsim_ms = t_score.elapsed_ms
+        prof.retrieved_ids = ids
+        prof.retrieved_scores = scores
+        prof.total_ms = prof.routing_ms + prof.maxsim_ms
+        return prof
+
+    # ---- Shard-fetch path (disk-backed, for large corpora) ----
     if router_type == RouterType.CENTROID:
         prof.num_shards_fetched = len(routed)
         shard_chunks, fetch_stats = pipeline.fetch_per_shard(routed, max_docs=search_cfg.max_docs_exact)
@@ -199,13 +217,22 @@ def run_single_config(
     n_eval = min(cfg.n_eval_queries, len(query_vecs), len(ground_truth))
     profiles: List[QueryProfile] = []
 
+    # Pre-load corpus to GPU if it fits (GEM pattern: zero-fetch at query time)
+    gpu_corpus = None
+    max_tok_est = max((v.shape[0] for v in doc_vecs), default=1)
+    if PreloadedGpuCorpus.fits_on_gpu(len(doc_vecs), max_tok_est, dim):
+        gpu_corpus = PreloadedGpuCorpus(doc_vecs, doc_ids, dim, device=device)
+    else:
+        log.info("Corpus too large for GPU (%d docs × %d tok) — using shard fetch", len(doc_vecs), max_tok_est)
+
     log.info(
-        "Running %d queries: router=%s top_shards=%s k_candidates=%s max_docs=%d transfer=%s compression=%s layout=%s",
+        "Running %d queries: router=%s top_shards=%s k_candidates=%s max_docs=%d transfer=%s compression=%s layout=%s gpu_corpus=%s",
         n_eval, bcfg.router_type.value,
         scfg.top_shards if bcfg.router_type == RouterType.CENTROID else "-",
         scfg.k_candidates if bcfg.router_type == RouterType.LEMUR else "-",
         scfg.max_docs_exact, scfg.transfer_mode.value,
         bcfg.compression.value, bcfg.layout.value,
+        "yes" if gpu_corpus else "no",
     )
 
     # Singleton warmup: pre-warm Triton autotune for expected shapes
@@ -222,7 +249,7 @@ def run_single_config(
 
     for qi in range(n_eval):
         qv = torch.from_numpy(query_vecs[qi]).float()
-        prof = search_shard_routed(qv, router, pipeline, scfg, bcfg.router_type, k=cfg.top_k_recall, device=device)
+        prof = search_shard_routed(qv, router, pipeline, scfg, bcfg.router_type, k=cfg.top_k_recall, device=device, gpu_corpus=gpu_corpus)
         profiles.append(prof)
         if (qi + 1) % 50 == 0:
             log.info("  Query %d/%d  p50_total=%.1fms", qi + 1, n_eval,

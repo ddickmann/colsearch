@@ -114,10 +114,8 @@ def score_all_docs_topk(
 ) -> Tuple[List[int], List[float]]:
     """Score all fetched docs in one kernel call.
 
-    Two paths:
-    - Uniform: all docs same token count → torch.cat + view, documents_mask=None
-      (enables maskless HAS_D_MASK=0 Triton kernel, ~15-20% faster).
-    - Non-uniform: pre-allocate padded numpy array + mask, single H2D transfer.
+    Concatenates per-shard tensors (not per-doc slices) to avoid O(n_docs)
+    torch.cat overhead, then reshapes for the Triton MaxSim kernel.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -128,37 +126,47 @@ def score_all_docs_topk(
     if q.dim() == 2:
         q = q.unsqueeze(0)
 
+    shard_embs: List[torch.Tensor] = []
     all_doc_ids: List[int] = []
-    all_slices: List[torch.Tensor] = []
-    lengths: List[int] = []
+    tok_per_doc: int = 0
+    is_uniform = True
 
     for flat_emb, offsets, doc_ids in shard_chunks:
         if not doc_ids:
             continue
-        for (s, e), did in zip(offsets, doc_ids):
-            all_slices.append(flat_emb[s:e])
-            lengths.append(e - s)
-            all_doc_ids.append(did)
+        shard_embs.append(flat_emb)
+        all_doc_ids.extend(doc_ids)
+        for s, e in offsets:
+            tlen = e - s
+            if tok_per_doc == 0:
+                tok_per_doc = tlen
+            elif tlen != tok_per_doc:
+                is_uniform = False
 
     if not all_doc_ids:
         return [], []
 
     n_docs = len(all_doc_ids)
-    dim = all_slices[0].shape[1]
-    min_tok = min(lengths)
-    max_tok = max(lengths)
+    dim = shard_embs[0].shape[1]
 
-    if min_tok == max_tok:
-        # FAST PATH: uniform-length docs — zero-copy view, maskless kernel
-        flat = torch.cat(all_slices, dim=0)
-        D_gpu = flat.view(n_docs, max_tok, dim).to(device, dtype=torch.float16)
+    if is_uniform and tok_per_doc > 0:
+        flat = torch.cat(shard_embs, dim=0)
+        D_gpu = flat.view(n_docs, tok_per_doc, dim).to(device, dtype=torch.float16)
         scores = maxsim(
             queries_embeddings=q,
             documents_embeddings=D_gpu,
             documents_mask=None,
         ).squeeze(0)
     else:
-        # NON-UNIFORM: padded numpy array with mask
+        lengths: List[int] = []
+        all_slices: List[torch.Tensor] = []
+        for flat_emb, offsets, doc_ids in shard_chunks:
+            if not doc_ids:
+                continue
+            for s, e in offsets:
+                all_slices.append(flat_emb[s:e])
+                lengths.append(e - s)
+        max_tok = max(lengths)
         D = np.zeros((n_docs, max_tok, dim), dtype=np.float16)
         M = np.zeros((n_docs, max_tok), dtype=np.float32)
         for i, sl in enumerate(all_slices):
@@ -180,6 +188,101 @@ def score_all_docs_topk(
     result_ids = [all_doc_ids[i] for i in idx_list]
     result_scores = top_sc.cpu().tolist()
     return result_ids, result_scores
+
+
+# ------------------------------------------------------------------
+# Pre-loaded GPU corpus (GEM pattern)
+# ------------------------------------------------------------------
+
+class PreloadedGpuCorpus:
+    """Pre-pad all docs into a contiguous GPU tensor once at startup.
+
+    At query time, D_gpu[candidate_indices] is a zero-allocation GPU gather.
+    """
+
+    def __init__(
+        self,
+        doc_vecs: list,
+        doc_ids: List[int],
+        dim: int,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16,
+    ):
+        n_docs = len(doc_vecs)
+        max_tok = max(v.shape[0] for v in doc_vecs) if doc_vecs else 1
+        logger.info(
+            "PreloadedGpuCorpus: %d docs, max_tok=%d, dim=%d, %.1f GB %s",
+            n_docs, max_tok, dim,
+            n_docs * max_tok * dim * (2 if dtype == torch.float16 else 4) / 1e9,
+            dtype,
+        )
+        self.D = torch.zeros((n_docs, max_tok, dim), dtype=dtype, device=device)
+        self.M = torch.zeros((n_docs, max_tok), dtype=torch.float32, device=device)
+        self.doc_ids = list(doc_ids)
+        self.doc_id_to_idx = {did: i for i, did in enumerate(doc_ids)}
+        self.max_tok = max_tok
+        self.dim = dim
+        self._device = device
+
+        for i, v in enumerate(doc_vecs):
+            tok = v.shape[0]
+            self.D[i, :tok] = torch.from_numpy(v).to(dtype)
+            self.M[i, :tok] = 1.0
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        logger.info("PreloadedGpuCorpus ready on %s", device)
+
+    def score_candidates(
+        self,
+        query: torch.Tensor,
+        candidate_doc_ids: List[int],
+        k: int = 10,
+    ) -> Tuple[List[int], List[float]]:
+        maxsim = _get_maxsim()
+        q = query.to(self._device, dtype=torch.float16)
+        if q.dim() == 2:
+            q = q.unsqueeze(0)
+
+        indices = torch.tensor(
+            [self.doc_id_to_idx[did] for did in candidate_doc_ids if did in self.doc_id_to_idx],
+            dtype=torch.long,
+            device=self._device,
+        )
+        if indices.numel() == 0:
+            return [], []
+
+        D_slice = self.D[indices]
+        M_slice = self.M[indices]
+
+        has_padding = (M_slice[:, -1] == 0).any()
+        if has_padding:
+            actual_max = int(M_slice.sum(dim=1).max().item())
+            D_slice = D_slice[:, :actual_max].contiguous()
+            M_slice = M_slice[:, :actual_max].contiguous()
+
+        scores = maxsim(
+            queries_embeddings=q,
+            documents_embeddings=D_slice,
+            documents_mask=M_slice if has_padding else None,
+        ).squeeze(0)
+
+        n = indices.shape[0]
+        final_k = min(k, n)
+        top_sc, top_idx = scores.topk(final_k)
+
+        cand_ids = [candidate_doc_ids[i] for i in range(n)]
+        idx_list = top_idx.cpu().tolist()
+        return [cand_ids[i] for i in idx_list], top_sc.cpu().tolist()
+
+    @staticmethod
+    def fits_on_gpu(n_docs: int, max_tok: int, dim: int, dtype=torch.float16) -> bool:
+        bytes_needed = n_docs * max_tok * dim * (2 if dtype == torch.float16 else 4)
+        bytes_needed += n_docs * max_tok * 4  # mask
+        if not torch.cuda.is_available():
+            return False
+        free, _total = torch.cuda.mem_get_info()
+        return bytes_needed < free * 0.85
 
 
 # ------------------------------------------------------------------
