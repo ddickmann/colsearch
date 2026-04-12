@@ -196,14 +196,18 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
             ann_backend=cfg.lemur.ann_backend.value,
             device=lemur_device,
         )
+        # Build FP16 tensor once, reuse for both passes
+        doc_vecs_f16 = torch.from_numpy(np.asarray(active_vectors)).to(torch.float16)
+        doc_counts_t = torch.from_numpy(active_counts)
+
         # First pass: temporary token-balanced shards for LEMUR training
         shard_assignments = assign_storage_shards(
             active_offsets, cfg.n_shards, cfg.seed, StorageLayout.TOKEN_BALANCED,
         )
         doc_id_to_shard = {doc_id: int(shard_assignments[i]) for i, doc_id in enumerate(doc_ids)}
         router.fit_initial(
-            pooled_doc_vectors=torch.from_numpy(np.asarray(active_vectors)).to(torch.float16),
-            pooled_doc_counts=torch.from_numpy(active_counts),
+            pooled_doc_vectors=doc_vecs_f16,
+            pooled_doc_counts=doc_counts_t,
             doc_ids=doc_ids,
             doc_id_to_shard=doc_id_to_shard,
             epochs=cfg.lemur.epochs,
@@ -215,12 +219,14 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
         )
         doc_id_to_shard = {doc_id: int(shard_assignments[i]) for i, doc_id in enumerate(doc_ids)}
         router.fit_initial(
-            pooled_doc_vectors=torch.from_numpy(np.asarray(active_vectors)).to(torch.float16),
-            pooled_doc_counts=torch.from_numpy(active_counts),
+            pooled_doc_vectors=doc_vecs_f16,
+            pooled_doc_counts=doc_counts_t,
             doc_ids=doc_ids,
             doc_id_to_shard=doc_id_to_shard,
             epochs=cfg.lemur.epochs,
         )
+        del doc_vecs_f16, doc_counts_t
+        gc.collect()
         train_s = time.time() - t0
         log.info("LEMUR router training done in %.1fs", train_s)
 

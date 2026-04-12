@@ -56,18 +56,19 @@ class RouterState:
 
 
 class _TorchMipsIndex:
-    """Fallback MIPS index when Faiss is not available."""
+    """GPU-accelerated MIPS index (brute-force matmul + topk)."""
 
-    def __init__(self) -> None:
+    def __init__(self, device: str = "cpu") -> None:
+        self._device = torch.device(device)
         self.weights = torch.empty((0, 0), dtype=torch.float32)
         self.ids: List[int] = []
 
     def build(self, weights: torch.Tensor, ids: Sequence[int]) -> None:
-        self.weights = weights.detach().cpu().to(torch.float32).contiguous()
+        self.weights = weights.detach().to(self._device, dtype=torch.float32).contiguous()
         self.ids = [int(x) for x in ids]
 
     def add(self, weights: torch.Tensor, ids: Sequence[int]) -> None:
-        weights = weights.detach().cpu().to(torch.float32).contiguous()
+        weights = weights.detach().to(self._device, dtype=torch.float32).contiguous()
         if self.weights.numel() == 0:
             self.weights = weights
         else:
@@ -77,11 +78,11 @@ class _TorchMipsIndex:
     def search(self, queries: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray]:
         if self.weights.numel() == 0:
             return np.empty((queries.shape[0], 0), dtype=np.float32), np.empty((queries.shape[0], 0), dtype=np.int64)
-        q = queries.detach().cpu().to(torch.float32)
+        q = queries.detach().to(self._device, dtype=torch.float32)
         scores = q @ self.weights.T
         topk = min(k, scores.shape[1])
         vals, idx = torch.topk(scores, topk, dim=1)
-        return vals.numpy(), idx.numpy().astype(np.int64)
+        return vals.cpu().numpy(), idx.cpu().numpy().astype(np.int64)
 
 
 class _ProjectionFallbackModel:
@@ -159,7 +160,7 @@ class LemurRouter:
         doc_id_to_shard: Dict[int, int],
         epochs: int = 10,
     ) -> None:
-        vectors = pooled_doc_vectors.detach().cpu().to(torch.float32).contiguous()
+        vectors = pooled_doc_vectors.detach().cpu().contiguous()
         counts = pooled_doc_counts.detach().cpu().to(torch.int32).contiguous()
         if int(counts.sum(dtype=torch.int64).item()) != int(vectors.shape[0]):
             raise ValueError("pooled_doc_counts do not sum to pooled_doc_vectors rows")
@@ -307,7 +308,13 @@ class LemurRouter:
         with open(self.index_dir / "router_state.json", "w") as f:
             json.dump(asdict(self._state), f, indent=2)
         if self._use_faiss and self._index is not None:
-            faiss.write_index(self._index, str(self.index_dir / "ann.index"))
+            idx_to_save = self._index
+            if hasattr(faiss, "index_gpu_to_cpu"):
+                try:
+                    idx_to_save = faiss.index_gpu_to_cpu(self._index)
+                except Exception:
+                    pass
+            faiss.write_index(idx_to_save, str(self.index_dir / "ann.index"))
 
     def load(self) -> None:
         self._load_if_present(required=True)
@@ -333,7 +340,22 @@ class LemurRouter:
         self._tombstones = {int(x) for x in maps.get("tombstones", [])}
         self._lemur = self._new_lemur_backend(load_saved=True)
         if self._use_faiss and (self.index_dir / "ann.index").exists():
-            self._index = faiss.read_index(str(self.index_dir / "ann.index"))
+            cpu_index = faiss.read_index(str(self.index_dir / "ann.index"))
+            use_gpu = (
+                self.device != "cpu"
+                and torch.cuda.is_available()
+                and hasattr(faiss, "StandardGpuResources")
+            )
+            if use_gpu:
+                try:
+                    res = faiss.StandardGpuResources()
+                    self._gpu_res = res
+                    self._index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+                    logger.info("ANN index loaded to GPU (faiss-gpu)")
+                except Exception:
+                    self._index = cpu_index
+            else:
+                self._index = cpu_index
         else:
             self._rebuild_ann()
 
@@ -353,25 +375,39 @@ class LemurRouter:
 
     def _rebuild_ann(self) -> None:
         if self._weights.ndim != 2 or self._weights.shape[0] == 0:
-            self._index = _TorchMipsIndex()
+            self._index = _TorchMipsIndex(device=self.device)
             return
         if self._use_faiss:
             dim = int(self._weights.shape[1])
+            w_np = self._weights.cpu().numpy().astype(np.float32)
+            ids_np = np.arange(self._weights.shape[0], dtype=np.int64)
+            use_gpu = (
+                self.device != "cpu"
+                and torch.cuda.is_available()
+                and hasattr(faiss, "StandardGpuResources")
+            )
             if self.ann_backend == "faiss_ivfpq_ip":
                 nlist = max(32, int(math.sqrt(self._weights.shape[0])))
                 quantizer = faiss.IndexFlatIP(dim)
                 index = faiss.IndexIVFPQ(quantizer, dim, nlist, 16, 8, faiss.METRIC_INNER_PRODUCT)
-                index.train(self._weights.numpy())
+                index.train(w_np)
                 id_index = faiss.IndexIDMap2(index)
+                id_index.add_with_ids(w_np, ids_np)
             else:
-                base = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)
-                base.hnsw.efConstruction = 200
-                base.hnsw.efSearch = 128
+                base = faiss.IndexFlatIP(dim)
                 id_index = faiss.IndexIDMap2(base)
-            id_index.add_with_ids(self._weights.numpy(), np.arange(self._weights.shape[0], dtype=np.int64))
+                id_index.add_with_ids(w_np, ids_np)
+            if use_gpu:
+                try:
+                    res = faiss.StandardGpuResources()
+                    self._gpu_res = res
+                    id_index = faiss.index_cpu_to_gpu(res, 0, id_index)
+                    logger.info("ANN index moved to GPU (faiss-gpu)")
+                except Exception as e:
+                    logger.warning("faiss-gpu transfer failed, using CPU: %s", e)
             self._index = id_index
         else:
-            idx = _TorchMipsIndex()
+            idx = _TorchMipsIndex(device=self.device)
             idx.build(self._weights, list(range(self._weights.shape[0])))
             self._index = idx
 
@@ -379,7 +415,8 @@ class LemurRouter:
         if self._index is None:
             raise RuntimeError("ANN index is not built")
         if self._use_faiss:
-            return self._index.search(feats.numpy(), k)
+            feats_np = feats.cpu().numpy().astype(np.float32)
+            return self._index.search(feats_np, k)
         return self._index.search(feats, k)
 
     def _mark_dirty(self, changed_ops: int, changed_shards: Iterable[int]) -> None:

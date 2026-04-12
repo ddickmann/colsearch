@@ -66,16 +66,12 @@ class Lemur:
                 raise ValueError(f"{name} and {name}_counts must be provided together.")
             if matrix is None:
                 return None, None
-            matrix = self._to_tensor(matrix, device=torch.device("cpu"))
-            counts = self._to_tensor(counts, device=torch.device("cpu"))
+            matrix = self._to_tensor(matrix)
+            counts = self._to_tensor(counts, dtype=torch.int32)
             if matrix.ndim != 2:
                 raise ValueError(f"{name} must be a 2D tensor.")
-            if matrix.dtype != torch.float32:
-                raise ValueError(f"{name} must have dtype float32.")
             if counts.ndim != 1:
                 raise ValueError(f"{name}_counts must be a 1D tensor.")
-            if counts.dtype != torch.int32:
-                raise ValueError(f"{name}_counts must have dtype int32.")
             if torch.any(counts < 0):
                 raise ValueError(f"{name}_counts must be non-negative.")
             if counts.sum(dtype=torch.int64).item() != matrix.shape[0]:
@@ -158,14 +154,14 @@ class Lemur:
 
         device = self.device
 
-        tmp_train = torch.cat([pick(i) for i in train_subset_ix.tolist()], dim=0).to(device)
+        tmp_train = torch.cat([pick(i) for i in train_subset_ix.tolist()], dim=0).to(device=device, dtype=torch.float32)
         tmp_train_counts = self.train_counts[train_subset_ix].to(device)
 
         learn_subset_ix = torch.randperm(len(self.learn))[: min(len(self.learn), learn_subset_size)]
         learn_vectors = self.learn[learn_subset_ix]
 
-        X_train = learn_vectors.to(device)
-        X_val = self.test[test_subset_ix].to(device) if self.test is not None else None
+        X_train = learn_vectors.to(device=device, dtype=torch.float32)
+        X_val = self.test[test_subset_ix].to(device=device, dtype=torch.float32) if self.test is not None else None
 
         y_train = single_maxsim(tmp_train, tmp_train_counts, X_train, block_bytes=block_bytes)
         y_val = (
@@ -413,7 +409,7 @@ class Lemur:
     ) -> torch.Tensor:
         device = self.device
         self.mlp.to(device)
-        data = data.to(device)
+        data = data.to(device=device, dtype=torch.float32)
         feature_extractor = self.mlp.feature_extractor
 
         self.mlp.eval()
@@ -439,24 +435,20 @@ class Lemur:
         verbose: bool = True,
     ) -> torch.Tensor:
         matrix = self._to_tensor(X)
-        counts = self._to_tensor(X_counts, device=torch.device("cpu"))
+        counts = self._to_tensor(X_counts, dtype=torch.int32)
         if matrix.ndim != 2:
             raise ValueError("X must be a 2D tensor.")
-        if matrix.dtype != torch.float32:
-            raise ValueError("X must have dtype float32.")
         if counts.ndim != 1:
             raise ValueError("X_counts must be a 1D tensor.")
-        if counts.dtype != torch.int32:
-            raise ValueError("X_counts must have dtype int32.")
         if counts.sum(dtype=torch.int64).item() != matrix.shape[0]:
             raise ValueError("sum(X_counts) must equal the number of rows in X.")
 
         sample_ix = torch.randperm(len(self.learn))[:sample_size]
         sampled = self.learn[sample_ix]
-        Z = self._compute_features_batched(sampled)
+        Z = self._compute_features_batched(sampled.to(dtype=torch.float32))
 
         device = Z.device
-        sampled = sampled.to(device)
+        sampled = sampled.to(device=device, dtype=torch.float32)
 
         num_segments = len(counts)
         W = torch.empty((num_segments, Z.shape[1]), device=device, dtype=torch.float32)
@@ -489,9 +481,9 @@ class Lemur:
                     row_start = int(offsets[seg_start].item())
                     row_end = int(offsets[seg_end].item())
 
-                    matrix_slice = matrix[row_start:row_end]
-                    if matrix_slice.device != device:
-                        matrix_slice = matrix_slice.to(device, non_blocking=use_non_blocking)
+                    matrix_slice = matrix[row_start:row_end].to(
+                        device=device, dtype=torch.float32, non_blocking=use_non_blocking,
+                    )
                     counts_slice = counts[seg_start:seg_end]
                     Y_batch = (single_maxsim(matrix_slice, counts_slice, sampled) - self.mean) / self.std
 
