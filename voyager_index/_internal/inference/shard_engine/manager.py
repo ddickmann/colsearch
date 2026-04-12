@@ -217,6 +217,30 @@ class ShardSegmentManager:
             del doc_vecs_f16, doc_counts_t
             gc.collect()
 
+            roq_doc_codes = None
+            roq_doc_meta = None
+            if cfg.compression == Compression.ROQ4:
+                try:
+                    from voyager_index._internal.inference.quantization.rotational import (
+                        RotationalQuantizer, RoQConfig,
+                    )
+                    import pickle
+                    logger.info("Training ROQ 4-bit quantizer ...")
+                    roq_q = RotationalQuantizer(RoQConfig(dim=self._dim, num_bits=4, seed=cfg.seed))
+                    roq_doc_codes = []
+                    roq_doc_meta = []
+                    for i, (s, e) in enumerate(doc_offsets):
+                        vecs_slice = np.asarray(all_vecs[s:e], dtype=np.float32)
+                        q = roq_q.quantize(vecs_slice, store=False)
+                        roq_doc_codes.append(np.asarray(q["codes"], dtype=np.uint8))
+                        roq_doc_meta.append(roq_q.build_triton_meta(q, include_norm_sq=True))
+                    with open(self._path / "roq_quantizer.pkl", "wb") as f:
+                        pickle.dump(roq_q, f)
+                    logger.info("ROQ 4-bit encoding done for %d docs", n_docs)
+                except ImportError:
+                    logger.warning("ROQ quantizer unavailable, falling back to FP16")
+                    cfg.compression = Compression.FP16
+
             store = ShardStore(self._path)
             store.build(
                 all_vectors=all_vecs,
@@ -227,6 +251,8 @@ class ShardSegmentManager:
                 dim=self._dim,
                 compression=cfg.compression,
                 uniform_shard_tokens=cfg.uniform_shard_tokens,
+                roq_doc_codes=roq_doc_codes,
+                roq_doc_meta=roq_doc_meta,
             )
 
             meta = {
