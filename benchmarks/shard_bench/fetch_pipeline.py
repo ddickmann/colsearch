@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -123,6 +123,71 @@ class FetchPipeline:
             "num_docs": total_docs,
         }
         return chunks, stats
+
+    def fetch_candidate_docs(
+        self,
+        docs_by_shard: Dict[int, List[int]],
+        max_docs: int = 0,
+    ) -> Tuple[List[ShardChunk], dict]:
+        """Fetch only specific candidate docs, grouped by shard (LEMUR path).
+
+        Uses a thread pool for parallel I/O across shards since safetensors
+        mmap reads release the GIL during the actual I/O.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        chunks: List[ShardChunk] = []
+        total_docs = 0
+        total_h2d_bytes = 0
+
+        items = list(docs_by_shard.items())
+        if max_docs:
+            budget = max_docs
+            trimmed_items = []
+            for shard_id, doc_ids in items:
+                if budget <= 0:
+                    break
+                take = doc_ids[:budget]
+                trimmed_items.append((shard_id, take))
+                budget -= len(take)
+            items = trimmed_items
+
+        def _load_one(shard_id: int, request_ids: List[int]) -> Optional[ShardChunk]:
+            emb, offsets, loaded_ids = self.store.load_docs_from_shard(
+                shard_id, request_ids, device="cpu",
+            )
+            if not loaded_ids:
+                return None
+            return (emb, offsets, loaded_ids)
+
+        n_workers = min(8, len(items)) if items else 1
+
+        with Timer() as t_fetch:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                future_to_idx = {
+                    pool.submit(_load_one, sid, dids): i
+                    for i, (sid, dids) in enumerate(items)
+                }
+                results_by_idx: Dict[int, ShardChunk] = {}
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    result = future.result()
+                    if result is not None:
+                        results_by_idx[idx] = result
+
+            for i in range(len(items)):
+                if i in results_by_idx:
+                    emb, offsets, loaded_ids = results_by_idx[i]
+                    chunks.append((emb, offsets, loaded_ids))
+                    total_docs += len(loaded_ids)
+                    total_h2d_bytes += emb.nelement() * emb.element_size()
+
+        return chunks, {
+            "fetch_ms": t_fetch.elapsed_ms,
+            "h2d_bytes": total_h2d_bytes,
+            "num_shards": len(chunks),
+            "num_docs": total_docs,
+        }
 
     def pipelined_search(
         self,

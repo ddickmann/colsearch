@@ -2,13 +2,14 @@
 MaxSim scorer: thin wrapper over voyager-index Triton kernels.
 
 Supports two paths:
+- score_all_docs_topk: batched single-call scoring (fast path)
+- score_shards_and_topk: per-shard scoring with GPU top-k merge (legacy)
 - score_and_topk: legacy padded-tensor interface
-- score_shards_and_topk: per-shard scoring with GPU top-k merge (fast path)
 """
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 _maxsim_fn = None
+_warmup_done: set = set()
 
 
 def _get_maxsim():
@@ -30,6 +32,49 @@ def _get_maxsim():
         _maxsim_fn = _fallback_maxsim
         logger.warning("Triton MaxSim unavailable, using PyTorch fallback")
     return _maxsim_fn
+
+
+def warmup_maxsim(dim: int, doc_token_counts: List[int], device: str = "cuda") -> None:
+    """Pre-warm Triton autotune for the exact (S, T, H) shapes that will appear.
+
+    Triton autotune keys on (NUM_Q_TOKENS, NUM_D_TOKENS, EMBED_DIM) only — B
+    (batch size) is NOT a key.  We use B=4 for minimal memory and warm only
+    the unique (S, T, H) combinations.
+    """
+    global _warmup_done
+    maxsim = _get_maxsim()
+    dev = torch.device(device)
+
+    q_tokens_list = [32, 64, 128, 256]
+    d_tokens_set: set = set()
+    for tc in doc_token_counts:
+        d_tokens_set.add(_next_pow2(tc, 32))
+    if not d_tokens_set:
+        d_tokens_set = {32, 64, 128, 256, 512, 1024, 2048}
+
+    n_warmup_docs = 4
+    for qt in q_tokens_list:
+        for dt in sorted(d_tokens_set):
+            key = (qt, dt, dim)
+            if key in _warmup_done:
+                continue
+            q = torch.zeros(1, qt, dim, dtype=torch.float16, device=dev)
+            d = torch.zeros(n_warmup_docs, dt, dim, dtype=torch.float16, device=dev)
+            m = torch.ones(n_warmup_docs, dt, dtype=torch.float32, device=dev)
+            maxsim(q, d, documents_mask=m)
+            _warmup_done.add(key)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    logger.info("MaxSim kernel warmup done for %d (S,T,H) combos", len(_warmup_done))
+
+
+def _next_pow2(v: int, minimum: int = 1) -> int:
+    v = max(v, minimum)
+    p = 1
+    while p < v:
+        p <<= 1
+    return p
 
 
 def _fallback_maxsim(
@@ -54,17 +99,163 @@ def _fallback_maxsim(
     return max_sim.sum(dim=-1)
 
 
+ShardChunk = Tuple[torch.Tensor, List[Tuple[int, int]], List[int]]
+
+
+# ------------------------------------------------------------------
+# Batched scoring (Fix 1) — single kernel call for all docs
+# ------------------------------------------------------------------
+
+def score_all_docs_topk(
+    query: torch.Tensor,
+    shard_chunks: List[ShardChunk],
+    k: int = 10,
+    device: torch.device = None,
+) -> Tuple[List[int], List[float]]:
+    """Score all fetched docs in one kernel call.
+
+    Two paths:
+    - Uniform: all docs same token count → torch.cat + view, documents_mask=None
+      (enables maskless HAS_D_MASK=0 Triton kernel, ~15-20% faster).
+    - Non-uniform: pre-allocate padded numpy array + mask, single H2D transfer.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    maxsim = _get_maxsim()
+
+    q = query.to(device, dtype=torch.float16)
+    if q.dim() == 2:
+        q = q.unsqueeze(0)
+
+    all_doc_ids: List[int] = []
+    all_slices: List[torch.Tensor] = []
+    lengths: List[int] = []
+
+    for flat_emb, offsets, doc_ids in shard_chunks:
+        if not doc_ids:
+            continue
+        for (s, e), did in zip(offsets, doc_ids):
+            all_slices.append(flat_emb[s:e])
+            lengths.append(e - s)
+            all_doc_ids.append(did)
+
+    if not all_doc_ids:
+        return [], []
+
+    n_docs = len(all_doc_ids)
+    dim = all_slices[0].shape[1]
+    min_tok = min(lengths)
+    max_tok = max(lengths)
+
+    if min_tok == max_tok:
+        # FAST PATH: uniform-length docs — zero-copy view, maskless kernel
+        flat = torch.cat(all_slices, dim=0)
+        D_gpu = flat.view(n_docs, max_tok, dim).to(device, dtype=torch.float16)
+        scores = maxsim(
+            queries_embeddings=q,
+            documents_embeddings=D_gpu,
+            documents_mask=None,
+        ).squeeze(0)
+    else:
+        # NON-UNIFORM: padded numpy array with mask
+        D = np.zeros((n_docs, max_tok, dim), dtype=np.float16)
+        M = np.zeros((n_docs, max_tok), dtype=np.float32)
+        for i, sl in enumerate(all_slices):
+            tok = sl.shape[0]
+            D[i, :tok] = sl.numpy()
+            M[i, :tok] = 1.0
+        D_gpu = torch.from_numpy(D).to(device)
+        M_gpu = torch.from_numpy(M).to(device)
+        scores = maxsim(
+            queries_embeddings=q,
+            documents_embeddings=D_gpu,
+            documents_mask=M_gpu,
+        ).squeeze(0)
+
+    final_k = min(k, n_docs)
+    top_sc, top_idx = scores.topk(final_k)
+
+    idx_list = top_idx.cpu().tolist()
+    result_ids = [all_doc_ids[i] for i in idx_list]
+    result_scores = top_sc.cpu().tolist()
+    return result_ids, result_scores
+
+
+# ------------------------------------------------------------------
+# ROQ 4-bit scoring (Step 5)
+# ------------------------------------------------------------------
+
+_roq_fn = None
+
+def _get_roq_maxsim():
+    global _roq_fn
+    if _roq_fn is not None:
+        return _roq_fn
+    try:
+        from voyager_index._internal.kernels.roq import roq_maxsim_4bit
+        _roq_fn = roq_maxsim_4bit
+        logger.info("Using voyager-index ROQ 4-bit MaxSim kernel")
+    except ImportError:
+        _roq_fn = None
+        logger.warning("ROQ 4-bit MaxSim kernel unavailable")
+    return _roq_fn
+
+
+def score_roq4_topk(
+    query_codes: torch.Tensor,
+    query_meta: torch.Tensor,
+    doc_codes: torch.Tensor,
+    doc_meta: torch.Tensor,
+    doc_ids: List[int],
+    k: int = 10,
+    documents_mask: torch.Tensor = None,
+    device: torch.device = None,
+) -> Tuple[List[int], List[float]]:
+    """Score documents using ROQ 4-bit MaxSim kernel.
+
+    query_codes: (1, S, NB) uint8
+    query_meta:  (1, S, 4) float32
+    doc_codes:   (N, T, NB) uint8
+    doc_meta:    (N, T, 4) float32
+    """
+    roq = _get_roq_maxsim()
+    if roq is None:
+        return [], []
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    qc = query_codes.to(device)
+    qm = query_meta.to(device)
+    dc = doc_codes.to(device)
+    dm = doc_meta.to(device)
+
+    n_docs = dc.shape[0]
+    if n_docs == 0:
+        return [], []
+
+    kwargs = {}
+    if documents_mask is not None:
+        kwargs["documents_mask"] = documents_mask.to(device)
+
+    scores = roq(qc, qm, dc, dm, **kwargs).squeeze(0)
+    final_k = min(k, n_docs)
+    top_sc, top_idx = scores.topk(final_k)
+    idx_list = top_idx.cpu().tolist()
+    return [doc_ids[i] for i in idx_list], top_sc.cpu().tolist()
+
+
+# ------------------------------------------------------------------
+# Per-shard scoring (legacy, kept for backward compat)
+# ------------------------------------------------------------------
+
 def _pad_shard_on_device(
     flat_emb: torch.Tensor,
     offsets: List[Tuple[int, int]],
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Pad a single shard's docs on GPU.  Much faster than cross-shard CPU padding
-    because (a) per-shard max_tokens is small, (b) the copy runs on device.
-
-    If all docs have the same token count, uses zero-copy view() instead.
-    """
+    """Pad a single shard's docs on GPU. Uses vectorized scatter for variable lengths."""
     if not offsets:
         dim = flat_emb.shape[1]
         return (
@@ -81,24 +272,25 @@ def _pad_shard_on_device(
     if flat_emb.device != device:
         flat_emb = flat_emb.to(device, non_blocking=True)
 
-    # Fast path: all docs same length -> zero-copy view
     if min_tok == max_tok:
         padded = flat_emb[: n_docs * max_tok].view(n_docs, max_tok, dim)
         mask = torch.ones(n_docs, max_tok, dtype=torch.float32, device=device)
         return padded, mask
 
+    # Vectorized scatter (Fix 3)
+    total_tokens = flat_emb.shape[0]
+    lengths_t = torch.tensor(lengths, dtype=torch.int64, device=device)
+    doc_indices = torch.repeat_interleave(torch.arange(n_docs, device=device), lengths_t)
+    offsets_t = torch.zeros(n_docs + 1, dtype=torch.int64, device=device)
+    offsets_t[1:] = lengths_t.cumsum(0)
+    token_positions = torch.arange(total_tokens, device=device) - offsets_t[doc_indices]
+
     padded = torch.zeros(n_docs, max_tok, dim, dtype=flat_emb.dtype, device=device)
     mask = torch.zeros(n_docs, max_tok, dtype=torch.float32, device=device)
-
-    for i, (s, e) in enumerate(offsets):
-        length = e - s
-        padded[i, :length] = flat_emb[s:e]
-        mask[i, :length] = 1.0
+    padded[doc_indices, token_positions] = flat_emb
+    mask[doc_indices, token_positions] = 1.0
 
     return padded, mask
-
-
-ShardChunk = Tuple[torch.Tensor, List[Tuple[int, int]], List[int]]
 
 
 def score_shards_and_topk(
@@ -107,22 +299,7 @@ def score_shards_and_topk(
     k: int = 10,
     device: torch.device = None,
 ) -> Tuple[List[int], List[float]]:
-    """
-    Score per-shard and merge top-k on GPU.  Avoids cross-shard padding entirely.
-
-    Each shard is padded independently (small max_tokens) and scored with one
-    fast_colbert_scores call.  A running top-k heap merges results across shards.
-
-    Args:
-        query: (n_query_tokens, dim) or (1, n_query_tokens, dim)
-        shard_chunks: list of (flat_emb, offsets, doc_ids) per shard.
-            flat_emb is (total_tokens, dim) on CPU or GPU.
-        k: final top-k
-        device: scoring device (defaults to cuda if available)
-
-    Returns:
-        (top_k_ids, top_k_scores) merged across all shards
-    """
+    """Score per-shard and merge top-k on GPU. Legacy — prefer score_all_docs_topk."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -139,14 +316,13 @@ def score_shards_and_topk(
         if not doc_ids:
             continue
 
-        # Pad this shard on device (small max_tokens, fast)
         doc_emb, doc_mask = _pad_shard_on_device(flat_emb, offsets, device)
 
         scores = maxsim(
             queries_embeddings=q,
             documents_embeddings=doc_emb,
             documents_mask=doc_mask,
-        ).squeeze(0)  # (n_docs,)
+        ).squeeze(0)
 
         shard_k = min(k, len(doc_ids))
         top_sc, top_idx = scores.topk(shard_k)
@@ -156,7 +332,6 @@ def score_shards_and_topk(
     if not best_scores:
         return [], []
 
-    # Merge across shards on GPU
     all_scores = torch.cat(best_scores)
     all_ids_flat: List[int] = []
     for id_list in best_ids:
@@ -179,10 +354,7 @@ def score_and_topk(
     use_quantization: bool = False,
     quantization_mode: str = "int8",
 ) -> Tuple[List[int], List[float]]:
-    """
-    Score documents against query, return top-k IDs and scores.
-    Legacy interface — prefers score_shards_and_topk for new code.
-    """
+    """Score documents against query, return top-k IDs and scores. Legacy interface."""
     maxsim = _get_maxsim()
 
     if query.dim() == 2:
@@ -217,21 +389,7 @@ def brute_force_maxsim(
     device: str = "cuda",
     batch_size: int = 2000,
 ) -> Tuple[List[int], List[float]]:
-    """
-    Brute-force MaxSim over an entire corpus for ground-truth computation.
-
-    Args:
-        query: (n_tokens, dim) numpy or tensor
-        all_doc_vecs: list of per-doc numpy arrays, each (n_tokens_i, dim)
-        doc_ids: external IDs
-        dim: embedding dimension
-        k: top-k to return
-        device: scoring device
-        batch_size: docs per GPU batch
-
-    Returns:
-        (top_k_ids, top_k_scores) sorted best-first
-    """
+    """Brute-force MaxSim over an entire corpus for ground-truth computation."""
     import numpy as np
     maxsim = _get_maxsim()
 

@@ -47,7 +47,7 @@ class PoolingConfig:
 @dataclass
 class LemurConfig:
     enabled: bool = False
-    device: str = "cuda"
+    device: str = "cpu"
     ann_backend: AnnBackend = AnnBackend.FAISS_HNSW_IP
     epochs: int = 10
     k_candidates: int = 2000
@@ -55,6 +55,16 @@ class LemurConfig:
     retrain_every_hours: int = 24
     retrain_dirty_doc_ratio: float = 0.05
     retrain_dirty_shard_ratio: float = 0.10
+
+
+@dataclass
+class ColBanditConfig:
+    enabled: bool = False
+    relaxation_eps: float = 0.01
+    max_rounds: int = 8
+    reveal_query_tokens_per_round: int = 2
+    min_candidates_for_bandit: int = 64
+    exact_survivor_cap: int = 256
 
 
 @dataclass
@@ -84,7 +94,7 @@ class SearchConfig:
     batch_size: int = 1
     k_candidates: int = 2000
     use_colbandit: bool = False
-    colbandit: object = None
+    colbandit: ColBanditConfig = field(default_factory=ColBanditConfig)
 
 
 @dataclass
@@ -108,7 +118,6 @@ class BenchmarkConfig:
 SWEEP_CORPUS_SIZES = [100_000, 300_000, 1_000_000]
 SWEEP_TOP_SHARDS = [4, 8, 16, 32]
 SWEEP_MAX_DOCS_EXACT = [1_000, 5_000, 10_000, 25_000]
-SWEEP_K_CANDIDATES = [100, 200, 300, 500, 750, 1000, 1500, 2000]
-SWEEP_COMPRESSION = [Compression.FP16, Compression.INT8]
+SWEEP_COMPRESSION = [Compression.FP16, Compression.INT8, Compression.ROQ4]
 SWEEP_LAYOUT = [StorageLayout.RANDOM, StorageLayout.CENTROID_GROUPED, StorageLayout.PROXY_GROUPED]
 SWEEP_TRANSFER = [TransferMode.PAGEABLE, TransferMode.PINNED, TransferMode.DOUBLE_BUFFERED]

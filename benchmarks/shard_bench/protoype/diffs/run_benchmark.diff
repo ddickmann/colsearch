@@ -1,0 +1,576 @@
+--- /mnt/data/orig_run_benchmark.py	2026-04-12 15:51:54.279588804 +0000
++++ /mnt/data/voyager-index/benchmarks/shard_bench/run_benchmark.py	2026-04-12 15:50:35.147520864 +0000
+@@ -1,12 +1,4 @@
+-"""
+-Main benchmark harness.
+-
+-Runs the shard-routed prototype and baselines across a sweep matrix,
+-computes ground-truth via brute-force MaxSim, and emits JSONL results.
+-
+-Usage:
+-    python -m benchmarks.shard_bench.run_benchmark [--quick] [--corpus-size 100000]
+-"""
++"""Main benchmark harness for shard_bench."""
+ from __future__ import annotations
+ 
+ import argparse
+@@ -17,45 +9,46 @@
+ import sys
+ import time
+ from pathlib import Path
+-from typing import Dict, List, Optional, Tuple
++from typing import List, Optional
+ 
+ import numpy as np
+ import torch
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+ 
++from benchmarks.shard_bench.baselines import BaselineDenseSingleVector, BaselineGpuMaxSim
++from benchmarks.shard_bench.build_index import DEFAULT_NPZ, _index_dir, build, load_corpus
++from benchmarks.shard_bench.centroid_router import CentroidRouter
++from benchmarks.shard_bench.colbandit_reranker import ColBanditConfig, ColBanditReranker
+ from benchmarks.shard_bench.config import (
+-    BenchmarkConfig, BuildConfig, SearchConfig,
+-    Compression, StorageLayout, TransferMode,
+-    SWEEP_TOP_SHARDS, SWEEP_MAX_DOCS_EXACT, SWEEP_TRANSFER,
++    BenchmarkConfig,
++    BuildConfig,
++    Compression,
++    RouterType,
++    SearchConfig,
++    StorageLayout,
++    SWEEP_MAX_DOCS_EXACT,
++    SWEEP_TOP_SHARDS,
++    SWEEP_TRANSFER,
++    TransferMode,
+ )
+-from benchmarks.shard_bench.build_index import build, load_corpus, DEFAULT_NPZ
+-from benchmarks.shard_bench.shard_store import ShardStore
+-from benchmarks.shard_bench.centroid_router import CentroidRouter
+ from benchmarks.shard_bench.fetch_pipeline import FetchPipeline, PinnedBufferPool
+-from benchmarks.shard_bench.maxsim_scorer import (
+-    score_and_topk, score_shards_and_topk, brute_force_maxsim,
+-)
+-from benchmarks.shard_bench.baselines import BaselineGpuMaxSim, BaselineDenseSingleVector
++from benchmarks.shard_bench.lemur_router import LemurRouter
++from benchmarks.shard_bench.maxsim_scorer import brute_force_maxsim, score_and_topk, score_shards_and_topk
+ from benchmarks.shard_bench.metrics import compute_all_metrics
+-from benchmarks.shard_bench.profiler import (
+-    QueryProfile, aggregate_profiles, Timer, memory_snapshot,
+-)
++from benchmarks.shard_bench.profiler import QueryProfile, Timer, aggregate_profiles, memory_snapshot
++from benchmarks.shard_bench.shard_store import ShardStore
+ 
+ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+ log = logging.getLogger(__name__)
+ 
+ 
+-def _mem_gb():
++def _mem_gb() -> float:
+     try:
+         return int(open("/proc/self/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e9
+     except Exception:
+-        return -1
+-
++        return -1.0
+ 
+-# ======================================================================
+-# Ground truth
+-# ======================================================================
+ 
+ def compute_ground_truth(
+     query_vecs: list,
+@@ -67,7 +60,6 @@
+     cache_path: Optional[Path] = None,
+     device: str = "cuda",
+ ) -> List[List[int]]:
+-    """Compute brute-force MaxSim ground truth, with disk cache."""
+     if cache_path and cache_path.exists():
+         log.info("Loading cached ground truth from %s", cache_path)
+         data = np.load(str(cache_path), allow_pickle=True)
+@@ -76,21 +68,10 @@
+             return gt
+ 
+     log.info("Computing brute-force ground truth for %d queries (k=%d)...", n_eval, k)
+-    t0 = time.time()
+     gts = []
+     for qi in range(n_eval):
+-        ids, scores = brute_force_maxsim(
+-            query_vecs[qi], doc_vecs, doc_ids, dim, k=k, device=device,
+-        )
++        ids, _scores = brute_force_maxsim(query_vecs[qi], doc_vecs, doc_ids, dim, k=k, device=device)
+         gts.append(ids)
+-        if (qi + 1) % 20 == 0:
+-            elapsed = time.time() - t0
+-            log.info("  GT %d/%d (%.1fs, %.1f q/s)", qi + 1, n_eval, elapsed, (qi + 1) / elapsed)
+-            if torch.cuda.is_available():
+-                torch.cuda.empty_cache()
+-
+-    log.info("Ground truth computed in %.1fs", time.time() - t0)
+-
+     if cache_path:
+         cache_path.parent.mkdir(parents=True, exist_ok=True)
+         max_len = max(len(g) for g in gts)
+@@ -98,65 +79,53 @@
+         for i, g in enumerate(gts):
+             gt_arr[i, :len(g)] = g
+         np.savez_compressed(str(cache_path), gt_ids=gt_arr)
+-
+     return gts
+ 
+ 
+-# ======================================================================
+-# Shard-routed search
+-# ======================================================================
+-
+ def search_shard_routed(
+     query: torch.Tensor,
+-    router: CentroidRouter,
++    router,
+     pipeline: FetchPipeline,
+-    top_shards: int,
+-    max_docs: int,
++    search_cfg: SearchConfig,
++    router_type: RouterType,
+     k: int = 10,
+     device: str = "cuda",
+ ) -> QueryProfile:
+-    """
+-    Run one query through the shard-routed pipeline.
+-
+-    Uses per-shard scoring: each shard is padded independently on GPU
+-    (small max_tokens) and scored with one fast_colbert_scores call.
+-    Top-k is merged across shards on GPU.
+-    """
+     prof = QueryProfile()
+     dev = torch.device(device if torch.cuda.is_available() else "cpu")
+ 
+-    # 1. Route
+     with Timer(sync_cuda=True) as t_route:
+-        shard_ids = router.route(query, top_shards=top_shards, max_docs=max_docs)
++        if router_type == RouterType.CENTROID:
++            routed = router.route(query, top_shards=search_cfg.top_shards, max_docs=search_cfg.max_docs_exact)
++        else:
++            routed = router.route(query, k_candidates=search_cfg.k_candidates, prefetch_doc_cap=search_cfg.max_docs_exact)
+     prof.routing_ms = t_route.elapsed_ms
+-    prof.num_shards_fetched = len(shard_ids)
+ 
+-    # 2. Fetch per-shard chunks (CPU/pinned)
+-    with Timer() as t_fetch:
+-        shard_chunks, fetch_stats = pipeline.fetch_per_shard(shard_ids, max_docs=max_docs)
++    if router_type == RouterType.CENTROID:
++        prof.num_shards_fetched = len(routed)
++        shard_chunks, fetch_stats = pipeline.fetch_per_shard(routed, max_docs=search_cfg.max_docs_exact)
++    else:
++        prof.num_shards_fetched = len(routed.shard_ids)
++        shard_chunks, fetch_stats = pipeline.fetch_candidate_docs(routed.by_shard, max_docs=search_cfg.max_docs_exact)
+     prof.fetch_ms = fetch_stats.get("fetch_ms", 0.0)
+     prof.h2d_bytes = fetch_stats.get("h2d_bytes", 0)
+     prof.num_docs_scored = fetch_stats.get("num_docs", 0)
+ 
+-    # 3. Per-shard MaxSim + GPU top-k merge (H2D happens inside per-shard)
+     if prof.num_docs_scored > 0:
+         with Timer(sync_cuda=True) as t_score:
+-            ids, scores = score_shards_and_topk(
+-                query, shard_chunks, k=k, device=dev,
+-            )
++            if search_cfg.use_colbandit and router_type == RouterType.LEMUR:
++                reranker = ColBanditReranker(search_cfg.colbandit)
++                ids, scores, _stats = reranker.rerank_shard_chunks(query, shard_chunks, k=k, device=dev)
++            else:
++                ids, scores = score_shards_and_topk(query, shard_chunks, k=k, device=dev)
+         prof.maxsim_ms = t_score.elapsed_ms
+-        prof.h2d_ms = t_score.elapsed_ms  # H2D is folded into per-shard scoring
++        prof.h2d_ms = t_score.elapsed_ms
+         prof.retrieved_ids = ids
+         prof.retrieved_scores = scores
+-
+-    prof.total_ms = prof.routing_ms + t_fetch.elapsed_ms + prof.maxsim_ms
++    prof.total_ms = prof.routing_ms + prof.fetch_ms + prof.maxsim_ms
+     return prof
+ 
+ 
+-# ======================================================================
+-# Single sweep configuration
+-# ======================================================================
+-
+ def run_single_config(
+     cfg: BenchmarkConfig,
+     query_vecs: list,
+@@ -166,110 +135,54 @@
+     dim: int,
+     device: str = "cuda",
+ ) -> dict:
+-    """Run benchmark for one configuration, return result dict."""
+     bcfg = cfg.build
+     scfg = cfg.search
+-
+-    # Load index
+-    cache_base = Path.home() / ".cache" / "shard-bench"
+-    suffix = "_uniform" if bcfg.uniform_shard_tokens else ""
+-    index_dir = cache_base / f"index_{bcfg.corpus_size}_{bcfg.compression.value}_{bcfg.layout.value}{suffix}"
+-
++    index_dir = _index_dir(bcfg)
+     if not (index_dir / "manifest.json").exists():
+         build(bcfg, device=device)
+ 
+     store = ShardStore(index_dir)
+-    router = CentroidRouter.load(index_dir / "router", device=device)
++    if bcfg.router_type == RouterType.CENTROID:
++        router = CentroidRouter.load(index_dir / "router", device=device)
++    else:
++        router = LemurRouter(index_dir / "lemur", ann_backend=bcfg.lemur.ann_backend.value, device=bcfg.lemur.device)
++        router.load()
+ 
+-    # Set up fetch pipeline
+     pool = None
+     if scfg.transfer_mode in (TransferMode.PINNED, TransferMode.DOUBLE_BUFFERED):
+-        pool = PinnedBufferPool(
+-            max_tokens=scfg.pinned_buffer_max_tokens,
+-            dim=dim,
+-            n_buffers=scfg.pinned_pool_buffers,
+-        )
+-
+-    pipeline = FetchPipeline(
+-        store=store,
+-        mode=scfg.transfer_mode,
+-        pinned_pool=pool,
+-        device=device,
+-    )
++        pool = PinnedBufferPool(max_tokens=scfg.pinned_buffer_max_tokens, dim=dim, n_buffers=scfg.pinned_pool_buffers)
++    pipeline = FetchPipeline(store=store, mode=scfg.transfer_mode, pinned_pool=pool, device=device)
+ 
+-    # Run queries
+     n_eval = min(cfg.n_eval_queries, len(query_vecs), len(ground_truth))
+     profiles: List[QueryProfile] = []
+-
+-    log.info(
+-        "Running %d queries: top_shards=%d max_docs=%d transfer=%s compression=%s layout=%s",
+-        n_eval, scfg.top_shards, scfg.max_docs_exact,
+-        scfg.transfer_mode.value, bcfg.compression.value, bcfg.layout.value,
+-    )
+-
+     for qi in range(n_eval):
+         qv = torch.from_numpy(query_vecs[qi]).float()
+-        prof = search_shard_routed(
+-            query=qv,
+-            router=router,
+-            pipeline=pipeline,
+-            top_shards=scfg.top_shards,
+-            max_docs=scfg.max_docs_exact,
+-            k=cfg.top_k_recall,
+-            device=device,
+-        )
++        prof = search_shard_routed(qv, router, pipeline, scfg, bcfg.router_type, k=cfg.top_k_recall, device=device)
+         profiles.append(prof)
+ 
+-        if (qi + 1) % 50 == 0:
+-            log.info("  Query %d/%d  p50_total=%.1fms", qi + 1, n_eval,
+-                     np.median([p.total_ms for p in profiles]))
+-            if torch.cuda.is_available():
+-                torch.cuda.empty_cache()
+-
+-    # Compute metrics
+     all_retrieved = [p.retrieved_ids for p in profiles]
+-    gt_slice = ground_truth[:n_eval]
+-    quality = compute_all_metrics(all_retrieved, gt_slice, ks=(10, 100))
+-
+-    # Aggregate latency
++    quality = compute_all_metrics(all_retrieved, ground_truth[:n_eval], ks=(10, 100))
+     latency = aggregate_profiles(profiles)
+-    mem = memory_snapshot()
+-
+-    # Compute throughput
+     total_time_s = sum(p.total_ms for p in profiles) / 1000.0
+-    qps = n_eval / total_time_s if total_time_s > 0 else 0
+-
+     result = {
++        "router_type": bcfg.router_type.value,
+         "corpus_size": bcfg.corpus_size,
+         "compression": bcfg.compression.value,
+         "layout": bcfg.layout.value,
+-        "n_centroids": bcfg.n_centroids,
+         "n_shards": bcfg.n_shards,
+-        "top_shards": scfg.top_shards,
++        "top_shards": scfg.top_shards if bcfg.router_type == RouterType.CENTROID else None,
++        "k_candidates": scfg.k_candidates if bcfg.router_type == RouterType.LEMUR else None,
+         "max_docs_exact": scfg.max_docs_exact,
+         "transfer_mode": scfg.transfer_mode.value,
+-        "n_eval": n_eval,
++        "use_colbandit": scfg.use_colbandit,
+         **quality,
+         **latency,
+-        "qps": qps,
+-        **mem,
++        "qps": n_eval / total_time_s if total_time_s > 0 else 0.0,
++        **memory_snapshot(),
+     }
+-
+-    log.info(
+-        "RESULT: R@10=%.4f R@100=%.4f MRR@10=%.4f p50=%.1fms p95=%.1fms QPS=%.1f",
+-        quality.get("recall_at_10", 0), quality.get("recall_at_100", 0),
+-        quality.get("mrr_at_10", 0),
+-        latency.get("p50_total_ms", 0), latency.get("p95_total_ms", 0),
+-        qps,
+-    )
+-
+     return result
+ 
+ 
+-# ======================================================================
+-# Baseline runs
+-# ======================================================================
+-
+ def run_baselines(
+     query_vecs: list,
+     doc_vecs: list,
+@@ -280,87 +193,54 @@
+     max_docs_gpu: int = 10_000,
+     device: str = "cuda",
+ ) -> List[dict]:
+-    """Run Baseline A (GPU MaxSim) and Baseline C (dense single-vector)."""
+     results = []
+-
+-    # Baseline A: GPU-only MaxSim
+     log.info("=== Baseline A: GPU-only MaxSim ===")
+     try:
+         baseline_a = BaselineGpuMaxSim(doc_vecs, doc_ids, dim, device=device, max_docs=max_docs_gpu)
+         profiles_a = []
+         for qi in range(n_eval):
+             qv = torch.from_numpy(query_vecs[qi]).float()
+-            prof = baseline_a.search(qv, k=100)
+-            profiles_a.append(prof)
+-
+-        all_ret_a = [p.retrieved_ids for p in profiles_a]
+-        quality_a = compute_all_metrics(all_ret_a, ground_truth[:n_eval], ks=(10, 100))
+-        latency_a = aggregate_profiles(profiles_a)
+-        total_s = sum(p.total_ms for p in profiles_a) / 1000.0
+-
++            profiles_a.append(baseline_a.search(qv, k=100))
+         results.append({
+             "pipeline": "baseline_a_gpu_maxsim",
+-            "corpus_size": max_docs_gpu,
+-            **quality_a,
+-            **latency_a,
+-            "qps": n_eval / total_s if total_s > 0 else 0,
++            **compute_all_metrics([p.retrieved_ids for p in profiles_a], ground_truth[:n_eval], ks=(10, 100)),
++            **aggregate_profiles(profiles_a),
+             **memory_snapshot(),
+         })
+-        log.info("Baseline A: R@10=%.4f p50=%.1fms", quality_a.get("recall_at_10", 0), latency_a.get("p50_total_ms", 0))
+-        del baseline_a
+     except Exception as e:
+         log.warning("Baseline A failed: %s", e)
+ 
+-    gc.collect()
+-    if torch.cuda.is_available():
+-        torch.cuda.empty_cache()
+-
+-    # Baseline C: Dense single-vector
+     log.info("=== Baseline C: Dense single-vector ===")
+     try:
+         baseline_c = BaselineDenseSingleVector(doc_vecs, doc_ids, dim)
+         profiles_c = []
+         for qi in range(n_eval):
+             qv = torch.from_numpy(query_vecs[qi]).float()
+-            prof = baseline_c.search(qv, k=100)
+-            profiles_c.append(prof)
+-
+-        all_ret_c = [p.retrieved_ids for p in profiles_c]
+-        quality_c = compute_all_metrics(all_ret_c, ground_truth[:n_eval], ks=(10, 100))
+-        latency_c = aggregate_profiles(profiles_c)
+-        total_s = sum(p.total_ms for p in profiles_c) / 1000.0
+-
++            profiles_c.append(baseline_c.search(qv, k=100))
+         results.append({
+             "pipeline": "baseline_c_dense_single_vector",
+-            "corpus_size": len(doc_ids),
+-            **quality_c,
+-            **latency_c,
+-            "qps": n_eval / total_s if total_s > 0 else 0,
++            **compute_all_metrics([p.retrieved_ids for p in profiles_c], ground_truth[:n_eval], ks=(10, 100)),
++            **aggregate_profiles(profiles_c),
+             **memory_snapshot(),
+         })
+-        log.info("Baseline C: R@10=%.4f p50=%.1fms", quality_c.get("recall_at_10", 0), latency_c.get("p50_total_ms", 0))
+-        del baseline_c
+     except Exception as e:
+         log.warning("Baseline C failed: %s", e)
+-
+-    gc.collect()
+     return results
+ 
+ 
+-# ======================================================================
+-# Main
+-# ======================================================================
+-
+-def main():
++def main() -> None:
+     parser = argparse.ArgumentParser(description="Shard Benchmark Harness")
+     parser.add_argument("--corpus-size", type=int, default=100_000)
+     parser.add_argument("--n-eval", type=int, default=100)
+-    parser.add_argument("--quick", action="store_true", help="Minimal sweep for smoke testing")
++    parser.add_argument("--quick", action="store_true")
+     parser.add_argument("--npz", type=str, default=str(DEFAULT_NPZ))
+     parser.add_argument("--device", type=str, default="cuda")
+     parser.add_argument("--skip-baselines", action="store_true")
+     parser.add_argument("--skip-gt", action="store_true")
+-    parser.add_argument("--cold-reads", action="store_true", help="Drop page cache before each run")
++    parser.add_argument("--router", choices=[x.value for x in RouterType], default=RouterType.LEMUR.value)
++    parser.add_argument("--enable-pooling", action="store_true")
++    parser.add_argument("--pool-factor", type=int, default=2)
++    parser.add_argument("--use-colbandit", action="store_true")
+     args = parser.parse_args()
+ 
+     device = args.device
+@@ -368,133 +248,65 @@
+         log.warning("CUDA not available, falling back to CPU")
+         device = "cpu"
+ 
+-    # Load corpus
+-    all_vectors, doc_offsets, doc_ids, query_vecs, qrels, dim = load_corpus(
+-        Path(args.npz), max_docs=args.corpus_size,
+-    )
++    all_vectors, doc_offsets, doc_ids, query_vecs, _qrels, dim = load_corpus(Path(args.npz), max_docs=args.corpus_size)
+     doc_vecs = [all_vectors[s:e] for s, e in doc_offsets]
+     n_eval = min(args.n_eval, len(query_vecs))
+ 
+-    # Ground truth
+     gt_cache = Path.home() / ".cache" / "shard-bench" / f"gt_{args.corpus_size}.npz"
+-    if args.skip_gt and gt_cache.exists():
+-        data = np.load(str(gt_cache), allow_pickle=True)
+-        ground_truth = [row[row >= 0].tolist() for row in data["gt_ids"][:n_eval]]
+-    else:
+-        ground_truth = compute_ground_truth(
+-            query_vecs, doc_vecs, doc_ids, dim, n_eval, k=100,
+-            cache_path=gt_cache, device=device,
+-        )
++    ground_truth = compute_ground_truth(query_vecs, doc_vecs, doc_ids, dim, n_eval, k=100, cache_path=None if not args.skip_gt else gt_cache, device=device)
+ 
+-    # Results output
+     results_dir = Path(__file__).resolve().parent / "results"
+     results_dir.mkdir(parents=True, exist_ok=True)
+     results_file = results_dir / f"bench_{args.corpus_size}.jsonl"
+-
+     all_results = []
+ 
+-    # Baselines
+     if not args.skip_baselines:
+-        baseline_results = run_baselines(
+-            query_vecs, doc_vecs, doc_ids, ground_truth, dim, n_eval,
+-            max_docs_gpu=min(args.corpus_size, 20_000),
+-            device=device,
+-        )
+-        for r in baseline_results:
+-            all_results.append(r)
++        all_results.extend(run_baselines(query_vecs, doc_vecs, doc_ids, ground_truth, dim, n_eval, max_docs_gpu=min(args.corpus_size, 20_000), device=device))
+ 
+-    # Sweep matrix
+     if args.quick:
+         sweep_shards = [8]
+         sweep_docs = [5_000]
+         sweep_transfer = [TransferMode.PINNED]
+         sweep_compression = [Compression.FP16]
+-        sweep_layout = [StorageLayout.CENTROID_GROUPED]
++        sweep_layout = [StorageLayout.PROXY_GROUPED]
+     else:
+         sweep_shards = SWEEP_TOP_SHARDS
+         sweep_docs = SWEEP_MAX_DOCS_EXACT
+         sweep_transfer = SWEEP_TRANSFER
+         sweep_compression = [Compression.FP16, Compression.INT8]
+-        sweep_layout = [StorageLayout.CENTROID_GROUPED, StorageLayout.RANDOM]
++        sweep_layout = [StorageLayout.PROXY_GROUPED, StorageLayout.RANDOM]
+ 
+     for compression in sweep_compression:
+         for layout in sweep_layout:
+-            # Build index for this compression+layout combo
+-            bcfg = BuildConfig(
+-                corpus_size=args.corpus_size,
+-                compression=compression,
+-                layout=layout,
+-            )
++            bcfg = BuildConfig(corpus_size=args.corpus_size, compression=compression, layout=layout, router_type=RouterType(args.router))
++            bcfg.pooling.enabled = bool(args.enable_pooling)
++            bcfg.pooling.pool_factor = int(args.pool_factor)
++            bcfg.lemur.enabled = bcfg.router_type == RouterType.LEMUR
+             build(bcfg, npz_path=Path(args.npz), device=device)
+ 
+             for top_shards in sweep_shards:
+                 for max_docs in sweep_docs:
+                     for transfer in sweep_transfer:
+-                        cfg = BenchmarkConfig(
+-                            build=bcfg,
+-                            search=SearchConfig(
+-                                top_shards=top_shards,
+-                                max_docs_exact=max_docs,
+-                                transfer_mode=transfer,
+-                            ),
+-                            n_eval_queries=n_eval,
+-                        )
+-
+-                        if args.cold_reads:
+-                            cache_base = Path.home() / ".cache" / "shard-bench"
+-                            sfx = "_uniform" if bcfg.uniform_shard_tokens else ""
+-                            idx_dir = cache_base / f"index_{bcfg.corpus_size}_{bcfg.compression.value}_{bcfg.layout.value}{sfx}"
+-                            store = ShardStore(idx_dir)
+-                            store.drop_all_page_cache()
+-
++                        scfg = SearchConfig(top_shards=top_shards, max_docs_exact=max_docs, transfer_mode=transfer, use_colbandit=args.use_colbandit)
++                        if args.use_colbandit:
++                            scfg.colbandit = ColBanditConfig(enabled=True)
++                        cfg = BenchmarkConfig(build=bcfg, search=scfg, n_eval_queries=n_eval)
+                         try:
+-                            result = run_single_config(
+-                                cfg, query_vecs, doc_vecs, doc_ids,
+-                                ground_truth, dim, device=device,
+-                            )
+-                            result["pipeline"] = "shard_routed"
++                            result = run_single_config(cfg, query_vecs, doc_vecs, doc_ids, ground_truth, dim, device=device)
++                            result["pipeline"] = f"shard_routed_{bcfg.router_type.value}"
+                             all_results.append(result)
+                         except Exception as e:
+                             log.error("Config failed: %s", e, exc_info=True)
+-
+                         gc.collect()
+                         if torch.cuda.is_available():
+                             torch.cuda.empty_cache()
+ 
+-    # Write results
+     with open(results_file, "w") as f:
+         for r in all_results:
+             f.write(json.dumps(r, default=str) + "\n")
+-
+     log.info("Results written to %s (%d entries)", results_file, len(all_results))
+     log.info("Final RSS: %.1f GB", _mem_gb())
+ 
+-    # Print summary
+-    _print_summary(all_results)
+-
+-
+-def _print_summary(results: List[dict]):
+-    W = 130
+-    print("\n" + "=" * W)
+-    print(f"{'Pipeline':<25} {'Compression':<8} {'Layout':<12} {'Shards':>6} {'MaxDocs':>8} "
+-          f"{'Transfer':<10} {'R@10':>7} {'R@100':>7} {'p50ms':>7} {'p95ms':>7} {'QPS':>7}")
+-    print("-" * W)
+-    for r in results:
+-        print(
+-            f"{r.get('pipeline', '?'):<25} "
+-            f"{r.get('compression', '-'):<8} "
+-            f"{r.get('layout', '-'):<12} "
+-            f"{r.get('top_shards', '-'):>6} "
+-            f"{r.get('max_docs_exact', '-'):>8} "
+-            f"{r.get('transfer_mode', '-'):<10} "
+-            f"{r.get('recall_at_10', 0):>7.4f} "
+-            f"{r.get('recall_at_100', 0):>7.4f} "
+-            f"{r.get('p50_total_ms', 0):>7.1f} "
+-            f"{r.get('p95_total_ms', 0):>7.1f} "
+-            f"{r.get('qps', 0):>7.1f}"
+-        )
+-    print("=" * W)
+-
+ 
+ if __name__ == "__main__":
+     main()
