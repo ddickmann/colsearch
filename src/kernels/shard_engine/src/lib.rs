@@ -8,6 +8,7 @@ pub mod state;
 pub mod metadata;
 pub mod simd_proxy;
 pub mod centroid_approx;
+pub mod codec;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,6 +20,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods, PyArrayMethods};
 
+use crate::codec::ResidualCodec;
 use crate::mmap_reader::MmapShard;
 use crate::state::{DocMeta, ShardState, StateHandle};
 use crate::topk::heap_topk;
@@ -133,6 +135,7 @@ pub struct ShardIndex {
     gpu_score_fn: Option<Box<GpuScoreFn>>,
     centroids: Option<Arc<Vec<f32>>>,
     n_centroids: usize,
+    codec: Option<Arc<ResidualCodec>>,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -256,6 +259,7 @@ impl ShardIndex {
             gpu_score_fn: gpu_closure,
             centroids: None,
             n_centroids: 0,
+            codec: None,
             closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -694,6 +698,41 @@ impl ShardIndex {
         Ok(())
     }
 
+    /// Set up the residual codec for compressed fetch/decompression.
+    ///
+    /// Must be called AFTER `set_centroids`. `bucket_weights` is the 1-D array
+    /// of representative values for each bucket (length = 2^nbits).
+    #[pyo3(signature = (bucket_weights, nbits))]
+    fn set_codec(
+        &mut self,
+        bucket_weights: Vec<f32>,
+        nbits: usize,
+    ) -> PyResult<()> {
+        self.ensure_open()?;
+        let centroids = self.centroids.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("set_centroids must be called before set_codec")
+        })?;
+        if nbits == 0 || 8 % nbits != 0 {
+            return Err(PyValueError::new_err(format!("nbits must divide 8, got {nbits}")));
+        }
+        let n_buckets = 1 << nbits;
+        if bucket_weights.len() != n_buckets {
+            return Err(PyValueError::new_err(format!(
+                "bucket_weights len {} != 2^nbits = {n_buckets}", bucket_weights.len()
+            )));
+        }
+        let codec = ResidualCodec::new(
+            Arc::clone(centroids),
+            self.n_centroids,
+            self.dim,
+            bucket_weights,
+            nbits,
+        );
+        self.codec = Some(Arc::new(codec));
+        log::info!("Residual codec ready: nbits={nbits}, packed_dim={}", self.dim * nbits / 8);
+        Ok(())
+    }
+
     /// Approximate MaxSim scoring using centroid codes (Rayon-parallel).
     ///
     /// Pre-filter stage: scores `candidate_ids` using lightweight centroid
@@ -757,6 +796,10 @@ impl ShardIndex {
     /// is the raw bytes of FP16 data (caller reinterprets as float16),
     /// offsets is `(n_docs, 2)` with `[start, end)` row indices,
     /// and doc_ids is the ordered list.
+    ///
+    /// When a residual codec is configured AND shards contain `packed_residuals`,
+    /// reads compressed data and decompresses to f16 (7.5x less I/O for nbits=2).
+    /// Falls back to raw FP16 embedding reads otherwise.
     /// GIL is released during the Rust I/O work.
     #[pyo3(signature = (candidate_ids,))]
     fn fetch_candidate_embeddings<'py>(
@@ -772,6 +815,7 @@ impl ShardIndex {
         let snap = self.state.load();
         let shard_snap = self.load_shards();
         let dim = self.dim;
+        let codec_opt = self.codec.as_ref().map(Arc::clone);
 
         let (flat_bytes, offsets_vec, out_ids) = py.allow_threads(move || {
             let mut by_shard: HashMap<u32, Vec<(u64, usize, usize)>> = HashMap::new();
@@ -786,7 +830,7 @@ impl ShardIndex {
                 }
             }
 
-            let bytes_per_row = dim * 2;
+            let bytes_per_row_fp16 = dim * 2;
             let mut flat: Vec<u8> = Vec::new();
             let mut offsets: Vec<[i64; 2]> = Vec::new();
             let mut ids: Vec<u64> = Vec::new();
@@ -797,13 +841,34 @@ impl ShardIndex {
                     Some(s) => s,
                     None => continue,
                 };
+
+                let use_codec = codec_opt.is_some()
+                    && shard.has_tensor("packed_residuals")
+                    && shard.has_tensor("centroid_codes");
+
                 for &(did, rs, re) in docs {
-                    if let Ok(raw) = shard.read_rows_raw("embeddings", rs, re) {
-                        let n_tokens = raw.len() / bytes_per_row;
+                    let n_tokens = re - rs;
+                    if n_tokens == 0 {
+                        continue;
+                    }
+
+                    if use_codec {
+                        let codec = codec_opt.as_ref().unwrap();
+                        let codes_res = shard.read_selected_u16("centroid_codes", &[(rs, re)]);
+                        let packed_res = shard.read_rows_raw("packed_residuals", rs, re);
+                        if let (Ok(codes), Ok(packed_bytes)) = (codes_res, packed_res) {
+                            let decompressed = codec.decompress_to_f16(&codes, packed_bytes, n_tokens);
+                            flat.extend_from_slice(&decompressed);
+                            offsets.push([pos, pos + n_tokens as i64]);
+                            ids.push(did);
+                            pos += n_tokens as i64;
+                        }
+                    } else if let Ok(raw) = shard.read_rows_raw("embeddings", rs, re) {
+                        let actual_tokens = raw.len() / bytes_per_row_fp16;
                         flat.extend_from_slice(raw);
-                        offsets.push([pos, pos + n_tokens as i64]);
+                        offsets.push([pos, pos + actual_tokens as i64]);
                         ids.push(did);
-                        pos += n_tokens as i64;
+                        pos += actual_tokens as i64;
                     }
                 }
             }

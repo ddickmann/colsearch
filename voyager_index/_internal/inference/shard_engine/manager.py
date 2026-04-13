@@ -1113,6 +1113,18 @@ class ShardSegmentManager:
                 local_ends.tolist(),
             )
             rust_idx.set_centroids(centroids)
+
+            codec_meta_path = self._path / "codec_meta.npz"
+            if codec_meta_path.exists():
+                meta = np.load(str(codec_meta_path))
+                bw = meta["bucket_weights"].astype(np.float32)
+                nbits_val = int(meta["nbits"][0])
+                rust_idx.set_codec(bw.tolist(), nbits_val)
+                logger.info(
+                    "Residual codec loaded: nbits=%d, %d bucket weights",
+                    nbits_val, len(bw),
+                )
+
             self._rust_index = rust_idx
             logger.info(
                 "Rust ShardIndex ready: %d docs, %d centroids for approx scoring",
