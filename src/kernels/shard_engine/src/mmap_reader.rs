@@ -75,9 +75,9 @@ impl MmapShard {
                     "F32" => 4,
                     "F64" => 8,
                     "I8" | "U8" => 1,
-                    "I16" => 2,
-                    "I32" => 4,
-                    "I64" => 8,
+                    "I16" | "U16" => 2,
+                    "I32" | "U32" => 4,
+                    "I64" | "U64" => 8,
                     _ => 4,
                 };
                 let shape: Vec<usize> = meta_obj
@@ -192,6 +192,32 @@ impl MmapShard {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         Ok(floats)
+    }
+
+    /// Read selected rows from a U16 tensor and return as u16 values.
+    pub fn read_selected_u16(&self, tensor_name: &str, ranges: &[(usize, usize)]) -> io::Result<Vec<u16>> {
+        if let Some(meta) = self.tensors.get(tensor_name) {
+            if meta.dtype != "U16" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("read_selected_u16 requires U16 dtype, got '{}'", meta.dtype),
+                ));
+            }
+        }
+        let raw = self.read_selected_rows(tensor_name, ranges)?;
+        if raw.len() % 2 != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "raw bytes not aligned to u16"));
+        }
+        let values: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        Ok(values)
+    }
+
+    /// Check if a named tensor exists.
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
     }
 
     /// Read all rows of a tensor as raw bytes.

@@ -93,6 +93,7 @@ class SearchConfig:
 
     max_docs_exact: int = 10_000
     n_full_scores: int = 4096
+    n_centroid_approx: int = 0
     transfer_mode: TransferMode = TransferMode.PINNED
     pinned_pool_buffers: int = 3
     pinned_buffer_max_tokens: int = 50_000

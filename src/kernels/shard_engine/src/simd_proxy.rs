@@ -69,7 +69,7 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
 // ───────────────────── dispatch ─────────────────────
 
 #[inline]
-fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {

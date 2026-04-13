@@ -7,6 +7,7 @@ pub mod mmap_reader;
 pub mod state;
 pub mod metadata;
 pub mod simd_proxy;
+pub mod centroid_approx;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -130,6 +131,8 @@ pub struct ShardIndex {
     writer: Mutex<WriterInner>,
     dim: usize,
     gpu_score_fn: Option<Box<GpuScoreFn>>,
+    centroids: Option<Vec<f32>>,
+    n_centroids: usize,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -251,6 +254,8 @@ impl ShardIndex {
             }),
             dim,
             gpu_score_fn: gpu_closure,
+            centroids: None,
+            n_centroids: 0,
             closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -621,6 +626,128 @@ impl ShardIndex {
         self.state.store(new_state);
 
         Ok(())
+    }
+
+    /// Register documents that already exist in shard files.
+    ///
+    /// Used when loading a pre-built index (e.g. from ShardSegmentManager).
+    #[pyo3(signature = (doc_ids, shard_ids, row_starts, row_ends))]
+    fn register_shard_docs(
+        &self,
+        doc_ids: Vec<u64>,
+        shard_ids: Vec<u32>,
+        row_starts: Vec<usize>,
+        row_ends: Vec<usize>,
+    ) -> PyResult<()> {
+        self.ensure_open()?;
+        let n = doc_ids.len();
+        if shard_ids.len() != n || row_starts.len() != n || row_ends.len() != n {
+            return Err(PyValueError::new_err("all arrays must have the same length"));
+        }
+
+        let _w = self.writer.lock();
+        let snap = self.state.load();
+        let mut new_docs = snap.docs.clone();
+        for i in 0..n {
+            new_docs.insert(doc_ids[i], DocMeta {
+                shard_id: shard_ids[i],
+                row_start: row_starts[i],
+                row_end: row_ends[i],
+                dim: self.dim,
+                payload_json: None,
+            });
+        }
+        let shard_count = snap.shard_count;
+        let new_state = Self::build_state_from_docs(&new_docs, shard_count);
+        self.state.store(new_state);
+        Ok(())
+    }
+
+    /// Load centroid embeddings for approximate scoring.
+    ///
+    /// `centroids` shape: `(n_centroids, dim)`.
+    #[pyo3(signature = (centroids,))]
+    fn set_centroids(
+        &mut self,
+        centroids: PyReadonlyArray2<f32>,
+    ) -> PyResult<()> {
+        self.ensure_open()?;
+        let shape = centroids.shape();
+        let n_c = shape[0];
+        let c_dim = shape[1];
+        if c_dim != self.dim {
+            return Err(PyValueError::new_err(format!(
+                "centroid dim {c_dim} != index dim {}", self.dim
+            )));
+        }
+        if n_c == 0 {
+            return Err(PyValueError::new_err("centroids must have at least 1 row"));
+        }
+        let flat: Vec<f32> = centroids
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("centroids must be contiguous"))?
+            .to_vec();
+        self.centroids = Some(flat);
+        self.n_centroids = n_c;
+        log::info!("Loaded {} centroids (dim={})", n_c, c_dim);
+        Ok(())
+    }
+
+    /// Approximate MaxSim scoring using centroid codes (Rayon-parallel).
+    ///
+    /// Pre-filter stage: scores `candidate_ids` using lightweight centroid
+    /// code lookups and returns the top `n_top` doc IDs + scores.
+    /// GIL is released during all Rust work.
+    #[pyo3(signature = (query, candidate_ids, n_top=512))]
+    fn score_candidates_approx<'py>(
+        &self,
+        py: Python<'py>,
+        query: PyReadonlyArray2<f32>,
+        candidate_ids: Vec<u64>,
+        n_top: usize,
+    ) -> PyResult<(Bound<'py, PyArray1<u64>>, Bound<'py, PyArray1<f32>>)> {
+        self.ensure_open()?;
+        let centroids = self.centroids.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("centroids not loaded — call set_centroids first")
+        })?;
+        let shape = query.shape();
+        let q_dim = shape[1];
+        if q_dim != self.dim {
+            return Err(PyValueError::new_err(format!(
+                "query dim {q_dim} != index dim {}", self.dim
+            )));
+        }
+        let q_data: Vec<f32> = query
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("query must be contiguous"))?
+            .to_vec();
+
+        let snap = self.state.load();
+        let shard_snap = self.load_shards();
+        let n_centroids = self.n_centroids;
+        let dim = self.dim;
+        let centroids_owned = centroids.clone();
+
+        let (ids, scs) = py.allow_threads(move || {
+            let results = centroid_approx::score_candidates_approx(
+                &q_data,
+                &centroids_owned,
+                n_centroids,
+                dim,
+                &candidate_ids,
+                &snap,
+                &shard_snap,
+                n_top,
+            );
+            let ids: Vec<u64> = results.iter().map(|d| d.doc_id).collect();
+            let scs: Vec<f32> = results.iter().map(|d| d.score).collect();
+            (ids, scs)
+        });
+
+        Ok((
+            PyArray1::from_slice_bound(py, &ids),
+            PyArray1::from_slice_bound(py, &scs),
+        ))
     }
 
     /// Flush the WAL and sync to disk.

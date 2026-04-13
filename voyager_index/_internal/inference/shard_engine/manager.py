@@ -87,6 +87,8 @@ class ShardEngineConfig:
         use_colbandit: bool = False,
         uniform_shard_tokens: bool = True,
         quantization_mode: str = "",
+        n_centroids: int = 1024,
+        n_centroid_approx: int = 512,
         seed: int = 42,
     ):
         self.n_shards = n_shards
@@ -104,6 +106,8 @@ class ShardEngineConfig:
         self.use_colbandit = use_colbandit
         self.uniform_shard_tokens = uniform_shard_tokens
         self.quantization_mode = quantization_mode
+        self.n_centroids = n_centroids
+        self.n_centroid_approx = n_centroid_approx
         self.seed = seed
 
     def to_build_config(self, corpus_size: int) -> BuildConfig:
@@ -129,6 +133,7 @@ class ShardEngineConfig:
         return SearchConfig(
             k_candidates=self.k_candidates,
             n_full_scores=self.n_full_scores,
+            n_centroid_approx=self.n_centroid_approx,
             transfer_mode=self.transfer_mode,
             pinned_pool_buffers=self.pinned_pool_buffers,
             pinned_buffer_max_tokens=self.pinned_buffer_max_tokens,
@@ -171,6 +176,7 @@ class ShardSegmentManager:
         self._page_cache_last: Optional[Tuple[float, float]] = None  # (timestamp, hit_rate)
         self._doc_means: Optional[torch.Tensor] = None
         self._doc_mean_id_to_idx: Optional[Dict[int, int]] = None
+        self._rust_index = None
         self._checkpoint_mgr = ShardCheckpointManager(self._path)
         self._file_lock: Optional[Any] = None
         if _FileLock is not None:
@@ -368,6 +374,7 @@ class ShardSegmentManager:
             self._init_wal_and_memtable()
             self._replay_wal()
             self._load_doc_means()
+            self._init_rust_index()
             logger.info("Shard index loaded: %d docs from %s",
                         len(self._doc_ids), self._path)
 
@@ -426,9 +433,24 @@ class ShardSegmentManager:
                 nprobe_override=n_probes,
             )
 
-        # --- Centroid proxy pre-scoring (Track C) ---
-        # Prune candidates cheaply before expensive shard fetch + exact MaxSim.
-        if self._doc_means is not None and self._doc_mean_id_to_idx is not None:
+        # --- Stage 1: Centroid-code approximate MaxSim (Rust + Rayon) ---
+        if (
+            self._rust_index is not None
+            and scfg.n_centroid_approx > 0
+            and len(routed.doc_ids) > scfg.n_centroid_approx
+        ):
+            q_np = q.cpu().numpy().astype(np.float32)
+            approx_ids, _approx_scores = self._rust_index.score_candidates_approx(
+                q_np, routed.doc_ids, scfg.n_centroid_approx,
+            )
+            pruned_ids = approx_ids.tolist()
+            pruned_set = set(pruned_ids)
+            routed_by_shard = {
+                sid: [d for d in dids if d in pruned_set]
+                for sid, dids in routed.by_shard.items()
+            }
+            routed_by_shard = {sid: dids for sid, dids in routed_by_shard.items() if dids}
+        elif self._doc_means is not None and self._doc_mean_id_to_idx is not None:
             pruned_ids = proxy_score_candidates(
                 query=q,
                 doc_means=self._doc_means,
@@ -1014,6 +1036,55 @@ class ShardSegmentManager:
             logger.info("Doc-mean proxy embeddings loaded: %d docs on %s", len(ids), dev)
         except Exception as exc:
             logger.warning("Could not load doc means for proxy scoring: %s", exc)
+
+    def _init_rust_index(self) -> None:
+        """Initialize the Rust ShardIndex for centroid-code approximate scoring."""
+        centroids_path = self._path / "centroids.npy"
+        doc_index_path = self._path / "doc_index.npz"
+        if not centroids_path.exists() or not doc_index_path.exists():
+            logger.info("Centroid codes not available — skipping Rust approx scoring")
+            return
+        try:
+            import latence_shard_engine
+        except ImportError:
+            logger.warning("latence_shard_engine not installed — skipping Rust approx scoring")
+            return
+        try:
+            centroids = np.load(str(centroids_path)).astype(np.float32)
+            doc_index = np.load(str(doc_index_path), allow_pickle=True)
+            doc_ids = doc_index["doc_ids"]
+            shard_ids = doc_index["shard_ids"]
+            local_starts = doc_index["local_starts"]
+            local_ends = doc_index["local_ends"]
+
+            shard_dir = self._path / "shards"
+            shard_files = sorted(shard_dir.glob("shard_*.safetensors"))
+            if not shard_files:
+                logger.warning("No shard files found — skipping Rust approx scoring")
+                return
+
+            import tempfile, os
+            tmpdir = tempfile.mkdtemp(prefix="shard_idx_")
+            for i, sf in enumerate(shard_files):
+                os.symlink(str(sf), os.path.join(tmpdir, f"shard_{i}.safetensors"))
+            open(os.path.join(tmpdir, "shard.wal"), "wb").close()
+
+            rust_idx = latence_shard_engine.ShardIndex(tmpdir, self._dim)
+            rust_idx.register_shard_docs(
+                doc_ids.tolist(),
+                shard_ids.astype(np.uint32).tolist(),
+                local_starts.tolist(),
+                local_ends.tolist(),
+            )
+            rust_idx.set_centroids(centroids)
+            self._rust_index = rust_idx
+            logger.info(
+                "Rust ShardIndex ready: %d docs, %d centroids for approx scoring",
+                rust_idx.doc_count, len(centroids),
+            )
+        except Exception as exc:
+            logger.warning("Failed to initialize Rust ShardIndex: %s", exc)
+            self._rust_index = None
 
     def _load_sealed_payloads(self) -> Dict[int, dict]:
         """Load sealed payloads from payloads.json."""
