@@ -374,13 +374,19 @@ class ShardSegmentManager:
             self._load_doc_means()
             self._init_rust_index()
 
-            self._doc_vecs = self._load_sealed_vectors()
-            self._try_gpu_preload()
-            if self._gpu_corpus is None and self._rust_index is not None:
+            if self._rust_index is not None:
                 logger.info(
-                    "GPU preload unavailable — Rust fetch path active for exact scoring",
+                    "Rust mmap fetch path active — skipping sealed vector preload "
+                    "(%d docs, saves ~%.1f GB CPU RAM)",
+                    len(self._doc_ids),
+                    len(self._doc_ids) * 256 * self._dim * 4 / 1e9,
                 )
                 self._doc_vecs = None
+            else:
+                self._doc_vecs = self._load_sealed_vectors()
+                self._try_gpu_preload()
+                if self._gpu_corpus is None:
+                    self._doc_vecs = None
             self._init_pipeline()
             logger.info("Shard index loaded: %d docs from %s",
                         len(self._doc_ids), self._path)
