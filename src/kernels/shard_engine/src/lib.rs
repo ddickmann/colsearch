@@ -423,10 +423,9 @@ impl ShardIndex {
         }
 
         // Phase 1 (GIL held): extract owned data from numpy
-        let q_data: Vec<f32> = query
+        let q_data: &[f32] = query
             .as_slice()
-            .map_err(|_| PyValueError::new_err("query must be contiguous"))?
-            .to_vec();
+            .map_err(|_| PyValueError::new_err("query must be contiguous"))?;
 
         // Load snapshots (lock-free)
         let snap = self.state.load();
@@ -555,10 +554,9 @@ impl ShardIndex {
             )));
         }
 
-        let q_data: Vec<f32> = query
+        let q_data: &[f32] = query
             .as_slice()
-            .map_err(|_| PyValueError::new_err("query must be contiguous"))?
-            .to_vec();
+            .map_err(|_| PyValueError::new_err("query must be contiguous"))?;
 
         // Grab an Arc to the snapshot — zero-copy, keeps data alive in allow_threads
         let snap = self.state.load();
@@ -797,10 +795,9 @@ impl ShardIndex {
                 "query dim {q_dim} != index dim {}", self.dim
             )));
         }
-        let q_data: Vec<f32> = query
+        let q_data: &[f32] = query
             .as_slice()
-            .map_err(|_| PyValueError::new_err("query must be contiguous"))?
-            .to_vec();
+            .map_err(|_| PyValueError::new_err("query must be contiguous"))?;
 
         let snap = self.state.load();
         let shard_snap = self.load_shards();
@@ -811,7 +808,7 @@ impl ShardIndex {
 
         let (ids, scs) = py.allow_threads(move || {
             let results = centroid_approx::score_candidates_approx(
-                &q_data,
+                q_data,
                 &centroids_arc,
                 n_centroids,
                 dim,
@@ -856,17 +853,16 @@ impl ShardIndex {
                 "query dim {q_dim} != index dim {}", self.dim
             )));
         }
-        let q_data: Vec<f32> = query
+        let q_data: &[f32] = query
             .as_slice()
-            .map_err(|_| PyValueError::new_err("query must be contiguous"))?
-            .to_vec();
+            .map_err(|_| PyValueError::new_err("query must be contiguous"))?;
 
         let dim = self.dim;
         let merged_arc = Arc::clone(merged);
 
         let (ids, scs) = py.allow_threads(move || {
             let topk = fused_maxsim::fused_maxsim_topk(
-                &q_data,
+                q_data,
                 &candidate_ids,
                 &merged_arc,
                 dim,

@@ -535,6 +535,30 @@ class PreloadedGpuCorpus:
         return int(n_docs * max_tok * dim * np.dtype(dtype).itemsize)
 
     @staticmethod
+    def estimate_streaming_cpu_bytes(
+        chunk_docs: int,
+        max_tok: int,
+        dim: int,
+        dtype=np.float16,
+    ) -> int:
+        emb_bytes = int(chunk_docs * max_tok * dim * np.dtype(dtype).itemsize)
+        mask_bytes = int(chunk_docs * max_tok * np.dtype(np.float32).itemsize)
+        return emb_bytes + mask_bytes
+
+    @classmethod
+    def suggest_streaming_chunk_docs(
+        cls,
+        max_tok: int,
+        dim: int,
+        dtype=np.float16,
+        max_host_bytes: int = 256 * 1024**2,
+    ) -> int:
+        bytes_per_doc = cls.estimate_streaming_cpu_bytes(1, max_tok, dim, dtype=dtype)
+        if bytes_per_doc <= 0:
+            return 1
+        return max(1, min(4096, int(max_host_bytes // bytes_per_doc)))
+
+    @staticmethod
     def available_cpu_bytes() -> int | None:
         try:
             return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES"))
@@ -558,6 +582,81 @@ class PreloadedGpuCorpus:
             return True
         # Leave generous headroom for Python object overhead and transient copies.
         return bytes_needed < avail * 0.45
+
+    @classmethod
+    def fits_cpu_streaming(
+        cls,
+        max_tok: int,
+        dim: int,
+        chunk_docs: int | None = None,
+        dtype=np.float16,
+        hard_cap_bytes: int = 1024**3,
+        max_host_bytes: int = 256 * 1024**2,
+    ) -> bool:
+        if chunk_docs is None:
+            chunk_docs = cls.suggest_streaming_chunk_docs(
+                max_tok, dim, dtype=dtype, max_host_bytes=max_host_bytes,
+            )
+        bytes_needed = cls.estimate_streaming_cpu_bytes(
+            chunk_docs, max_tok, dim, dtype=dtype,
+        )
+        if bytes_needed > hard_cap_bytes:
+            return False
+        avail = cls.available_cpu_bytes()
+        if avail is None:
+            return True
+        return bytes_needed < avail * 0.45
+
+    @classmethod
+    def from_merged_streaming(
+        cls,
+        store: "ShardStore",
+        dim: int,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16,
+        chunk_docs: int | None = None,
+    ) -> "PreloadedGpuCorpus":
+        doc_ids_arr, offsets, merged_dim, _total_tokens = store.load_merged_layout()
+        if int(merged_dim) != int(dim):
+            raise ValueError(f"merged dim {merged_dim} != expected dim {dim}")
+        max_tok = int(np.max(offsets[1:] - offsets[:-1])) if len(doc_ids_arr) else 1
+        if chunk_docs is None:
+            chunk_docs = cls.suggest_streaming_chunk_docs(max_tok, dim)
+
+        n_docs = int(len(doc_ids_arr))
+        self = cls.__new__(cls)
+        self.D = torch.zeros((n_docs, max_tok, dim), dtype=dtype, device=device)
+        self.M = torch.zeros((n_docs, max_tok), dtype=torch.float32, device=device)
+        self.doc_ids = [int(did) for did in doc_ids_arr.tolist()]
+        self.doc_id_to_idx = {did: i for i, did in enumerate(self.doc_ids)}
+        self.max_tok = max_tok
+        self.dim = dim
+        self._device = device
+
+        pos = 0
+        for ids_chunk, emb_chunk, mask_chunk, chunk_max_tok, _global_max_tok in store.iter_merged_doc_chunks(chunk_docs):
+            n_chunk = int(len(ids_chunk))
+            if n_chunk == 0:
+                continue
+            emb_t = torch.from_numpy(emb_chunk)
+            mask_t = torch.from_numpy(mask_chunk)
+            if device != "cpu":
+                emb_t = emb_t.to(device=device, dtype=dtype, non_blocking=True)
+                mask_t = mask_t.to(device=device, dtype=torch.float32, non_blocking=True)
+            else:
+                emb_t = emb_t.to(device=device, dtype=dtype)
+                mask_t = mask_t.to(device=device, dtype=torch.float32)
+            self.D[pos:pos + n_chunk, :chunk_max_tok] = emb_t[:, :chunk_max_tok]
+            self.M[pos:pos + n_chunk, :chunk_max_tok] = mask_t[:, :chunk_max_tok]
+            pos += n_chunk
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        logger.info(
+            "PreloadedGpuCorpus ready from merged mmap: %d docs, max_tok=%d, dim=%d on %s",
+            n_docs, max_tok, dim, device,
+        )
+        return self
 
 
 # ------------------------------------------------------------------

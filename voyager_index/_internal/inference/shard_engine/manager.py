@@ -90,6 +90,7 @@ class ShardEngineConfig:
         uniform_shard_tokens: bool = True,
         quantization_mode: str = "",
         variable_length_strategy: str = "bucketed",
+        gpu_corpus_rerank_topn: int = 16,
         n_centroids: int = 1024,
         n_centroid_approx: int = 0,
         router_device: str | None = "cpu",
@@ -113,6 +114,7 @@ class ShardEngineConfig:
         self.uniform_shard_tokens = uniform_shard_tokens
         self.quantization_mode = quantization_mode
         self.variable_length_strategy = variable_length_strategy
+        self.gpu_corpus_rerank_topn = gpu_corpus_rerank_topn
         self.n_centroids = n_centroids
         self.n_centroid_approx = n_centroid_approx
         self.router_device = router_device
@@ -152,6 +154,7 @@ class ShardEngineConfig:
             use_colbandit=self.use_colbandit,
             quantization_mode=self.quantization_mode,
             variable_length_strategy=self.variable_length_strategy,
+            gpu_corpus_rerank_topn=self.gpu_corpus_rerank_topn,
         )
 
 
@@ -391,6 +394,7 @@ class ShardSegmentManager:
             if self._rust_index is not None:
                 # Only preload when both GPU VRAM and CPU staging are safe.
                 doc_index_path = self._path / "doc_index.npz"
+                merged_emb_path = self._path / "merged_embeddings.bin"
                 gpu_preloaded = False
                 if (
                     doc_index_path.exists()
@@ -405,38 +409,76 @@ class ShardSegmentManager:
                         fits_gpu = PreloadedGpuCorpus.fits_on_gpu(
                             len(self._doc_ids), actual_max_tok, self._dim,
                         )
+                        stream_chunk_docs = PreloadedGpuCorpus.suggest_streaming_chunk_docs(
+                            actual_max_tok, self._dim,
+                        )
+                        fits_cpu_stream = PreloadedGpuCorpus.fits_cpu_streaming(
+                            actual_max_tok,
+                            self._dim,
+                            chunk_docs=stream_chunk_docs,
+                        )
                         fits_cpu_stage = PreloadedGpuCorpus.fits_cpu_staging(
                             len(self._doc_ids), actual_max_tok, self._dim,
                         )
 
-                        if fits_gpu and fits_cpu_stage:
-                            self._doc_vecs = self._load_sealed_vectors()
-                            self._try_gpu_preload()
-                            if self._gpu_corpus is not None:
+                        if fits_gpu and merged_emb_path.exists() and fits_cpu_stream and self._store is not None:
+                            try:
+                                self._gpu_corpus = PreloadedGpuCorpus.from_merged_streaming(
+                                    self._store,
+                                    self._dim,
+                                    device=self._device,
+                                    chunk_docs=stream_chunk_docs,
+                                )
                                 gpu_preloaded = True
                                 logger.info(
-                                    "GPU preload succeeded (%d docs, max_tok=%d)",
+                                    "Streaming GPU preload succeeded (%d docs, max_tok=%d, chunk_docs=%d)",
+                                    len(self._gpu_corpus.doc_ids), actual_max_tok, stream_chunk_docs,
+                                )
+                            except Exception as exc:
+                                logger.warning("Streaming GPU preload failed: %s", exc)
+                                self._gpu_corpus = None
+
+                        if not gpu_preloaded:
+                            if fits_gpu and fits_cpu_stage:
+                                self._doc_vecs = self._load_sealed_vectors()
+                                self._try_gpu_preload()
+                                if self._gpu_corpus is not None:
+                                    gpu_preloaded = True
+                                    logger.info(
+                                        "GPU preload succeeded (%d docs, max_tok=%d)",
+                                        len(self._doc_ids), actual_max_tok,
+                                    )
+                                else:
+                                    self._doc_vecs = None
+                            elif fits_gpu:
+                                if merged_emb_path.exists() and not fits_cpu_stream:
+                                    stream_mb = (
+                                        PreloadedGpuCorpus.estimate_streaming_cpu_bytes(
+                                            stream_chunk_docs, actual_max_tok, self._dim,
+                                        ) / 1e6
+                                    )
+                                    logger.info(
+                                        "Skipping streaming GPU preload (%d docs, max_tok=%d) — "
+                                        "chunk staging would require ~%.1f MB; using non-preloaded exact path",
+                                        len(self._doc_ids), actual_max_tok, stream_mb,
+                                    )
+                                else:
+                                    stage_gb = (
+                                        PreloadedGpuCorpus.estimate_cpu_staging_bytes(
+                                            len(self._doc_ids), actual_max_tok, self._dim,
+                                        ) / 1e9
+                                    )
+                                    logger.info(
+                                        "Skipping GPU preload (%d docs, max_tok=%d) — "
+                                                "CPU staging would require ~%.1f GB; using non-preloaded exact path",
+                                        len(self._doc_ids), actual_max_tok, stage_gb,
+                                    )
+                            else:
+                                logger.info(
+                                    "Corpus too large for GPU preload (%d docs, max_tok=%d) — "
+                                            "using non-preloaded exact path",
                                     len(self._doc_ids), actual_max_tok,
                                 )
-                            else:
-                                self._doc_vecs = None
-                        elif fits_gpu:
-                            stage_gb = (
-                                PreloadedGpuCorpus.estimate_cpu_staging_bytes(
-                                    len(self._doc_ids), actual_max_tok, self._dim,
-                                ) / 1e9
-                            )
-                            logger.info(
-                                "Skipping GPU preload (%d docs, max_tok=%d) — "
-                                        "CPU staging would require ~%.1f GB; using non-preloaded exact path",
-                                len(self._doc_ids), actual_max_tok, stage_gb,
-                            )
-                        else:
-                            logger.info(
-                                "Corpus too large for GPU preload (%d docs, max_tok=%d) — "
-                                        "using non-preloaded exact path",
-                                len(self._doc_ids), actual_max_tok,
-                            )
                     except Exception as exc:
                         logger.warning("GPU preload check failed: %s", exc)
 
@@ -560,12 +602,29 @@ class ShardSegmentManager:
             return [], [], "none", self._empty_exact_stage_stats("none")
 
         if self._gpu_corpus is not None and dev.type == "cuda":
+            rerank_topn = max(int(getattr(scfg, "gpu_corpus_rerank_topn", 0) or 0), internal_k)
             ids, scores, score_stats = self._gpu_corpus.score_candidates(
-                q, exact_candidate_ids, k=internal_k, return_stats=True,
+                q, exact_candidate_ids, k=rerank_topn, return_stats=True,
             )
             stage_stats = self._empty_exact_stage_stats("gpu_corpus")
             stage_stats.update(score_stats)
             stage_stats["num_docs_scored"] = len(exact_candidate_ids)
+
+            if self._rust_index is not None and rerank_topn > internal_k and len(ids) > internal_k:
+                q_np = q.cpu().numpy().astype(np.float32) if not isinstance(q, np.ndarray) else q.astype(np.float32)
+                with Timer(sync_cuda=True) as t_rerank:
+                    rerank_ids, rerank_scores = self._rust_index.score_candidates_exact(
+                        q_np, ids, internal_k,
+                    )
+                stage_stats["exact_ms"] += t_rerank.elapsed_ms
+                stage_stats["maxsim_ms"] += t_rerank.elapsed_ms
+                return (
+                    list(zip(rerank_ids.tolist(), rerank_scores.tolist())),
+                    exact_candidate_ids,
+                    "gpu_corpus_rerank",
+                    stage_stats,
+                )
+
             return list(zip(ids, scores)), exact_candidate_ids, "gpu_corpus", stage_stats
 
         if self._rust_index is not None:

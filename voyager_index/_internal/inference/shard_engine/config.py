@@ -105,6 +105,7 @@ class SearchConfig:
     use_colbandit: bool = False
     quantization_mode: str = ""
     variable_length_strategy: str = "bucketed"
+    gpu_corpus_rerank_topn: int = 16
 
 
 @dataclass

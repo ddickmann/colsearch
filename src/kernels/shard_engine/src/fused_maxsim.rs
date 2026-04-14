@@ -38,26 +38,32 @@ pub fn fused_maxsim_topk(
     if n_q == 0 {
         return Vec::new();
     }
+    let threads = rayon::current_num_threads().max(1);
+    let chunk_size = (candidate_ids.len() / (threads * 4)).max(32);
 
-    let scored: Vec<ScoredDoc> = candidate_ids
-        .par_iter()
-        .map_with(Vec::<f32>::new(), |doc_buf, &did| {
-            let raw = match merged.get_embeddings_f16_bytes(did) {
-                Some(r) if !r.is_empty() => r,
-                _ => return None,
-            };
-            let bytes_per_token = dim * 2;
-            let n_d = raw.len() / bytes_per_token;
-            if n_d == 0 {
-                return None;
+    let partial_topk: Vec<Vec<ScoredDoc>> = candidate_ids
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut doc_buf = Vec::<f32>::new();
+            let mut scored = Vec::with_capacity(chunk.len());
+            for &did in chunk {
+                let raw = match merged.get_embeddings_f16_bytes(did) {
+                    Some(r) if !r.is_empty() => r,
+                    _ => continue,
+                };
+                let bytes_per_token = dim * 2;
+                let n_d = raw.len() / bytes_per_token;
+                if n_d == 0 {
+                    continue;
+                }
+                let score = maxsim_f16_slice(query_f32, raw, dim, n_q, n_d, &mut doc_buf);
+                scored.push(ScoredDoc { doc_id: did, score });
             }
-            let score = maxsim_f16_slice(query_f32, raw, dim, n_q, n_d, doc_buf);
-            Some(ScoredDoc { doc_id: did, score })
+            heap_topk(scored.into_iter(), k)
         })
-        .flatten()
         .collect();
 
-    heap_topk(scored.into_iter(), k)
+    heap_topk(partial_topk.into_iter().flatten(), k)
 }
 
 /// Compute MaxSim between an f32 query and FP16 document bytes.
@@ -77,11 +83,10 @@ fn maxsim_f16_slice(
     let total_floats = n_d * dim;
     doc_f32_buf.resize(total_floats, 0.0);
     f16_bytes_to_f32(&doc_f16_bytes[..n_d * dim * 2], doc_f32_buf);
+    let query_rows = query_f32.chunks_exact(dim).take(n_q);
 
     let mut total = 0.0f32;
-    for qi in 0..n_q {
-        let q_start = qi * dim;
-        let q_row = &query_f32[q_start..q_start + dim];
+    for q_row in query_rows {
         let mut max_dot = f32::NEG_INFINITY;
 
         for dj in 0..n_d {

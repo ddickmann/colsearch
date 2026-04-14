@@ -246,12 +246,38 @@ class LemurRouter:
     # Query-time routing
     # ------------------------------------------------------------------
     @staticmethod
+    def _as_cpu_float32_tensor(value: torch.Tensor | np.ndarray) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            q = value.detach()
+            if q.device.type != "cpu":
+                q = q.cpu()
+            if q.dtype != torch.float32:
+                q = q.to(torch.float32)
+            if not q.is_contiguous():
+                q = q.contiguous()
+            return q
+
+        arr = np.asarray(value)
+        if arr.dtype != np.float32:
+            arr = arr.astype(np.float32, copy=False)
+        if not arr.flags.c_contiguous:
+            arr = np.ascontiguousarray(arr)
+        return torch.from_numpy(arr)
+
+    @staticmethod
+    def _as_numpy_float32_contiguous(value: torch.Tensor) -> np.ndarray:
+        t = value.detach()
+        if t.device.type != "cpu":
+            t = t.cpu()
+        if t.dtype != torch.float32:
+            t = t.to(torch.float32)
+        if not t.is_contiguous():
+            t = t.contiguous()
+        return t.numpy()
+
+    @staticmethod
     def _normalize_query_tokens(query_vectors: torch.Tensor | np.ndarray) -> torch.Tensor:
-        q = (
-            query_vectors.detach().cpu().to(torch.float32)
-            if isinstance(query_vectors, torch.Tensor)
-            else torch.from_numpy(np.asarray(query_vectors)).to(torch.float32)
-        )
+        q = LemurRouter._as_cpu_float32_tensor(query_vectors)
         if q.dim() == 3 and q.shape[0] == 1:
             q = q.squeeze(0)
         return q.contiguous()
@@ -306,7 +332,7 @@ class LemurRouter:
             raise RuntimeError("router is not loaded")
         q = self._normalize_query_tokens(query_vectors)
         q_counts = torch.tensor([q.shape[0]], dtype=torch.int32)
-        feats = self._lemur.compute_features((q, q_counts)).detach().cpu().to(torch.float32).contiguous()
+        feats = self._as_cpu_float32_tensor(self._lemur.compute_features((q, q_counts)))
         search_k = self._compute_search_k(k_candidates, search_k_cap)
         saved_nprobe = self._apply_nprobe_override(nprobe_override)
         try:
@@ -336,7 +362,7 @@ class LemurRouter:
         normalized = [self._normalize_query_tokens(q) for q in query_vectors]
         q_counts = torch.tensor([q.shape[0] for q in normalized], dtype=torch.int32)
         flat_queries = torch.cat(normalized, dim=0)
-        feats = self._lemur.compute_features((flat_queries, q_counts)).detach().cpu().to(torch.float32).contiguous()
+        feats = self._as_cpu_float32_tensor(self._lemur.compute_features((flat_queries, q_counts)))
         search_k = self._compute_search_k(k_candidates, search_k_cap)
         saved_nprobe = self._apply_nprobe_override(nprobe_override)
         try:
@@ -541,7 +567,7 @@ class LemurRouter:
         if self._index is None:
             raise RuntimeError("ANN index is not built")
         if self._use_faiss:
-            feats_np = feats.cpu().numpy().astype(np.float32)
+            feats_np = self._as_numpy_float32_contiguous(feats)
             if use_lock is None:
                 use_lock = self._gpu_index_active
             if use_lock:

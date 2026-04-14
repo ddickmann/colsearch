@@ -8,7 +8,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -628,6 +628,92 @@ class ShardStore:
         pinned = torch.empty_like(emb, pin_memory=True)
         pinned.copy_(emb)
         return pinned, offsets, doc_ids
+
+    def load_merged_layout(self) -> Tuple[np.ndarray, np.ndarray, int, int]:
+        """Load merged-mmap document order and token offsets."""
+        merged_path = self.root / "merged_embeddings.bin"
+        offsets_path = self.root / "merged_offsets.bin"
+        doc_map_path = self.root / "merged_doc_map.bin"
+        if not merged_path.exists():
+            raise FileNotFoundError(f"Missing merged embeddings at {merged_path}")
+        if not offsets_path.exists():
+            raise FileNotFoundError(f"Missing merged offsets at {offsets_path}")
+        if not doc_map_path.exists():
+            raise FileNotFoundError(f"Missing merged doc map at {doc_map_path}")
+
+        with open(merged_path, "rb") as f:
+            emb_header = f.read(16)
+        if len(emb_header) != 16:
+            raise ValueError("merged_embeddings.bin header is truncated")
+        total_tokens = int(np.frombuffer(emb_header[:8], dtype=np.int64)[0])
+        dim = int(np.frombuffer(emb_header[8:], dtype=np.int64)[0])
+
+        with open(offsets_path, "rb") as f:
+            offsets_header = f.read(8)
+            offsets_bytes = f.read()
+        if len(offsets_header) != 8:
+            raise ValueError("merged_offsets.bin header is truncated")
+        n_entries = int(np.frombuffer(offsets_header, dtype=np.int64)[0])
+        offsets = np.frombuffer(offsets_bytes, dtype=np.int64, count=n_entries).copy()
+
+        with open(doc_map_path, "rb") as f:
+            doc_map_header = f.read(8)
+            doc_map_bytes = f.read()
+        if len(doc_map_header) != 8:
+            raise ValueError("merged_doc_map.bin header is truncated")
+        n_docs = int(np.frombuffer(doc_map_header, dtype=np.int64)[0])
+        doc_ids = np.frombuffer(doc_map_bytes, dtype=np.uint64, count=n_docs).astype(np.int64, copy=True)
+
+        if len(offsets) != len(doc_ids) + 1:
+            raise ValueError(
+                f"merged layout mismatch: {len(doc_ids)} doc ids but {len(offsets)} offsets",
+            )
+        return doc_ids, offsets, dim, total_tokens
+
+    def iter_merged_doc_chunks(
+        self,
+        chunk_docs: int,
+    ) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]:
+        """Yield merged-mmap documents as chunked dense CPU batches.
+
+        Each yielded item is ``(doc_ids, emb_chunk, mask_chunk, chunk_max_tok, global_max_tok)``.
+        The dense chunks are bounded by *chunk_docs* so GPU preload can stream
+        without materializing the full corpus on the host.
+        """
+        merged_path = self.root / "merged_embeddings.bin"
+        doc_ids, offsets, dim, total_tokens = self.load_merged_layout()
+        lengths = offsets[1:] - offsets[:-1]
+        global_max_tok = int(lengths.max()) if lengths.size else 1
+
+        emb_mmap = np.memmap(
+            str(merged_path),
+            mode="r",
+            dtype=np.float16,
+            offset=16,
+            shape=(total_tokens, dim),
+        )
+
+        n_docs = len(doc_ids)
+        for start_idx in range(0, n_docs, max(1, int(chunk_docs))):
+            end_idx = min(start_idx + int(chunk_docs), n_docs)
+            ids_chunk = doc_ids[start_idx:end_idx]
+            starts_chunk = offsets[start_idx:end_idx]
+            ends_chunk = offsets[start_idx + 1:end_idx + 1]
+            lengths_chunk = ends_chunk - starts_chunk
+            chunk_max_tok = int(lengths_chunk.max()) if lengths_chunk.size else 1
+
+            emb_chunk = np.zeros((len(ids_chunk), chunk_max_tok, dim), dtype=np.float16)
+            mask_chunk = np.zeros((len(ids_chunk), chunk_max_tok), dtype=np.float32)
+            for row_idx, (tok_start, tok_end) in enumerate(zip(starts_chunk, ends_chunk)):
+                tok_start_i = int(tok_start)
+                tok_end_i = int(tok_end)
+                tok_len = tok_end_i - tok_start_i
+                if tok_len <= 0:
+                    continue
+                emb_chunk[row_idx, :tok_len] = emb_mmap[tok_start_i:tok_end_i]
+                mask_chunk[row_idx, :tok_len] = 1.0
+
+            yield ids_chunk, emb_chunk, mask_chunk, chunk_max_tok, global_max_tok
 
     def fetch_docs(self, doc_ids: List[int]) -> Dict[int, np.ndarray]:
         """Fetch individual documents by ID. Returns {doc_id: np.ndarray}.
