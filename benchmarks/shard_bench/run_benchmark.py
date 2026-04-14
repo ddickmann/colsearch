@@ -135,12 +135,16 @@ def search_shard_routed(
         prof.fetch_ms = 0.0
         prof.h2d_bytes = 0
 
-        with Timer(sync_cuda=True) as t_score:
-            ids, scores = gpu_corpus.score_candidates(query, candidate_ids, k=k)
-        prof.maxsim_ms = t_score.elapsed_ms
+        ids, scores, score_stats = gpu_corpus.score_candidates(
+            query, candidate_ids, k=k, return_stats=True,
+        )
+        prof.exact_ms = score_stats.get("exact_ms", 0.0)
+        prof.h2d_ms = score_stats.get("h2d_ms", 0.0)
+        prof.maxsim_ms = score_stats.get("maxsim_ms", prof.exact_ms)
+        prof.topk_ms = score_stats.get("topk_ms", 0.0)
         prof.retrieved_ids = ids
         prof.retrieved_scores = scores
-        prof.total_ms = prof.routing_ms + prof.maxsim_ms
+        prof.total_ms = prof.routing_ms + prof.exact_ms
         return prof
 
     # ---- Shard-fetch path (disk-backed, for large corpora) ----
@@ -162,14 +166,25 @@ def search_shard_routed(
             if search_cfg.use_colbandit and router_type == RouterType.LEMUR:
                 reranker = ColBanditReranker(search_cfg.colbandit)
                 ids, scores, _stats = reranker.rerank_shard_chunks(query, shard_chunks, k=k, device=dev)
+                prof.exact_ms = t_score.elapsed_ms
+                prof.maxsim_ms = t_score.elapsed_ms
             else:
-                ids, scores = score_all_docs_topk(query, shard_chunks, k=k, device=dev)
-        prof.maxsim_ms = t_score.elapsed_ms
-        prof.h2d_ms = t_score.elapsed_ms
+                ids, scores, score_stats = score_all_docs_topk(
+                    query,
+                    shard_chunks,
+                    k=k,
+                    device=dev,
+                    variable_length_strategy=search_cfg.variable_length_strategy,
+                    return_stats=True,
+                )
+                prof.exact_ms = score_stats.get("exact_ms", t_score.elapsed_ms)
+                prof.h2d_ms = score_stats.get("h2d_ms", 0.0)
+                prof.maxsim_ms = score_stats.get("maxsim_ms", t_score.elapsed_ms)
+                prof.topk_ms = score_stats.get("topk_ms", 0.0)
         prof.retrieved_ids = ids
         prof.retrieved_scores = scores
 
-    prof.total_ms = prof.routing_ms + prof.fetch_ms + prof.maxsim_ms
+    prof.total_ms = prof.routing_ms + prof.prune_ms + prof.fetch_ms + prof.exact_ms
     return prof
 
 

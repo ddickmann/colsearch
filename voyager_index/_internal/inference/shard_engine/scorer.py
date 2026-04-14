@@ -15,6 +15,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
+from .profiler import Timer
+
 logger = logging.getLogger(__name__)
 
 _maxsim_fn = None
@@ -186,7 +188,9 @@ def score_all_docs_topk(
     k: int = 10,
     device: torch.device = None,
     quantization_mode: str = "",
-) -> Tuple[List[int], List[float]]:
+    variable_length_strategy: str = "bucketed",
+    return_stats: bool = False,
+) -> Tuple[List[int], List[float]] | Tuple[List[int], List[float], dict]:
     """Score all fetched docs in one kernel call.
 
     Concatenates per-shard tensors (not per-doc slices) to avoid O(n_docs)
@@ -197,6 +201,8 @@ def score_all_docs_topk(
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
 
     maxsim = _get_maxsim()
 
@@ -222,6 +228,17 @@ def score_all_docs_topk(
                 is_uniform = False
 
     if not all_doc_ids:
+        empty_stats = {
+            "score_mode": "none",
+            "prepare_ms": 0.0,
+            "h2d_ms": 0.0,
+            "maxsim_ms": 0.0,
+            "topk_ms": 0.0,
+            "exact_ms": 0.0,
+            "n_buckets": 0,
+        }
+        if return_stats:
+            return [], [], empty_stats
         return [], []
 
     n_docs = len(all_doc_ids)
@@ -232,46 +249,139 @@ def score_all_docs_topk(
         quant_kwargs["use_quantization"] = True
         quant_kwargs["quantization_mode"] = quantization_mode
 
-    if is_uniform and tok_per_doc > 0:
-        flat = torch.cat(shard_embs, dim=0)
-        D_gpu = flat.view(n_docs, tok_per_doc, dim).to(device, dtype=torch.float16)
-        scores = maxsim(
-            queries_embeddings=q,
-            documents_embeddings=D_gpu,
-            documents_mask=None,
-            **quant_kwargs,
-        ).squeeze(0)
-    else:
-        lengths: List[int] = []
-        all_slices: List[torch.Tensor] = []
-        for flat_emb, offsets, doc_ids in shard_chunks:
-            if not doc_ids:
-                continue
-            for s, e in offsets:
-                all_slices.append(flat_emb[s:e])
-                lengths.append(e - s)
-        max_tok = max(lengths)
-        D = np.zeros((n_docs, max_tok, dim), dtype=np.float16)
-        M = np.zeros((n_docs, max_tok), dtype=np.float32)
-        for i, sl in enumerate(all_slices):
-            tok = sl.shape[0]
-            D[i, :tok] = sl.numpy()
-            M[i, :tok] = 1.0
-        D_gpu = torch.from_numpy(D).to(device)
-        M_gpu = torch.from_numpy(M).to(device)
-        scores = maxsim(
-            queries_embeddings=q,
-            documents_embeddings=D_gpu,
-            documents_mask=M_gpu,
-            **quant_kwargs,
-        ).squeeze(0)
+    sync_cuda = device.type == "cuda"
+    stats = {
+        "score_mode": "uniform" if is_uniform and tok_per_doc > 0 else variable_length_strategy,
+        "prepare_ms": 0.0,
+        "h2d_ms": 0.0,
+        "maxsim_ms": 0.0,
+        "topk_ms": 0.0,
+        "exact_ms": 0.0,
+        "n_buckets": 0,
+    }
 
-    final_k = min(k, n_docs)
-    top_sc, top_idx = scores.topk(final_k)
+    def _finalize_scores(scores: torch.Tensor, ordered_doc_ids: List[int]) -> Tuple[List[int], List[float]]:
+        final_k = min(k, len(ordered_doc_ids))
+        if final_k <= 0:
+            return [], []
+        with Timer(sync_cuda=sync_cuda) as t_topk:
+            top_sc, top_idx = scores.topk(final_k)
+        stats["topk_ms"] += t_topk.elapsed_ms
+        idx_list = top_idx.cpu().tolist()
+        return [ordered_doc_ids[i] for i in idx_list], top_sc.cpu().tolist()
 
-    idx_list = top_idx.cpu().tolist()
-    result_ids = [all_doc_ids[i] for i in idx_list]
-    result_scores = top_sc.cpu().tolist()
+    with Timer(sync_cuda=sync_cuda) as t_exact:
+        if is_uniform and tok_per_doc > 0:
+            flat = torch.cat(shard_embs, dim=0)
+            if device.type == "cuda":
+                with Timer(sync_cuda=True) as t_h2d:
+                    D_dev = flat.view(n_docs, tok_per_doc, dim).to(device, dtype=torch.float16)
+                stats["h2d_ms"] += t_h2d.elapsed_ms
+            else:
+                D_dev = flat.view(n_docs, tok_per_doc, dim).to(device, dtype=torch.float16)
+            with Timer(sync_cuda=sync_cuda) as t_maxsim:
+                scores = maxsim(
+                    queries_embeddings=q,
+                    documents_embeddings=D_dev,
+                    documents_mask=None,
+                    **quant_kwargs,
+                ).squeeze(0)
+            stats["maxsim_ms"] += t_maxsim.elapsed_ms
+            result_ids, result_scores = _finalize_scores(scores, all_doc_ids)
+        elif variable_length_strategy == "padded":
+            lengths: List[int] = []
+            all_slices: List[torch.Tensor] = []
+            for flat_emb, offsets, doc_ids in shard_chunks:
+                if not doc_ids:
+                    continue
+                for s, e in offsets:
+                    all_slices.append(flat_emb[s:e])
+                    lengths.append(e - s)
+            max_tok = max(lengths)
+            with Timer(sync_cuda=False) as t_prepare:
+                D = np.zeros((n_docs, max_tok, dim), dtype=np.float16)
+                M = np.zeros((n_docs, max_tok), dtype=np.float32)
+                for i, sl in enumerate(all_slices):
+                    tok = sl.shape[0]
+                    D[i, :tok] = sl.cpu().numpy()
+                    M[i, :tok] = 1.0
+            stats["prepare_ms"] += t_prepare.elapsed_ms
+            if device.type == "cuda":
+                with Timer(sync_cuda=True) as t_h2d:
+                    D_dev = torch.from_numpy(D).to(device)
+                    M_dev = torch.from_numpy(M).to(device)
+                stats["h2d_ms"] += t_h2d.elapsed_ms
+            else:
+                D_dev = torch.from_numpy(D).to(device)
+                M_dev = torch.from_numpy(M).to(device)
+            with Timer(sync_cuda=sync_cuda) as t_maxsim:
+                scores = maxsim(
+                    queries_embeddings=q,
+                    documents_embeddings=D_dev,
+                    documents_mask=M_dev,
+                    **quant_kwargs,
+                ).squeeze(0)
+            stats["maxsim_ms"] += t_maxsim.elapsed_ms
+            result_ids, result_scores = _finalize_scores(scores, all_doc_ids)
+        else:
+            buckets: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
+            for flat_emb, offsets, doc_ids in shard_chunks:
+                if not doc_ids:
+                    continue
+                for doc_id, (s, e) in zip(doc_ids, offsets):
+                    tok = int(e - s)
+                    bucket_key = _next_pow2(tok, 32)
+                    buckets.setdefault(bucket_key, []).append((doc_id, flat_emb[s:e]))
+
+            stats["n_buckets"] = len(buckets)
+            bucket_scores: List[torch.Tensor] = []
+            bucket_doc_ids: List[int] = []
+
+            for bucket_key in sorted(buckets):
+                entries = buckets[bucket_key]
+                with Timer(sync_cuda=False) as t_prepare:
+                    pieces = [piece for _doc_id, piece in entries]
+                    doc_ids = [doc_id for doc_id, _piece in entries]
+                    offsets: List[Tuple[int, int]] = []
+                    pos = 0
+                    for piece in pieces:
+                        tok = int(piece.shape[0])
+                        offsets.append((pos, pos + tok))
+                        pos += tok
+                    flat = torch.cat(pieces, dim=0)
+                stats["prepare_ms"] += t_prepare.elapsed_ms
+
+                if device.type == "cuda" and flat.device != device:
+                    with Timer(sync_cuda=True) as t_h2d:
+                        flat = flat.to(device, dtype=torch.float16, non_blocking=True)
+                    stats["h2d_ms"] += t_h2d.elapsed_ms
+                elif flat.device != device:
+                    flat = flat.to(device, dtype=torch.float16)
+
+                with Timer(sync_cuda=sync_cuda) as t_prepare:
+                    doc_emb, doc_mask = _pad_flat_embeddings(flat, offsets, device)
+                stats["prepare_ms"] += t_prepare.elapsed_ms
+
+                with Timer(sync_cuda=sync_cuda) as t_maxsim:
+                    scores = maxsim(
+                        queries_embeddings=q,
+                        documents_embeddings=doc_emb,
+                        documents_mask=None if doc_mask.shape[1] and bool(doc_mask[:, -1].all().item()) else doc_mask,
+                        **quant_kwargs,
+                    ).squeeze(0)
+                stats["maxsim_ms"] += t_maxsim.elapsed_ms
+                bucket_scores.append(scores)
+                bucket_doc_ids.extend(doc_ids)
+
+            if bucket_scores:
+                scores = torch.cat(bucket_scores, dim=0)
+                result_ids, result_scores = _finalize_scores(scores, bucket_doc_ids)
+            else:
+                result_ids, result_scores = [], []
+
+    stats["exact_ms"] = t_exact.elapsed_ms
+    if return_stats:
+        return result_ids, result_scores, stats
     return result_ids, result_scores
 
 
@@ -337,7 +447,8 @@ class PreloadedGpuCorpus:
         query: torch.Tensor,
         candidate_doc_ids: List[int],
         k: int = 10,
-    ) -> Tuple[List[int], List[float]]:
+        return_stats: bool = False,
+    ) -> Tuple[List[int], List[float]] | Tuple[List[int], List[float], dict]:
         maxsim = _get_maxsim()
         q = query.to(self._device, dtype=torch.float16)
         if q.dim() == 2:
@@ -345,6 +456,17 @@ class PreloadedGpuCorpus:
 
         valid_ids = [did for did in candidate_doc_ids if did in self.doc_id_to_idx]
         if not valid_ids:
+            empty_stats = {
+                "score_mode": "gpu_corpus",
+                "prepare_ms": 0.0,
+                "h2d_ms": 0.0,
+                "maxsim_ms": 0.0,
+                "topk_ms": 0.0,
+                "exact_ms": 0.0,
+                "n_buckets": 0,
+            }
+            if return_stats:
+                return [], [], empty_stats
             return [], []
 
         indices = torch.tensor(
@@ -353,27 +475,47 @@ class PreloadedGpuCorpus:
             device=self._device,
         )
 
-        D_slice = self.D[indices]
-        M_slice = self.M[indices]
+        stats = {
+            "score_mode": "gpu_corpus",
+            "prepare_ms": 0.0,
+            "h2d_ms": 0.0,
+            "maxsim_ms": 0.0,
+            "topk_ms": 0.0,
+            "exact_ms": 0.0,
+            "n_buckets": 1,
+        }
 
-        has_padding = (M_slice[:, -1] == 0).any()
-        if has_padding:
-            actual_max = int(M_slice.sum(dim=1).max().item())
-            D_slice = D_slice[:, :actual_max].contiguous()
-            M_slice = M_slice[:, :actual_max].contiguous()
+        with Timer(sync_cuda=True) as t_exact:
+            with Timer(sync_cuda=True) as t_prepare:
+                D_slice = self.D[indices]
+                M_slice = self.M[indices]
+                has_padding = (M_slice[:, -1] == 0).any()
+                if has_padding:
+                    actual_max = int(M_slice.sum(dim=1).max().item())
+                    D_slice = D_slice[:, :actual_max].contiguous()
+                    M_slice = M_slice[:, :actual_max].contiguous()
+            stats["prepare_ms"] += t_prepare.elapsed_ms
 
-        scores = maxsim(
-            queries_embeddings=q,
-            documents_embeddings=D_slice,
-            documents_mask=M_slice if has_padding else None,
-        ).squeeze(0)
+            with Timer(sync_cuda=True) as t_maxsim:
+                scores = maxsim(
+                    queries_embeddings=q,
+                    documents_embeddings=D_slice,
+                    documents_mask=M_slice if has_padding else None,
+                ).squeeze(0)
+            stats["maxsim_ms"] = t_maxsim.elapsed_ms
 
-        n = len(valid_ids)
-        final_k = min(k, n)
-        top_sc, top_idx = scores.topk(final_k)
+            n = len(valid_ids)
+            final_k = min(k, n)
+            with Timer(sync_cuda=True) as t_topk:
+                top_sc, top_idx = scores.topk(final_k)
+            stats["topk_ms"] = t_topk.elapsed_ms
 
+        stats["exact_ms"] = t_exact.elapsed_ms
         idx_list = top_idx.cpu().tolist()
-        return [valid_ids[i] for i in idx_list], top_sc.cpu().tolist()
+        result = ([valid_ids[i] for i in idx_list], top_sc.cpu().tolist())
+        if return_stats:
+            return result[0], result[1], stats
+        return result
 
     @staticmethod
     def fits_on_gpu(n_docs: int, max_tok: int, dim: int, dtype=torch.float16) -> bool:
@@ -490,12 +632,12 @@ def score_roq4_topk(
 # Per-shard scoring (legacy, kept for backward compat)
 # ------------------------------------------------------------------
 
-def _pad_shard_on_device(
+def _pad_flat_embeddings(
     flat_emb: torch.Tensor,
     offsets: List[Tuple[int, int]],
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pad a single shard's docs on GPU. Uses vectorized scatter for variable lengths."""
+    """Pad a flat doc list already resident on *device*."""
     if not offsets:
         dim = flat_emb.shape[1]
         return (
@@ -508,9 +650,6 @@ def _pad_shard_on_device(
     max_tok = max(lengths)
     min_tok = min(lengths)
     dim = flat_emb.shape[1]
-
-    if flat_emb.device != device:
-        flat_emb = flat_emb.to(device, non_blocking=True)
 
     if min_tok == max_tok:
         padded = flat_emb[: n_docs * max_tok].view(n_docs, max_tok, dim)
@@ -531,6 +670,17 @@ def _pad_shard_on_device(
     mask[doc_indices, token_positions] = 1.0
 
     return padded, mask
+
+
+def _pad_shard_on_device(
+    flat_emb: torch.Tensor,
+    offsets: List[Tuple[int, int]],
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pad a single shard's docs on GPU. Uses vectorized scatter for variable lengths."""
+    if flat_emb.device != device:
+        flat_emb = flat_emb.to(device, non_blocking=True)
+    return _pad_flat_embeddings(flat_emb, offsets, device)
 
 
 def score_shards_and_topk(

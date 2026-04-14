@@ -148,6 +148,7 @@ class LemurRouter:
         self._tombstones: set[int] = set()
         self._weights = torch.empty((0, 0), dtype=torch.float32)
         self._use_faiss = FAISS_AVAILABLE and ann_backend.startswith("faiss")
+        self._gpu_index_active = False
         self._gpu_res = None
         self._gpu_res_lock = __import__("threading").Lock()
         self._search_lock = __import__("threading").Lock()
@@ -244,32 +245,38 @@ class LemurRouter:
     # ------------------------------------------------------------------
     # Query-time routing
     # ------------------------------------------------------------------
-    def route(
-        self,
-        query_vectors: torch.Tensor,
-        k_candidates: int = 2000,
-        prefetch_doc_cap: int = 10000,
-        nprobe_override: Optional[int] = None,
-    ) -> CandidatePlan:
-        if self._lemur is None or self._index is None:
-            raise RuntimeError("router is not loaded")
-        q = query_vectors.detach().cpu().to(torch.float32)
-        q_counts = torch.tensor([q.shape[0]], dtype=torch.int32)
-        feats = self._lemur.compute_features((q, q_counts)).detach().cpu().to(torch.float32).contiguous()
+    @staticmethod
+    def _normalize_query_tokens(query_vectors: torch.Tensor | np.ndarray) -> torch.Tensor:
+        q = (
+            query_vectors.detach().cpu().to(torch.float32)
+            if isinstance(query_vectors, torch.Tensor)
+            else torch.from_numpy(np.asarray(query_vectors)).to(torch.float32)
+        )
+        if q.dim() == 3 and q.shape[0] == 1:
+            q = q.squeeze(0)
+        return q.contiguous()
+
+    def _compute_search_k(self, k_candidates: int, search_k_cap: Optional[int]) -> int:
         tombstone_headroom = max(64, int(len(self._tombstones) * 1.5))
         index_size = self._weights.shape[0] if self._weights is not None else k_candidates
         search_k = min(k_candidates + tombstone_headroom, index_size)
-        search_k = min(search_k, 2048)
-        saved_nprobe = self._apply_nprobe_override(nprobe_override)
-        try:
-            _, row_ids = self._search(feats, max(search_k, 1))
-        finally:
-            self._restore_nprobe(saved_nprobe)
+        if search_k_cap is not None:
+            search_k = min(search_k, int(search_k_cap))
+        if self._gpu_index_active:
+            search_k = min(search_k, 2048)
+        return max(search_k, 1)
+
+    def _candidate_plan_from_rows(
+        self,
+        row_ids: Sequence[int],
+        prefetch_doc_cap: int,
+    ) -> CandidatePlan:
         doc_ids: List[int] = []
-        for row in row_ids[0].tolist() if row_ids.size else []:
+        for row in row_ids:
+            row = int(row)
             if row < 0 or row >= len(self._row_to_doc_id):
                 continue
-            doc_id = self._row_to_doc_id[int(row)]
+            doc_id = self._row_to_doc_id[row]
             if doc_id in self._tombstones:
                 continue
             doc_ids.append(doc_id)
@@ -286,6 +293,65 @@ class LemurRouter:
             generation=self._state.generation,
             post_tombstone_count=len(doc_ids),
         )
+
+    def route(
+        self,
+        query_vectors: torch.Tensor,
+        k_candidates: int = 2000,
+        prefetch_doc_cap: int = 10000,
+        nprobe_override: Optional[int] = None,
+        search_k_cap: Optional[int] = 2048,
+    ) -> CandidatePlan:
+        if self._lemur is None or self._index is None:
+            raise RuntimeError("router is not loaded")
+        q = self._normalize_query_tokens(query_vectors)
+        q_counts = torch.tensor([q.shape[0]], dtype=torch.int32)
+        feats = self._lemur.compute_features((q, q_counts)).detach().cpu().to(torch.float32).contiguous()
+        search_k = self._compute_search_k(k_candidates, search_k_cap)
+        saved_nprobe = self._apply_nprobe_override(nprobe_override)
+        try:
+            _, row_ids = self._search(
+                feats,
+                search_k,
+                use_lock=self._gpu_index_active or saved_nprobe is not None,
+            )
+        finally:
+            self._restore_nprobe(saved_nprobe)
+        rows = row_ids[0].tolist() if row_ids.size else []
+        return self._candidate_plan_from_rows(rows, prefetch_doc_cap)
+
+    def route_batch(
+        self,
+        query_vectors: Sequence[torch.Tensor | np.ndarray],
+        k_candidates: int = 2000,
+        prefetch_doc_cap: int = 10000,
+        nprobe_override: Optional[int] = None,
+        search_k_cap: Optional[int] = 2048,
+    ) -> List[CandidatePlan]:
+        if self._lemur is None or self._index is None:
+            raise RuntimeError("router is not loaded")
+        if not query_vectors:
+            return []
+
+        normalized = [self._normalize_query_tokens(q) for q in query_vectors]
+        q_counts = torch.tensor([q.shape[0] for q in normalized], dtype=torch.int32)
+        flat_queries = torch.cat(normalized, dim=0)
+        feats = self._lemur.compute_features((flat_queries, q_counts)).detach().cpu().to(torch.float32).contiguous()
+        search_k = self._compute_search_k(k_candidates, search_k_cap)
+        saved_nprobe = self._apply_nprobe_override(nprobe_override)
+        try:
+            _, row_ids = self._search(
+                feats,
+                search_k,
+                use_lock=self._gpu_index_active or saved_nprobe is not None,
+            )
+        finally:
+            self._restore_nprobe(saved_nprobe)
+
+        return [
+            self._candidate_plan_from_rows(rows.tolist(), prefetch_doc_cap)
+            for rows in row_ids
+        ]
 
     # ------------------------------------------------------------------
     # Persistence / retraining state
@@ -349,6 +415,7 @@ class LemurRouter:
         self._doc_id_to_shard = {int(k): int(v) for k, v in maps["doc_id_to_shard"].items()}
         self._tombstones = {int(x) for x in maps.get("tombstones", [])}
         self._lemur = self._new_lemur_backend(load_saved=True)
+        self._gpu_index_active = False
         if self._use_faiss and (self.index_dir / "ann.index").exists():
             cpu_index = faiss.read_index(str(self.index_dir / "ann.index"))
             self._set_nprobe_if_ivf(cpu_index)
@@ -361,6 +428,7 @@ class LemurRouter:
                 try:
                     res = self._get_gpu_resources()
                     self._index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+                    self._gpu_index_active = True
                     logger.info("ANN index loaded to GPU (faiss-gpu)")
                 except Exception:
                     self._index = cpu_index
@@ -422,6 +490,7 @@ class LemurRouter:
 
     def _rebuild_ann(self) -> None:
         old_index = self._index
+        self._gpu_index_active = False
         if self._weights.ndim != 2 or self._weights.shape[0] == 0:
             self._index = _TorchMipsIndex(device=self.device)
             del old_index
@@ -452,6 +521,7 @@ class LemurRouter:
                 try:
                     res = self._get_gpu_resources()
                     id_index = faiss.index_cpu_to_gpu(res, 0, id_index)
+                    self._gpu_index_active = True
                     logger.info("ANN index moved to GPU (faiss-gpu)")
                 except Exception as e:
                     logger.warning("faiss-gpu transfer failed, using CPU: %s", e)
@@ -462,13 +532,22 @@ class LemurRouter:
             self._index = idx
         del old_index
 
-    def _search(self, feats: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray]:
+    def _search(
+        self,
+        feats: torch.Tensor,
+        k: int,
+        use_lock: Optional[bool] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self._index is None:
             raise RuntimeError("ANN index is not built")
         if self._use_faiss:
             feats_np = feats.cpu().numpy().astype(np.float32)
-            with self._search_lock:
-                return self._index.search(feats_np, k)
+            if use_lock is None:
+                use_lock = self._gpu_index_active
+            if use_lock:
+                with self._search_lock:
+                    return self._index.search(feats_np, k)
+            return self._index.search(feats_np, k)
         return self._index.search(feats, k)
 
     def _mark_dirty(self, changed_ops: int, changed_shards: Iterable[int]) -> None:

@@ -52,6 +52,7 @@ class LemurConfig:
     ann_backend: AnnBackend = AnnBackend.FAISS_FLAT_IP
     epochs: int = 10
     k_candidates: int = 2000
+    search_k_cap: int | None = 2048
     nprobe: int = 10
     retrain_every_ops: int = 50_000
     retrain_every_hours: int = 24
@@ -100,8 +101,10 @@ class SearchConfig:
     pinned_buffer_max_tokens: int = 50_000
     batch_size: int = 1
     k_candidates: int = 2000
+    lemur_search_k_cap: int | None = 2048
     use_colbandit: bool = False
     quantization_mode: str = ""
+    variable_length_strategy: str = "bucketed"
 
 
 @dataclass

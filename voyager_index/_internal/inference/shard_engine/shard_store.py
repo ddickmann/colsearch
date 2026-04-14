@@ -508,31 +508,64 @@ class ShardStore:
         selected: List[Tuple[int, "DocMeta"]],
         device: str,
     ) -> Tuple[torch.Tensor, List[Tuple[int, int]], List[int]]:
-        pieces: List[torch.Tensor] = []
-        offsets: List[Tuple[int, int]] = []
-        out_ids: List[int] = []
-        pos = 0
+        ordered = [
+            (idx, int(doc_id), dm)
+            for idx, (doc_id, dm) in enumerate(selected)
+        ]
+        sorted_selected = sorted(ordered, key=lambda item: (item[2].local_offset_start, item[2].local_offset_end))
+        runs: List[List[Tuple[int, int, "DocMeta"]]] = []
+        current_run: List[Tuple[int, int, "DocMeta"]] = []
+        current_end = -1
+
+        for item in sorted_selected:
+            _idx, _doc_id, dm = item
+            if not current_run or dm.local_offset_start > current_end:
+                if current_run:
+                    runs.append(current_run)
+                current_run = [item]
+            else:
+                current_run.append(item)
+            current_end = max(current_end, int(dm.local_offset_end))
+        if current_run:
+            runs.append(current_run)
+
+        ordered_pieces: Dict[int, torch.Tensor] = {}
 
         with _st_safe_open(str(shard_path), framework="pt", device="cpu") as f:
             emb_slice = f.get_slice("embeddings")
             scales_slice = f.get_slice("scales") if is_int8 else None
 
-            for doc_id, dm in selected:
-                s, e = dm.local_offset_start, dm.local_offset_end
+            for run in runs:
+                run_start = int(run[0][2].local_offset_start)
+                run_end = int(max(item[2].local_offset_end for item in run))
                 if is_int8 and scales_slice is not None:
-                    raw = emb_slice[s:e].float()
-                    sc = scales_slice[s:e].unsqueeze(-1)
-                    piece = (raw * sc).to(torch.float16)
+                    raw_run = emb_slice[run_start:run_end].float()
+                    scale_run = scales_slice[run_start:run_end].unsqueeze(-1)
+                    run_piece = (raw_run * scale_run).to(torch.float16)
                 else:
-                    piece = emb_slice[s:e].to(torch.float16)
-                pieces.append(piece)
-                offsets.append((pos, pos + piece.shape[0]))
-                out_ids.append(doc_id)
-                pos += piece.shape[0]
+                    run_piece = emb_slice[run_start:run_end].to(torch.float16)
 
-        if not pieces:
+                for idx, _doc_id, dm in run:
+                    rel_start = int(dm.local_offset_start - run_start)
+                    rel_end = int(dm.local_offset_end - run_start)
+                    ordered_pieces[idx] = run_piece[rel_start:rel_end]
+
+        if not ordered_pieces:
             dim = self.manifest.dim if self.manifest else 128
             return torch.empty((0, dim), dtype=torch.float16), [], []
+
+        pieces: List[torch.Tensor] = []
+        offsets: List[Tuple[int, int]] = []
+        out_ids: List[int] = []
+        pos = 0
+        for idx, (doc_id, _dm) in enumerate(selected):
+            piece = ordered_pieces.get(idx)
+            if piece is None:
+                continue
+            pieces.append(piece)
+            offsets.append((pos, pos + piece.shape[0]))
+            out_ids.append(int(doc_id))
+            pos += int(piece.shape[0])
 
         merged = torch.cat(pieces, dim=0)
         if device != "cpu":

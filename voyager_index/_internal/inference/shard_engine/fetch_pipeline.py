@@ -36,8 +36,20 @@ class PinnedBufferPool:
         self.max_tokens = max_tokens
         self.dim = dim
         self._pool: queue.Queue[torch.Tensor] = queue.Queue()
+        use_pinned = torch.cuda.is_available()
         for _ in range(n_buffers):
-            buf = torch.empty(max_tokens, dim, dtype=torch.float16, pin_memory=True)
+            if use_pinned:
+                try:
+                    buf = torch.empty(max_tokens, dim, dtype=torch.float16, pin_memory=True)
+                except RuntimeError as exc:
+                    logger.warning(
+                        "Pinned host allocation unavailable, using pageable buffers: %s",
+                        exc,
+                    )
+                    use_pinned = False
+                    buf = torch.empty(max_tokens, dim, dtype=torch.float16)
+            else:
+                buf = torch.empty(max_tokens, dim, dtype=torch.float16)
             self._pool.put(buf)
 
     def get(self) -> torch.Tensor:
@@ -94,16 +106,34 @@ class FetchPipeline:
             chunks: list of (flat_emb, offsets, doc_ids)
             stats:  dict with fetch_ms, h2d_bytes, num_shards, num_docs
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         chunks: List[ShardChunk] = []
         total_docs = 0
         total_bytes = 0
 
+        def _load_one(shard_id: int) -> Optional[ShardChunk]:
+            emb, offsets, dids = self.store.load_shard(shard_id, device="cpu")
+            return (emb, offsets, dids)
+
+        n_workers = min(8, len(shard_ids)) if shard_ids else 1
+
         with Timer() as t_fetch:
-            for sid in shard_ids:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                future_to_idx = {
+                    pool.submit(_load_one, sid): i
+                    for i, sid in enumerate(shard_ids)
+                }
+                results_by_idx: Dict[int, ShardChunk] = {}
+                for future in as_completed(future_to_idx):
+                    results_by_idx[future_to_idx[future]] = future.result()
+
+            for i in range(len(shard_ids)):
+                if i not in results_by_idx:
+                    continue
+                emb, offsets, dids = results_by_idx[i]
                 if max_docs and total_docs >= max_docs:
                     break
-
-                emb, offsets, dids = self.store.load_shard(sid, device="cpu")
 
                 if max_docs and total_docs + len(dids) > max_docs:
                     n_take = max_docs - total_docs

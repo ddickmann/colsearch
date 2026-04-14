@@ -12,9 +12,10 @@ Four isolated experiments run in sequence, sharing the same loaded index:
          Tells you the maximum gain available by eliminating routing cost.
 
   Exp-3  Exact-Shape Microbench
-         Calls score_all_docs_topk() directly with uniform lengths (fast
-         path) vs variable lengths (current slow path), same token budget.
-         Tells you whether the np.zeros pad path is a major penalty.
+         Calls score_all_docs_topk() directly with uniform lengths, the
+         legacy padded fallback, and the current bucketed fallback under
+         the same token budget.
+         Tells you whether bucketing removes the old variable-length penalty.
 
   Exp-4  Cache and Residency Upper-Bound
          Measures cold vs warm shard fetch, and candidate-cache replay.
@@ -152,14 +153,9 @@ def build_manager(n_centroid_approx: int = 0) -> ShardSegmentManager:
 # Shared search primitive that returns stage breakdowns
 # ---------------------------------------------------------------------------
 
-def timed_search(mgr: ShardSegmentManager, q: np.ndarray) -> Tuple[List[int], float, float, float]:
-    """Returns (result_ids, route_ms, exact_ms, total_ms)."""
-    t_total_start = time.perf_counter()
-    trace = mgr.inspect_query_pipeline(q, k=K)
-    total_ms = (time.perf_counter() - t_total_start) * 1000.0
-    route_ms = float(trace["route_ms"])
-    exact_ms = total_ms - route_ms
-    return trace["result_ids"], route_ms, exact_ms, total_ms
+def timed_search(mgr: ShardSegmentManager, q: np.ndarray) -> dict:
+    """Return the full per-stage trace for one query."""
+    return mgr.inspect_query_pipeline(q, k=K)
 
 
 def serial_eval(
@@ -168,23 +164,35 @@ def serial_eval(
     gts: List[List[int]],
     label: str,
 ) -> dict:
-    all_results  = []
+    all_results = []
     route_ms_arr = []
+    prune_ms_arr = []
+    fetch_ms_arr = []
     exact_ms_arr = []
+    maxsim_ms_arr = []
+    topk_ms_arr = []
     total_ms_arr = []
     for q in queries[:N_WARMUP]:
         mgr.inspect_query_pipeline(q, k=K)
-    for q, gt in zip(queries[:N_EVAL], gts[:N_EVAL]):
-        result_ids, r_ms, e_ms, t_ms = timed_search(mgr, q)
-        all_results.append(result_ids)
-        route_ms_arr.append(r_ms)
-        exact_ms_arr.append(e_ms)
-        total_ms_arr.append(t_ms)
+    for q, _gt in zip(queries[:N_EVAL], gts[:N_EVAL]):
+        trace = timed_search(mgr, q)
+        all_results.append(trace["result_ids"])
+        route_ms_arr.append(float(trace["route_ms"]))
+        prune_ms_arr.append(float(trace.get("prune_ms", 0.0)))
+        fetch_ms_arr.append(float(trace.get("fetch_ms", 0.0)))
+        exact_ms_arr.append(float(trace.get("exact_ms", 0.0)))
+        maxsim_ms_arr.append(float(trace.get("maxsim_ms", 0.0)))
+        topk_ms_arr.append(float(trace.get("topk_ms", 0.0)))
+        total_ms_arr.append(float(trace.get("total_ms", 0.0)))
 
     recall = recall_at_k(all_results, gts[:N_EVAL], K)
     total_arr = np.array(total_ms_arr)
     route_arr = np.array(route_ms_arr)
+    prune_arr = np.array(prune_ms_arr)
+    fetch_arr = np.array(fetch_ms_arr)
     exact_arr = np.array(exact_ms_arr)
+    maxsim_arr = np.array(maxsim_ms_arr)
+    topk_arr = np.array(topk_ms_arr)
     qps = N_EVAL / (total_arr.sum() / 1000.0)
     return {
         "label": label,
@@ -193,8 +201,14 @@ def serial_eval(
         "p50_ms":  round(float(np.percentile(total_arr, 50)), 2),
         "p95_ms":  round(float(np.percentile(total_arr, 95)), 2),
         "route_p50_ms": round(float(np.percentile(route_arr, 50)), 2),
+        "prune_p50_ms": round(float(np.percentile(prune_arr, 50)), 2),
+        "fetch_p50_ms": round(float(np.percentile(fetch_arr, 50)), 2),
         "exact_p50_ms": round(float(np.percentile(exact_arr, 50)), 2),
+        "maxsim_p50_ms": round(float(np.percentile(maxsim_arr, 50)), 2),
+        "topk_p50_ms": round(float(np.percentile(topk_arr, 50)), 2),
         "route_frac":   round(float(np.mean(route_arr) / np.mean(total_arr)), 3),
+        "prune_frac":   round(float(np.mean(prune_arr) / np.mean(total_arr)), 3),
+        "fetch_frac":   round(float(np.mean(fetch_arr) / np.mean(total_arr)), 3),
         "exact_frac":   round(float(np.mean(exact_arr) / np.mean(total_arr)), 3),
     }
 
@@ -212,11 +226,12 @@ def exp1_phase_and_concurrency(
     # Single-threaded breakdown first
     baseline = serial_eval(mgr, queries, gts, "serial_baseline")
     log.info(
-        "Serial  recall=%.4f  QPS=%.1f  p50=%.1fms  route_p50=%.1fms  exact_p50=%.1fms  "
-        "route_frac=%.2f  exact_frac=%.2f",
+        "Serial  recall=%.4f  QPS=%.1f  p50=%.1fms  route=%.1fms  prune=%.1fms  "
+        "fetch=%.1fms  exact=%.1fms  maxsim=%.1fms  topk=%.1fms",
         baseline["recall@10"], baseline["qps"], baseline["p50_ms"],
-        baseline["route_p50_ms"], baseline["exact_p50_ms"],
-        baseline["route_frac"], baseline["exact_frac"],
+        baseline["route_p50_ms"], baseline["prune_p50_ms"],
+        baseline["fetch_p50_ms"], baseline["exact_p50_ms"],
+        baseline["maxsim_p50_ms"], baseline["topk_p50_ms"],
     )
 
     # Concurrency sweep
@@ -224,6 +239,11 @@ def exp1_phase_and_concurrency(
     for n_workers in WORKER_COUNTS:
         latencies: List[float] = []
         results_list: List[List[int]] = [[] for _ in range(N_EVAL)]
+        route_ms: List[float] = []
+        prune_ms: List[float] = []
+        fetch_ms: List[float] = []
+        exact_ms: List[float] = []
+        maxsim_ms: List[float] = []
 
         # Warmup
         for q in queries[:N_WARMUP]:
@@ -243,10 +263,20 @@ def exp1_phase_and_concurrency(
                 trace = future.result()
                 results_list[i] = trace["result_ids"]
                 latencies.append((t_end - t_query_start[future]) * 1000.0)
+                route_ms.append(float(trace["route_ms"]))
+                prune_ms.append(float(trace.get("prune_ms", 0.0)))
+                fetch_ms.append(float(trace.get("fetch_ms", 0.0)))
+                exact_ms.append(float(trace.get("exact_ms", 0.0)))
+                maxsim_ms.append(float(trace.get("maxsim_ms", 0.0)))
         wall_elapsed = time.perf_counter() - wall_start
 
         throughput = N_EVAL / wall_elapsed
         lat_arr = np.array(latencies)
+        route_arr = np.array(route_ms)
+        prune_arr = np.array(prune_ms)
+        fetch_arr = np.array(fetch_ms)
+        exact_arr = np.array(exact_ms)
+        maxsim_arr = np.array(maxsim_ms)
         r = recall_at_k(results_list, gts[:N_EVAL], K)
         row = {
             "n_workers": n_workers,
@@ -255,12 +285,21 @@ def exp1_phase_and_concurrency(
             "p50_ms": round(float(np.percentile(lat_arr, 50)), 2),
             "p95_ms": round(float(np.percentile(lat_arr, 95)), 2),
             "p99_ms": round(float(np.percentile(lat_arr, 99)), 2),
+            "route_p50_ms": round(float(np.percentile(route_arr, 50)), 2),
+            "prune_p50_ms": round(float(np.percentile(prune_arr, 50)), 2),
+            "fetch_p50_ms": round(float(np.percentile(fetch_arr, 50)), 2),
+            "exact_p50_ms": round(float(np.percentile(exact_arr, 50)), 2),
+            "maxsim_p50_ms": round(float(np.percentile(maxsim_arr, 50)), 2),
         }
         concurrency_results.append(row)
         log.info(
-            "  Workers=%2d  recall=%.4f  QPS=%6.1f  p50=%6.1fms  p95=%6.1fms",
+            "  Workers=%2d  recall=%.4f  QPS=%6.1f  p50=%6.1fms  route=%5.1f  prune=%5.1f  fetch=%5.1f  exact=%5.1f",
             n_workers, r, throughput,
-            float(np.percentile(lat_arr, 50)), float(np.percentile(lat_arr, 95)),
+            float(np.percentile(lat_arr, 50)),
+            float(np.percentile(route_arr, 50)),
+            float(np.percentile(prune_arr, 50)),
+            float(np.percentile(fetch_arr, 50)),
+            float(np.percentile(exact_arr, 50)),
         )
 
     return {"baseline": baseline, "concurrency": concurrency_results}
@@ -286,12 +325,10 @@ def exp2_frozen_candidate_oracle(
     full_total_ms: List[float] = []
 
     for q in queries[:N_EVAL]:
-        t0 = time.perf_counter()
         trace = mgr.inspect_query_pipeline(q, k=K)
-        total_ms = (time.perf_counter() - t0) * 1000.0
         frozen_candidates.append(trace["exact_candidate_ids"])
         full_route_ms.append(float(trace["route_ms"]))
-        full_total_ms.append(total_ms)
+        full_total_ms.append(float(trace.get("total_ms", 0.0)))
 
     full_route_arr = np.array(full_route_ms)
     full_total_arr = np.array(full_total_ms)
@@ -412,7 +449,12 @@ def exp3_exact_shape_microbench(
     # Warmup
     for _ in range(n_warmup):
         score_all_docs_topk(q, uniform_chunks, k=10, device=dev)
-        score_all_docs_topk(q, variable_chunks, k=10, device=dev)
+        score_all_docs_topk(
+            q, variable_chunks, k=10, device=dev, variable_length_strategy="padded",
+        )
+        score_all_docs_topk(
+            q, variable_chunks, k=10, device=dev, variable_length_strategy="bucketed",
+        )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -423,28 +465,46 @@ def exp3_exact_shape_microbench(
             score_all_docs_topk(q, uniform_chunks, k=10, device=dev)
         uni_times.append(t.elapsed_ms)
 
-    # Variable timing
-    var_times = []
+    # Legacy padded timing
+    padded_times = []
     for _ in range(n_reps):
         with Timer(sync_cuda=True) as t:
-            score_all_docs_topk(q, variable_chunks, k=10, device=dev)
-        var_times.append(t.elapsed_ms)
+            score_all_docs_topk(
+                q, variable_chunks, k=10, device=dev, variable_length_strategy="padded",
+            )
+        padded_times.append(t.elapsed_ms)
+
+    # Current bucketed timing
+    bucketed_times = []
+    for _ in range(n_reps):
+        with Timer(sync_cuda=True) as t:
+            score_all_docs_topk(
+                q, variable_chunks, k=10, device=dev, variable_length_strategy="bucketed",
+            )
+        bucketed_times.append(t.elapsed_ms)
 
     uni_arr = np.array(uni_times)
-    var_arr = np.array(var_times)
-    speedup = float(np.mean(var_arr)) / max(float(np.mean(uni_arr)), 0.01)
+    padded_arr = np.array(padded_times)
+    bucketed_arr = np.array(bucketed_times)
+    padded_over_bucketed = float(np.mean(padded_arr)) / max(float(np.mean(bucketed_arr)), 0.01)
+    bucketed_over_uniform = float(np.mean(bucketed_arr)) / max(float(np.mean(uni_arr)), 0.01)
 
     log.info(
         "Uniform  path: mean=%.2fms  p50=%.2fms  p95=%.2fms  (is_uniform=True, no pad)",
         np.mean(uni_arr), np.percentile(uni_arr, 50), np.percentile(uni_arr, 95),
     )
     log.info(
-        "Variable path: mean=%.2fms  p50=%.2fms  p95=%.2fms  (np.zeros pad path)",
-        np.mean(var_arr), np.percentile(var_arr, 50), np.percentile(var_arr, 95),
+        "Padded   path: mean=%.2fms  p50=%.2fms  p95=%.2fms  (legacy NumPy pad fallback)",
+        np.mean(padded_arr), np.percentile(padded_arr, 50), np.percentile(padded_arr, 95),
     )
     log.info(
-        "Variable/Uniform ratio = %.2fx  (>1 means variable-length penalty is real)",
-        speedup,
+        "Bucketed path: mean=%.2fms  p50=%.2fms  p95=%.2fms  (current packed fallback)",
+        np.mean(bucketed_arr), np.percentile(bucketed_arr, 50), np.percentile(bucketed_arr, 95),
+    )
+    log.info(
+        "Padded/Bucketed ratio = %.2fx  Bucketed/Uniform ratio = %.2fx",
+        padded_over_bucketed,
+        bucketed_over_uniform,
     )
 
     return {
@@ -455,11 +515,15 @@ def exp3_exact_shape_microbench(
         "uniform_mean_ms":  round(float(np.mean(uni_arr)),  2),
         "uniform_p50_ms":   round(float(np.percentile(uni_arr, 50)), 2),
         "uniform_p95_ms":   round(float(np.percentile(uni_arr, 95)), 2),
-        "variable_mean_ms": round(float(np.mean(var_arr)),  2),
-        "variable_p50_ms":  round(float(np.percentile(var_arr, 50)), 2),
-        "variable_p95_ms":  round(float(np.percentile(var_arr, 95)), 2),
-        "variable_over_uniform_ratio": round(speedup, 2),
-        "passes_threshold": speedup >= 1.25,
+        "padded_mean_ms":   round(float(np.mean(padded_arr)),  2),
+        "padded_p50_ms":    round(float(np.percentile(padded_arr, 50)), 2),
+        "padded_p95_ms":    round(float(np.percentile(padded_arr, 95)), 2),
+        "bucketed_mean_ms": round(float(np.mean(bucketed_arr)),  2),
+        "bucketed_p50_ms":  round(float(np.percentile(bucketed_arr, 50)), 2),
+        "bucketed_p95_ms":  round(float(np.percentile(bucketed_arr, 95)), 2),
+        "padded_over_bucketed_ratio": round(padded_over_bucketed, 2),
+        "bucketed_over_uniform_ratio": round(bucketed_over_uniform, 2),
+        "passes_threshold": padded_over_bucketed >= 1.25,
     }
 
 
@@ -508,8 +572,12 @@ def exp4_cache_residency(
 
     pipeline = mgr._pipeline
     if pipeline is None:
-        log.warning("No FetchPipeline available — skipping Exp 4.")
-        return {"skipped": True, "reason": "no_pipeline"}
+        pipeline = FetchPipeline(
+            store=store,
+            mode=mgr._config.transfer_mode,
+            pinned_pool=None,
+            device=DEVICE,
+        )
 
     # Step A: collect routed shard groups for each query (no scoring)
     for q in queries[:N_WARMUP]:
@@ -645,15 +713,18 @@ def rank_and_recommend(
         })
 
     # --- Variable-length exact path (from Exp 3) ---
-    if "variable_over_uniform_ratio" in exp3:
-        var_ratio = exp3["variable_over_uniform_ratio"]
+    if "padded_over_bucketed_ratio" in exp3:
+        var_ratio = exp3["padded_over_bucketed_ratio"]
         est_p50_reduction = 1.0 - 1.0 / max(var_ratio, 1e-6)
         opportunities.append({
             "name": "Fix variable-length exact-scoring path (pack/bucket tokens)",
             "expected_speedup": round(var_ratio, 2),
             "expected_p50_reduction": round(est_p50_reduction, 2),
             "passes": var_ratio >= THRESHOLD_QPS_RATIO or est_p50_reduction >= THRESHOLD_P50_REDUCE,
-            "evidence": f"variable/uniform score_all_docs_topk ratio={var_ratio:.2f}x",
+            "evidence": (
+                f"padded/bucketed score_all_docs_topk ratio={var_ratio:.2f}x; "
+                f"bucketed/uniform={exp3.get('bucketed_over_uniform_ratio', 0.0):.2f}x"
+            ),
             "implementation": "Use uniform token-length shards (already built with `uniform_shard_tokens=True`) or add bucket-pad in scorer.py to force is_uniform fast path",
         })
 
@@ -661,14 +732,13 @@ def rank_and_recommend(
     if "warm_over_cache_ratio" in exp4:
         residency_gain = exp4["warm_over_cache_ratio"]
         warm_p50 = exp4["warm_fetch_p50_ms"]
-        total_p50 = baseline_p50
-        fetch_frac = warm_p50 / max(total_p50, 1.0)
+        fetch_frac = float(exp1.get("baseline", {}).get("fetch_frac", 0.0))
         max_end2end_gain = fetch_frac * (1.0 - 1.0 / max(residency_gain, 1e-6))
         opportunities.append({
             "name": "Reduce fetch overhead (hotset cache / partial residency)",
             "expected_speedup": round(1.0 / max(1.0 - max_end2end_gain, 0.1), 2),
             "expected_p50_reduction": round(max_end2end_gain, 2),
-            "passes": max_end2end_gain >= THRESHOLD_P50_REDUCE or residency_gain >= THRESHOLD_QPS_RATIO,
+            "passes": max_end2end_gain >= THRESHOLD_P50_REDUCE,
             "evidence": (
                 f"warm_fetch_p50={warm_p50:.1f}ms  cold/warm ratio={exp4['cold_over_warm_ratio']:.1f}x  "
                 f"warm/cache_floor={residency_gain:.1f}x  fetch_frac_of_total={fetch_frac:.0%}"

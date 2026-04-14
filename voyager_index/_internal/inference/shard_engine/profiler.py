@@ -15,7 +15,9 @@ import torch
 @dataclass
 class QueryProfile:
     routing_ms: float = 0.0
+    prune_ms: float = 0.0
     fetch_ms: float = 0.0
+    exact_ms: float = 0.0
     h2d_ms: float = 0.0
     maxsim_ms: float = 0.0
     topk_ms: float = 0.0
@@ -36,7 +38,7 @@ def aggregate_profiles(profiles: List[QueryProfile]) -> dict:
         return {}
 
     fields = [
-        "routing_ms", "fetch_ms", "h2d_ms", "maxsim_ms",
+        "routing_ms", "prune_ms", "fetch_ms", "exact_ms", "h2d_ms", "maxsim_ms",
         "topk_ms", "total_ms", "h2d_bytes",
         "num_shards_fetched", "num_docs_scored", "num_tokens_scored",
     ]

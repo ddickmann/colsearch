@@ -46,7 +46,7 @@ from .config import (
     TransferMode,
 )
 from .fetch_pipeline import FetchPipeline, PinnedBufferPool
-from .lemur_router import LemurRouter
+from .lemur_router import CandidatePlan, LemurRouter
 from .memtable import MemTable
 from .profiler import QueryProfile, Timer
 from .scorer import (
@@ -80,6 +80,8 @@ class ShardEngineConfig:
         ann_backend: AnnBackend = AnnBackend.FAISS_FLAT_IP,
         lemur_epochs: int = 10,
         k_candidates: int = 2000,
+        max_docs_exact: int = 10_000,
+        lemur_search_k_cap: int | None = 2048,
         n_full_scores: int = 4096,
         transfer_mode: TransferMode = TransferMode.PINNED,
         pinned_pool_buffers: int = 3,
@@ -87,8 +89,10 @@ class ShardEngineConfig:
         use_colbandit: bool = False,
         uniform_shard_tokens: bool = True,
         quantization_mode: str = "",
+        variable_length_strategy: str = "bucketed",
         n_centroids: int = 1024,
-        n_centroid_approx: int = 512,
+        n_centroid_approx: int = 0,
+        router_device: str | None = "cpu",
         seed: int = 42,
     ):
         self.n_shards = n_shards
@@ -99,6 +103,8 @@ class ShardEngineConfig:
         self.ann_backend = ann_backend
         self.lemur_epochs = lemur_epochs
         self.k_candidates = k_candidates
+        self.max_docs_exact = max_docs_exact
+        self.lemur_search_k_cap = lemur_search_k_cap
         self.n_full_scores = n_full_scores
         self.transfer_mode = transfer_mode
         self.pinned_pool_buffers = pinned_pool_buffers
@@ -106,8 +112,10 @@ class ShardEngineConfig:
         self.use_colbandit = use_colbandit
         self.uniform_shard_tokens = uniform_shard_tokens
         self.quantization_mode = quantization_mode
+        self.variable_length_strategy = variable_length_strategy
         self.n_centroids = n_centroids
         self.n_centroid_approx = n_centroid_approx
+        self.router_device = router_device
         self.seed = seed
 
     def to_build_config(self, corpus_size: int) -> BuildConfig:
@@ -123,15 +131,19 @@ class ShardEngineConfig:
         )
         cfg.lemur = LemurConfig(
             enabled=self.router_type == RouterType.LEMUR,
+            device=self.router_device or "cuda",
             ann_backend=self.ann_backend,
             epochs=self.lemur_epochs,
             k_candidates=self.k_candidates,
+            search_k_cap=self.lemur_search_k_cap,
         )
         return cfg
 
     def to_search_config(self) -> SearchConfig:
         return SearchConfig(
             k_candidates=self.k_candidates,
+            max_docs_exact=self.max_docs_exact,
+            lemur_search_k_cap=self.lemur_search_k_cap,
             n_full_scores=self.n_full_scores,
             n_centroid_approx=self.n_centroid_approx,
             transfer_mode=self.transfer_mode,
@@ -139,6 +151,7 @@ class ShardEngineConfig:
             pinned_buffer_max_tokens=self.pinned_buffer_max_tokens,
             use_colbandit=self.use_colbandit,
             quantization_mode=self.quantization_mode,
+            variable_length_strategy=self.variable_length_strategy,
         )
 
 
@@ -158,6 +171,7 @@ class ShardSegmentManager:
         self._path = Path(path)
         self._config = config or ShardEngineConfig()
         self._device = device
+        self._router_device = self._config.router_device or "cpu"
         self._lock = threading.RLock()
 
         self._store: Optional[ShardStore] = None
@@ -236,7 +250,7 @@ class ShardSegmentManager:
             router = LemurRouter(
                 index_dir=lemur_dir,
                 ann_backend=cfg.ann_backend.value,
-                device=self._device,
+                device=self._router_device,
             )
             doc_vecs_f16 = torch.from_numpy(all_vecs).to(torch.float16)
             doc_counts_t = torch.from_numpy(doc_counts)
@@ -359,7 +373,7 @@ class ShardSegmentManager:
             self._router = LemurRouter(
                 index_dir=lemur_dir,
                 ann_backend=self._config.ann_backend.value,
-                device=self._device,
+                device=self._router_device,
             )
             self._router.load()
 
@@ -414,13 +428,13 @@ class ShardSegmentManager:
                             )
                             logger.info(
                                 "Skipping GPU preload (%d docs, max_tok=%d) — "
-                                "CPU staging would require ~%.1f GB; using Rust mmap fetch path",
+                                        "CPU staging would require ~%.1f GB; using non-preloaded exact path",
                                 len(self._doc_ids), actual_max_tok, stage_gb,
                             )
                         else:
                             logger.info(
                                 "Corpus too large for GPU preload (%d docs, max_tok=%d) — "
-                                "using Rust mmap fetch path",
+                                        "using non-preloaded exact path",
                                 len(self._doc_ids), actual_max_tok,
                             )
                     except Exception as exc:
@@ -433,7 +447,11 @@ class ShardSegmentManager:
                 self._try_gpu_preload()
                 if self._gpu_corpus is None:
                     self._doc_vecs = None
-            if self._rust_index is None or self._gpu_corpus is not None:
+            if (
+                self._rust_index is None
+                or self._gpu_corpus is not None
+                or str(self._device).startswith("cuda")
+            ):
                 self._init_pipeline()
             logger.info("Shard index loaded: %d docs from %s",
                         len(self._doc_ids), self._path)
@@ -441,6 +459,280 @@ class ShardSegmentManager:
     # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------
+
+    def _resolve_scoring_device(self) -> torch.device:
+        if str(self._device).startswith("cuda") and torch.cuda.is_available():
+            return torch.device(self._device)
+        return torch.device("cpu")
+
+    @staticmethod
+    def _route_prefetch_cap(scfg: SearchConfig) -> int:
+        return max(
+            1,
+            int(scfg.max_docs_exact),
+            int(scfg.k_candidates),
+            int(scfg.n_full_scores),
+            int(scfg.n_centroid_approx),
+        )
+
+    def _group_candidate_ids_by_shard(self, candidate_ids: List[int]) -> Dict[int, List[int]]:
+        if self._store is None:
+            return {}
+        by_shard: Dict[int, List[int]] = {}
+        for did in candidate_ids:
+            try:
+                shard_id = int(self._store.doc_shard_id(int(did)))
+            except KeyError:
+                continue
+            by_shard.setdefault(shard_id, []).append(int(did))
+        return by_shard
+
+    @staticmethod
+    def _empty_exact_stage_stats(exact_path: str = "none") -> Dict[str, Any]:
+        return {
+            "exact_path": exact_path,
+            "fetch_ms": 0.0,
+            "exact_ms": 0.0,
+            "prepare_ms": 0.0,
+            "h2d_ms": 0.0,
+            "maxsim_ms": 0.0,
+            "topk_ms": 0.0,
+            "h2d_bytes": 0,
+            "num_shards_fetched": 0,
+            "num_docs_scored": 0,
+        }
+
+    def _prune_routed_candidates(
+        self,
+        q: torch.Tensor,
+        routed: CandidatePlan,
+        scfg: SearchConfig,
+        dev: torch.device,
+    ) -> Tuple[List[int], Dict[int, List[int]], str]:
+        if (
+            self._rust_index is not None
+            and scfg.n_centroid_approx > 0
+            and len(routed.doc_ids) > scfg.n_centroid_approx
+        ):
+            q_np = q.cpu().numpy().astype(np.float32)
+            approx_ids, _approx_scores = self._rust_index.score_candidates_approx(
+                q_np, routed.doc_ids, scfg.n_centroid_approx,
+            )
+            pruned_ids = approx_ids.tolist()
+            pruned_set = set(pruned_ids)
+            routed_by_shard = {
+                sid: [d for d in dids if d in pruned_set]
+                for sid, dids in routed.by_shard.items()
+            }
+            routed_by_shard = {sid: dids for sid, dids in routed_by_shard.items() if dids}
+            return pruned_ids, routed_by_shard, "centroid_approx"
+
+        if self._doc_means is not None and self._doc_mean_id_to_idx is not None:
+            pruned_ids = proxy_score_candidates(
+                query=q,
+                doc_means=self._doc_means,
+                candidate_doc_ids=routed.doc_ids,
+                doc_id_to_idx=self._doc_mean_id_to_idx,
+                n_full_scores=scfg.n_full_scores,
+                device=dev,
+            )
+            pruned_set = set(pruned_ids)
+            routed_by_shard = {
+                sid: [d for d in dids if d in pruned_set]
+                for sid, dids in routed.by_shard.items()
+            }
+            routed_by_shard = {sid: dids for sid, dids in routed_by_shard.items() if dids}
+            return pruned_ids, routed_by_shard, "doc_mean_proxy"
+
+        return routed.doc_ids, routed.by_shard, "none"
+
+    def _score_sealed_candidates(
+        self,
+        q: torch.Tensor,
+        candidate_ids: List[int],
+        docs_by_shard: Dict[int, List[int]],
+        internal_k: int,
+        scfg: SearchConfig,
+        dev: torch.device,
+    ) -> Tuple[List[Tuple[int, float]], List[int], str, Dict[str, Any]]:
+        exact_candidate_ids = candidate_ids[:scfg.max_docs_exact]
+        if not exact_candidate_ids:
+            return [], [], "none", self._empty_exact_stage_stats("none")
+
+        if self._gpu_corpus is not None and dev.type == "cuda":
+            ids, scores, score_stats = self._gpu_corpus.score_candidates(
+                q, exact_candidate_ids, k=internal_k, return_stats=True,
+            )
+            stage_stats = self._empty_exact_stage_stats("gpu_corpus")
+            stage_stats.update(score_stats)
+            stage_stats["num_docs_scored"] = len(exact_candidate_ids)
+            return list(zip(ids, scores)), exact_candidate_ids, "gpu_corpus", stage_stats
+
+        if self._rust_index is not None:
+            q_np = q.cpu().numpy().astype(np.float32) if not isinstance(q, np.ndarray) else q.astype(np.float32)
+            try:
+                with Timer(sync_cuda=dev.type == "cuda") as t_exact:
+                    top_ids, top_scores = self._rust_index.score_candidates_exact(
+                        q_np, exact_candidate_ids, internal_k,
+                    )
+                exact_path = "rust_fused_exact" if dev.type == "cpu" else "rust_fused_exact_no_preload"
+                stage_stats = self._empty_exact_stage_stats(exact_path)
+                stage_stats["exact_ms"] = t_exact.elapsed_ms
+                stage_stats["maxsim_ms"] = t_exact.elapsed_ms
+                stage_stats["num_docs_scored"] = len(exact_candidate_ids)
+                return (
+                    list(zip(top_ids.tolist(), top_scores.tolist())),
+                    exact_candidate_ids,
+                    exact_path,
+                    stage_stats,
+                )
+            except (AttributeError, RuntimeError):
+                if self._pipeline is not None and dev.type == "cuda":
+                    shard_groups = docs_by_shard or self._group_candidate_ids_by_shard(exact_candidate_ids)
+                    shard_chunks, fetch_stats = self._pipeline.fetch_candidate_docs(
+                        shard_groups, max_docs=scfg.max_docs_exact,
+                    )
+                    if shard_chunks:
+                        ids, scores, score_stats = score_all_docs_topk(
+                            q, shard_chunks, k=internal_k, device=dev,
+                            quantization_mode=scfg.quantization_mode,
+                            variable_length_strategy=scfg.variable_length_strategy,
+                            return_stats=True,
+                        )
+                        stage_stats = self._empty_exact_stage_stats("cuda_pipeline_fetch_fallback")
+                        stage_stats.update(score_stats)
+                        stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
+                        stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
+                        stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
+                        stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", len(exact_candidate_ids))
+                        return list(zip(ids, scores)), exact_candidate_ids, "cuda_pipeline_fetch_fallback", stage_stats
+                    stage_stats = self._empty_exact_stage_stats("cuda_pipeline_fetch_fallback")
+                    stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
+                    stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
+                    stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
+                    stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", 0)
+                    return [], exact_candidate_ids, "cuda_pipeline_fetch_fallback", stage_stats
+
+                with Timer(sync_cuda=False) as t_fetch:
+                    raw_bytes, offsets_arr, doc_ids_arr = self._rust_index.fetch_candidate_embeddings(
+                        exact_candidate_ids,
+                    )
+                if len(doc_ids_arr) > 0:
+                    emb_f16 = np.frombuffer(np.array(raw_bytes, copy=False), dtype=np.float16).reshape(-1, self._dim)
+                    emb_t = torch.from_numpy(emb_f16)
+                    offsets_list = [
+                        (int(offsets_arr[i, 0]), int(offsets_arr[i, 1]))
+                        for i in range(len(doc_ids_arr))
+                    ]
+                    doc_ids_list = doc_ids_arr.tolist()
+                    shard_chunks = [(emb_t, offsets_list, doc_ids_list)]
+                    ids, scores, score_stats = score_all_docs_topk(
+                        q, shard_chunks, k=internal_k, device=dev,
+                        quantization_mode=scfg.quantization_mode,
+                        variable_length_strategy=scfg.variable_length_strategy,
+                        return_stats=True,
+                    )
+                    stage_stats = self._empty_exact_stage_stats("rust_fetch_torch_fallback")
+                    stage_stats.update(score_stats)
+                    stage_stats["fetch_ms"] = t_fetch.elapsed_ms
+                    stage_stats["h2d_bytes"] = len(raw_bytes)
+                    stage_stats["num_shards_fetched"] = 1
+                    stage_stats["num_docs_scored"] = len(doc_ids_list)
+                    return list(zip(ids, scores)), exact_candidate_ids, "rust_fetch_torch_fallback", stage_stats
+                stage_stats = self._empty_exact_stage_stats("rust_fetch_torch_fallback")
+                stage_stats["fetch_ms"] = t_fetch.elapsed_ms
+                stage_stats["num_shards_fetched"] = 1
+                return [], exact_candidate_ids, "rust_fetch_torch_fallback", stage_stats
+
+        if self._pipeline is not None:
+            shard_groups = docs_by_shard or self._group_candidate_ids_by_shard(exact_candidate_ids)
+            shard_chunks, fetch_stats = self._pipeline.fetch_candidate_docs(
+                shard_groups, max_docs=scfg.max_docs_exact,
+            )
+            if shard_chunks:
+                ids, scores, score_stats = score_all_docs_topk(
+                    q, shard_chunks, k=internal_k, device=dev,
+                    quantization_mode=scfg.quantization_mode,
+                    variable_length_strategy=scfg.variable_length_strategy,
+                    return_stats=True,
+                )
+                stage_stats = self._empty_exact_stage_stats("pipeline_fetch")
+                stage_stats.update(score_stats)
+                stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
+                stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
+                stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
+                stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", len(exact_candidate_ids))
+                return list(zip(ids, scores)), exact_candidate_ids, "pipeline_fetch", stage_stats
+            stage_stats = self._empty_exact_stage_stats("pipeline_fetch")
+            stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
+            stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
+            stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
+            stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", 0)
+            return [], exact_candidate_ids, "pipeline_fetch", stage_stats
+        return [], exact_candidate_ids, "none", self._empty_exact_stage_stats("none")
+
+    def inspect_query_pipeline(
+        self,
+        query_vectors: np.ndarray,
+        k: int = 10,
+        n_probes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if not self._is_built:
+            raise RuntimeError("Index not built or loaded")
+
+        self._ensure_warmup()
+        q = (
+            torch.from_numpy(query_vectors).float()
+            if isinstance(query_vectors, np.ndarray)
+            else query_vectors.float()
+        )
+        dev = self._resolve_scoring_device()
+        scfg = self._config.to_search_config()
+        internal_k = k
+        n_sealed = len(self._doc_ids) if self._doc_ids else 0
+        effective_k = min(scfg.k_candidates, max(n_sealed, 1))
+
+        with Timer(sync_cuda=True) as t_total:
+            with Timer(sync_cuda=True) as t_route:
+                routed = self._router.route(
+                    q,
+                    k_candidates=effective_k,
+                    prefetch_doc_cap=self._route_prefetch_cap(scfg),
+                    nprobe_override=n_probes,
+                    search_k_cap=scfg.lemur_search_k_cap,
+                )
+
+            with Timer(sync_cuda=dev.type == "cuda") as t_prune:
+                pruned_ids, routed_by_shard, prune_path = self._prune_routed_candidates(
+                    q, routed, scfg, dev,
+                )
+            sealed_results, exact_candidate_ids, exact_path, exact_stats = self._score_sealed_candidates(
+                q, pruned_ids, routed_by_shard, internal_k, scfg, dev,
+            )
+
+        result_ids = [int(doc_id) for doc_id, _score in sealed_results[:k]]
+        return {
+            "route_ms": t_route.elapsed_ms,
+            "prune_ms": t_prune.elapsed_ms,
+            "fetch_ms": exact_stats["fetch_ms"],
+            "exact_ms": exact_stats["exact_ms"],
+            "exact_prepare_ms": exact_stats["prepare_ms"],
+            "h2d_ms": exact_stats["h2d_ms"],
+            "maxsim_ms": exact_stats["maxsim_ms"],
+            "topk_ms": exact_stats["topk_ms"],
+            "total_ms": t_total.elapsed_ms,
+            "h2d_bytes": exact_stats["h2d_bytes"],
+            "num_shards_fetched": exact_stats["num_shards_fetched"],
+            "num_docs_scored": exact_stats["num_docs_scored"],
+            "router_device": self._router_device,
+            "exact_device": str(dev),
+            "prune_path": prune_path,
+            "exact_path": exact_path,
+            "routed_ids": [int(did) for did in routed.doc_ids],
+            "pruned_ids": [int(did) for did in pruned_ids],
+            "exact_candidate_ids": [int(did) for did in exact_candidate_ids],
+            "result_ids": result_ids,
+        }
 
     def search_multivector(
         self,
@@ -470,7 +762,7 @@ class ShardSegmentManager:
         self._ensure_warmup()
 
         q = torch.from_numpy(query_vectors).float() if isinstance(query_vectors, np.ndarray) else query_vectors.float()
-        dev = torch.device(self._device if torch.cuda.is_available() else "cpu")
+        dev = self._resolve_scoring_device()
 
         scfg = self._config.to_search_config()
         n_sealed = len(self._doc_ids) if self._doc_ids else 0
@@ -489,102 +781,18 @@ class ShardSegmentManager:
             routed = self._router.route(
                 q,
                 k_candidates=effective_k,
-                prefetch_doc_cap=scfg.max_docs_exact,
+                prefetch_doc_cap=self._route_prefetch_cap(scfg),
                 nprobe_override=n_probes,
+                search_k_cap=scfg.lemur_search_k_cap,
             )
 
-        # --- Stage 1: Centroid-code approximate MaxSim (Rust + Rayon) ---
-        if (
-            self._rust_index is not None
-            and scfg.n_centroid_approx > 0
-            and len(routed.doc_ids) > scfg.n_centroid_approx
-        ):
-            q_np = q.cpu().numpy().astype(np.float32)
-            approx_ids, _approx_scores = self._rust_index.score_candidates_approx(
-                q_np, routed.doc_ids, scfg.n_centroid_approx,
+        with Timer(sync_cuda=dev.type == "cuda") as t_prune:
+            pruned_ids, routed_by_shard, _prune_path = self._prune_routed_candidates(
+                q, routed, scfg, dev,
             )
-            pruned_ids = approx_ids.tolist()
-            pruned_set = set(pruned_ids)
-            routed_by_shard = {
-                sid: [d for d in dids if d in pruned_set]
-                for sid, dids in routed.by_shard.items()
-            }
-            routed_by_shard = {sid: dids for sid, dids in routed_by_shard.items() if dids}
-        elif self._doc_means is not None and self._doc_mean_id_to_idx is not None:
-            pruned_ids = proxy_score_candidates(
-                query=q,
-                doc_means=self._doc_means,
-                candidate_doc_ids=routed.doc_ids,
-                doc_id_to_idx=self._doc_mean_id_to_idx,
-                n_full_scores=scfg.n_full_scores,
-                device=dev,
-            )
-            pruned_set = set(pruned_ids)
-            routed_by_shard = {
-                sid: [d for d in dids if d in pruned_set]
-                for sid, dids in routed.by_shard.items()
-            }
-            routed_by_shard = {sid: dids for sid, dids in routed_by_shard.items() if dids}
-        else:
-            pruned_ids = routed.doc_ids
-            routed_by_shard = routed.by_shard
-
-        sealed_results: List[Tuple[int, float]] = []
-        use_rust_fused = self._rust_index is not None and str(dev) == "cpu"
-
-        if self._gpu_corpus is not None and not use_rust_fused:
-            candidate_ids = pruned_ids[:scfg.max_docs_exact]
-            ids, scores = self._gpu_corpus.score_candidates(q, candidate_ids, k=internal_k)
-            sealed_results = list(zip(ids, scores))
-        elif self._rust_index is not None and use_rust_fused:
-            candidate_ids = pruned_ids[:scfg.max_docs_exact]
-            q_np = q.cpu().numpy().astype(np.float32) if not isinstance(q, np.ndarray) else q.astype(np.float32)
-            try:
-                top_ids, top_scores = self._rust_index.score_candidates_exact(
-                    q_np, candidate_ids, internal_k,
-                )
-                sealed_results = list(zip(top_ids.tolist(), top_scores.tolist()))
-            except (AttributeError, RuntimeError):
-                raw_bytes, offsets_arr, doc_ids_arr = self._rust_index.fetch_candidate_embeddings(
-                    candidate_ids,
-                )
-                if len(doc_ids_arr) > 0:
-                    emb_f16 = np.frombuffer(np.array(raw_bytes, copy=False), dtype=np.float16).reshape(-1, self._dim)
-                    emb_t = torch.from_numpy(emb_f16)
-                    offsets_list = [(int(offsets_arr[i, 0]), int(offsets_arr[i, 1])) for i in range(len(doc_ids_arr))]
-                    doc_ids_list = doc_ids_arr.tolist()
-                    shard_chunks = [(emb_t, offsets_list, doc_ids_list)]
-                    ids, scores = score_all_docs_topk(
-                        q, shard_chunks, k=internal_k, device=dev,
-                        quantization_mode=scfg.quantization_mode,
-                    )
-                    sealed_results = list(zip(ids, scores))
-        elif self._rust_index is not None:
-            candidate_ids = pruned_ids[:scfg.max_docs_exact]
-            raw_bytes, offsets_arr, doc_ids_arr = self._rust_index.fetch_candidate_embeddings(
-                candidate_ids,
-            )
-            if len(doc_ids_arr) > 0:
-                emb_f16 = np.frombuffer(np.array(raw_bytes, copy=False), dtype=np.float16).reshape(-1, self._dim)
-                emb_t = torch.from_numpy(emb_f16)
-                offsets_list = [(int(offsets_arr[i, 0]), int(offsets_arr[i, 1])) for i in range(len(doc_ids_arr))]
-                doc_ids_list = doc_ids_arr.tolist()
-                shard_chunks = [(emb_t, offsets_list, doc_ids_list)]
-                ids, scores = score_all_docs_topk(
-                    q, shard_chunks, k=internal_k, device=dev,
-                    quantization_mode=scfg.quantization_mode,
-                )
-                sealed_results = list(zip(ids, scores))
-        else:
-            shard_chunks, _stats = self._pipeline.fetch_candidate_docs(
-                routed_by_shard, max_docs=scfg.max_docs_exact,
-            )
-            if shard_chunks:
-                ids, scores = score_all_docs_topk(
-                    q, shard_chunks, k=internal_k, device=dev,
-                    quantization_mode=scfg.quantization_mode,
-                )
-                sealed_results = list(zip(ids, scores))
+        sealed_results, exact_candidate_ids, _exact_path, exact_stats = self._score_sealed_candidates(
+            q, pruned_ids, routed_by_shard, internal_k, scfg, dev,
+        )
 
         memtable_results: List[Tuple[int, float]] = []
         if self._memtable and self._memtable.size > 0:
@@ -593,32 +801,43 @@ class ShardSegmentManager:
                 k=internal_k,
             )
 
-        merged: Dict[int, float] = {}
-        for did, sc in sealed_results:
-            if did not in tombstones:
+        with Timer(sync_cuda=False) as t_postprocess:
+            merged: Dict[int, float] = {}
+            for did, sc in sealed_results:
+                if did not in tombstones:
+                    merged[did] = max(merged.get(did, float("-inf")), sc)
+            for did, sc in memtable_results:
                 merged[did] = max(merged.get(did, float("-inf")), sc)
-        for did, sc in memtable_results:
-            merged[did] = max(merged.get(did, float("-inf")), sc)
 
-        ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+            ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)
 
-        if filters:
-            filtered = []
-            for did, sc in ranked:
-                payload = dict(sealed_payloads_snap.get(did, {}))
-                if did in mt_payloads_snap:
-                    payload.update(mt_payloads_snap[did])
-                if self._evaluate_filter(payload, filters):
-                    filtered.append((did, sc))
-            ranked = filtered
+            if filters:
+                filtered = []
+                for did, sc in ranked:
+                    payload = dict(sealed_payloads_snap.get(did, {}))
+                    if did in mt_payloads_snap:
+                        payload.update(mt_payloads_snap[did])
+                    if self._evaluate_filter(payload, filters):
+                        filtered.append((did, sc))
+                ranked = filtered
 
-        result = ranked[:k]
+            result = ranked[:k]
 
         elapsed_us = (time.perf_counter() - t_start) * 1_000_000
         self._emit_metric("search_latency_us", elapsed_us)
         self._emit_metric("candidates_routed", len(routed.doc_ids))
-        self._emit_metric("candidates_scored", len(pruned_ids))
+        self._emit_metric("candidates_scored", len(exact_candidate_ids))
         self._emit_metric("route_ms", t_route.elapsed_ms)
+        self._emit_metric("prune_ms", t_prune.elapsed_ms)
+        self._emit_metric("fetch_ms", exact_stats["fetch_ms"])
+        self._emit_metric("exact_ms", exact_stats["exact_ms"])
+        self._emit_metric("exact_prepare_ms", exact_stats["prepare_ms"])
+        self._emit_metric("h2d_ms", exact_stats["h2d_ms"])
+        self._emit_metric("h2d_bytes", exact_stats["h2d_bytes"])
+        self._emit_metric("num_shards_fetched", exact_stats["num_shards_fetched"])
+        self._emit_metric("maxsim_ms", exact_stats["maxsim_ms"])
+        self._emit_metric("topk_ms", exact_stats["topk_ms"])
+        self._emit_metric("postprocess_ms", t_postprocess.elapsed_ms)
 
         now = time.perf_counter()
         if (
@@ -641,10 +860,75 @@ class ShardSegmentManager:
         queries: List[np.ndarray],
         k: int = 10,
         filters: Optional[Dict] = None,
+        max_workers: int = 1,
+        n_probes: Optional[int] = None,
         **kwargs,
     ) -> List[List[Tuple[int, float]]]:
         """Batch search over multiple queries."""
-        return [self.search_multivector(q, k=k, filters=filters) for q in queries]
+        if not queries:
+            return []
+        if filters:
+            return [self.search_multivector(q, k=k, filters=filters, n_probes=n_probes, **kwargs) for q in queries]
+        if not self._is_built:
+            raise RuntimeError("Index not built or loaded")
+
+        self._ensure_warmup()
+        dev = self._resolve_scoring_device()
+        scfg = self._config.to_search_config()
+        n_sealed = len(self._doc_ids) if self._doc_ids else 0
+        effective_k = min(scfg.k_candidates, max(n_sealed, 1))
+        query_tensors = [
+            torch.from_numpy(q).float() if isinstance(q, np.ndarray) else q.float()
+            for q in queries
+        ]
+
+        with self._lock:
+            if self._memtable:
+                _mt_docs_snap, _mt_payloads_snap, tombstones = self._memtable.snapshot()
+            else:
+                tombstones = set()
+
+        routed_plans = self._router.route_batch(
+            query_tensors,
+            k_candidates=effective_k,
+            prefetch_doc_cap=self._route_prefetch_cap(scfg),
+            nprobe_override=n_probes,
+            search_k_cap=scfg.lemur_search_k_cap,
+        )
+
+        def _finish_one(item: Tuple[int, torch.Tensor, CandidatePlan]) -> Tuple[int, List[Tuple[int, float]]]:
+            idx, q, routed = item
+            pruned_ids, routed_by_shard, _prune_path = self._prune_routed_candidates(
+                q, routed, scfg, dev,
+            )
+            sealed_results, _exact_candidate_ids, _exact_path, _exact_stats = self._score_sealed_candidates(
+                q, pruned_ids, routed_by_shard, k, scfg, dev,
+            )
+            merged: Dict[int, float] = {}
+            for did, sc in sealed_results:
+                if did not in tombstones:
+                    merged[did] = max(merged.get(did, float("-inf")), sc)
+            if self._memtable and self._memtable.size > 0:
+                query_np = (
+                    queries[idx]
+                    if isinstance(queries[idx], np.ndarray)
+                    else queries[idx].detach().cpu().numpy()
+                )
+                for did, sc in self._memtable.search(query_np, k=k):
+                    merged[did] = max(merged.get(did, float("-inf")), sc)
+            ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+            return idx, ranked[:k]
+
+        work_items = list(zip(range(len(query_tensors)), query_tensors, routed_plans))
+        if max_workers <= 1:
+            ordered = [_finish_one(item) for item in work_items]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(work_items))) as pool:
+                ordered = list(pool.map(_finish_one, work_items))
+        ordered.sort(key=lambda pair: pair[0])
+        return [result for _idx, result in ordered]
 
     def search(
         self,
