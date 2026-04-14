@@ -8,6 +8,10 @@ repo first.
 If you want the advanced, full-surface follow-up after this beginner path, use
 `docs/full_feature_cookbook.md`.
 
+If you want the fastest production-oriented CPU/GPU setup, worker guidance, and
+base64-first API examples, also read
+`docs/guides/max-performance-reference-api.md`.
+
 If you prefer to run the advanced flow as a logged example with a JSON report,
 use `examples/reference_api_feature_tour.py`.
 
@@ -63,8 +67,14 @@ By default the reference service:
 
 - binds to `127.0.0.1`
 - stores collections under `VOYAGER_INDEX_PATH` or `/data/voyager-index`
-- runs with `WORKERS=1`
+- auto-selects multiple local workers on multi-core hosts
 - exposes `/health`, `/ready`, and `/metrics`
+
+For a single-host production deployment, prefer:
+
+```bash
+HOST=0.0.0.0 WORKERS=4 voyager-index-server
+```
 
 ## 3. Run The Happy-Path Example
 
@@ -95,6 +105,10 @@ Insert points:
 
 `POST /collections/{name}/points` is also the delta-ingestion path: sending the
 same IDs again replaces or upserts those points.
+
+JSON float arrays remain supported, but base64 transport is the preferred
+default for new clients. Use `voyager_index.encode_vector_payload(...)` to build
+those request bodies.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/collections/tutorial-dense/points \
@@ -128,6 +142,20 @@ curl -X POST http://127.0.0.1:8080/collections/tutorial-dense/search \
   }'
 ```
 
+Hybrid mode defaults to standard fusion, and you can opt into solver refinement
+when `latence_solver` is installed:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/tutorial-dense/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [1, 0, 0, 0],
+    "query_text": "invoice",
+    "dense_hybrid_mode": "tabu",
+    "top_k": 2
+  }'
+```
+
 ## 5. Late-Interaction Collection
 
 Create and query a multivector text collection with precomputed embeddings:
@@ -137,6 +165,9 @@ curl -X POST http://127.0.0.1:8080/collections/tutorial-li \
   -H "Content-Type: application/json" \
   -d '{"dimension": 4, "kind": "late_interaction"}'
 ```
+
+The same route also accepts a base64 matrix payload in `vectors`, which is the
+recommended transport once query tensors get large.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/collections/tutorial-li/points \

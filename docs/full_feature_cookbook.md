@@ -13,6 +13,10 @@ The cookbook is intentionally honest about three different kinds of features:
 
 If you want the short first-run path, start with `docs/reference_api_tutorial.md`.
 
+If you want the fastest CPU/GPU deployment path, base64-first request examples,
+and shard-specific production tuning, also read
+`docs/guides/max-performance-reference-api.md`.
+
 If you want an executable companion to this cookbook, run:
 
 ```bash
@@ -30,10 +34,12 @@ with the results, skips, and boundary checks.
 | Dense vector search | reference HTTP API | runnable |
 | BM25-only sparse search | reference HTTP API | runnable |
 | Dense + BM25 hybrid search | reference HTTP API | runnable |
+| Dense hybrid mode selection (`rrf`, `tabu`) | reference HTTP API | runnable |
 | Dense optimized refinement with `latence_solver` | reference HTTP API + optional native package | runnable when installed |
 | Stateless `/reference/optimize` solver API | reference HTTP API + optional native package | runnable when installed |
 | Late-interaction retrieval | reference HTTP API | runnable |
 | Multimodal retrieval | reference HTTP API | runnable |
+| Shard collection routing + ColBANDIT + quantized scoring | reference HTTP API | runnable |
 | Multimodal `strategy="optimized"` screening | reference HTTP API | runnable, with backend selection limits explained |
 | Health, readiness, metrics, persistence | reference HTTP API | runnable |
 | Multimodal precision profiles (`INT8`, `FP8`, `RoQ`) | OSS guidance + library / validation surface | documented with boundaries |
@@ -83,7 +89,7 @@ Publishing wheels or a PyPI package can be added later without changing the HTTP
 ## Step 1. Start The Reference Service
 
 ```bash
-voyager-index-server
+HOST=0.0.0.0 WORKERS=4 voyager-index-server
 ```
 
 Then open the interactive API docs:
@@ -107,6 +113,9 @@ What these endpoints are for:
 - `/ready`: degraded-state reporting, including collection load failures and scan-limit warnings
 - `/metrics`: Prometheus-friendly counters and gauges
 - `/reference/preprocess/documents`: source-doc to page-image preprocessing before embedding
+
+Single-host worker scaling is supported as long as all workers share the same
+`VOYAGER_INDEX_PATH`.
 
 Skip ahead if:
 
@@ -233,6 +242,22 @@ curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
   }'
 ```
 
+Choose the dense fusion mode explicitly when needed:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [1, 0, 0, 0],
+    "query_text": "invoice",
+    "dense_hybrid_mode": "rrf",
+    "top_k": 3
+  }'
+```
+
+Use `dense_hybrid_mode: "tabu"` when `latence_solver` is installed and you want
+solver refinement over the fused pool.
+
 ### 3D. Payload filters
 
 Filters are flat payload equality checks and work across supported collection kinds.
@@ -259,7 +284,24 @@ curl -X POST http://127.0.0.1:8080/collections/dense-guide/search \
   }'
 ```
 
-### 3F. Dot-product dense collections
+### 3F. Prefer base64 transport for new clients
+
+Float arrays remain valid, but the preferred/default transport for larger
+vectors is the shared base64 payload contract used by the optimizer surface.
+
+```python
+import numpy as np
+
+from voyager_index import encode_vector_payload
+
+body = {
+    "vector": encode_vector_payload(np.array([1, 0, 0, 0], dtype="float32"), dtype="float16"),
+    "query_text": "invoice",
+    "top_k": 3,
+}
+```
+
+### 3G. Dot-product dense collections
 
 The dense HTTP surface also supports `distance: "dot"`:
 
@@ -268,6 +310,35 @@ curl -X POST http://127.0.0.1:8080/collections/dense-dot \
   -H "Content-Type: application/json" \
   -d '{"dimension": 2, "kind": "dense", "distance": "dot"}'
 ```
+
+### 3H. Shard collections for the max-performance path
+
+When you want the LEMUR-routed production path with ColBANDIT and quantized
+scoring controls, create a `shard` collection instead of a plain dense one:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/shard-guide \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dimension": 128,
+    "kind": "shard",
+    "n_shards": 256,
+    "compression": "fp16",
+    "quantization_mode": "fp8",
+    "transfer_mode": "pinned",
+    "router_device": "cpu",
+    "use_colbandit": true
+  }'
+```
+
+The detailed CPU/GPU tuning guide for this path is
+`docs/guides/max-performance-reference-api.md`.
+
+Important scope note:
+
+- shard HTTP search is vector-only
+- BM25 hybrid over HTTP stays on `dense` collections
+- shard + BM25 fusion is available through `HybridSearchManager` in programmatic flows
 
 Skip ahead if:
 

@@ -216,8 +216,12 @@ class Index:
             shard_kwargs = {k: v for k, v in kwargs.items() if k in {
                 "n_shards", "compression", "layout", "router_type",
                 "ann_backend", "lemur_epochs", "k_candidates",
+                "max_docs_exact", "lemur_search_k_cap", "n_full_scores",
                 "transfer_mode", "pinned_pool_buffers",
                 "pinned_buffer_max_tokens", "use_colbandit",
+                "quantization_mode", "variable_length_strategy",
+                "gpu_corpus_rerank_topn", "n_centroid_approx",
+                "router_device",
                 "uniform_shard_tokens", "seed",
             }}
             shard_config = kwargs.get("shard_config") or ShardEngineConfig(

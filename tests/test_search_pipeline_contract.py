@@ -56,6 +56,51 @@ def test_search_pipeline_reports_solver_backend_when_refining(tmp_path: Path) ->
     assert result["solver_backend"] is not None
 
 
+def test_search_pipeline_forwards_refine_controls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = SearchPipeline(str(tmp_path / "pipeline"), dim=4, use_roq=False, on_disk=False)
+    captured: dict[str, object] = {}
+
+    def fake_search(*, query_text, query_vector, k):
+        assert query_text == "alpha voyager"
+        assert k == 3
+        return {
+            "dense": [(1, 0.9), (2, 0.8)],
+            "sparse": [(2, 0.7)],
+            "union_ids": [1, 2],
+            "sparse_error": None,
+        }
+
+    def fake_refine(**kwargs):
+        captured.update(kwargs)
+        return {
+            "solver_output": {"objective_score": 1.0},
+            "selected_ids": ["1", "2"],
+            "backend_kind": "cpu_reference",
+        }
+
+    monkeypatch.setattr(pipeline.manager, "search", fake_search)
+    monkeypatch.setattr(pipeline.manager, "solver_available", True)
+    monkeypatch.setattr(pipeline.manager, "refine", fake_refine)
+
+    result = pipeline.search(
+        np.asarray([1, 0, 0, 0], dtype=np.float32),
+        top_k_retrieval=3,
+        enable_refinement=True,
+        query_text="alpha voyager",
+        query_payload={"label": "evidence"},
+        solver_config={"iterations": 24},
+        optimizer_policy="post_rerank_v1",
+        refine_options={"use_cross_encoder": True, "cross_encoder_top_k": 8},
+    )
+
+    assert result["solver_output"] == {"objective_score": 1.0}
+    assert captured["query_text"] == "alpha voyager"
+    assert captured["query_payload"] == {"label": "evidence"}
+    assert captured["solver_config"] == {"iterations": 24}
+    assert captured["optimizer_policy"] == "post_rerank_v1"
+    assert captured["refine_options"] == {"use_cross_encoder": True, "cross_encoder_top_k": 8}
+
+
 def test_hybrid_manager_orders_selected_candidates_by_marginal_gain() -> None:
     manager = HybridSearchManager.__new__(HybridSearchManager)
     query = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -127,6 +172,42 @@ def test_hybrid_manager_builds_solver_candidates_from_roq_payload_when_vector_mi
     assert candidates[0]["embedding"] == [1.0, 0.0]
 
 
+def test_hybrid_manager_forwards_shard_dense_search_kwargs() -> None:
+    manager = HybridSearchManager.__new__(HybridSearchManager)
+    captured: dict[str, object] = {}
+
+    def fake_search_multivector(query, *, k, filters=None, **kwargs):
+        captured["query_shape"] = tuple(query.shape)
+        captured["k"] = k
+        captured["filters"] = filters
+        captured.update(kwargs)
+        return [(7, 0.8)]
+
+    manager._dense_engine_type = "shard"
+    manager.hnsw = types.SimpleNamespace(search_multivector=fake_search_multivector)
+    manager.retriever = None
+    manager._legacy_bm25 = None
+    manager.sparse_dirty = False
+    manager.sparse_error = None
+    manager._last_search_context = None
+
+    result = manager.search(
+        query_text="",
+        query_vector=np.asarray([1.0, 0.0], dtype=np.float32),
+        k=5,
+        filters={"tenant": "acme"},
+        dense_search_kwargs={"quantization_mode": "fp8", "use_colbandit": True},
+    )
+
+    assert captured["query_shape"] == (1, 2)
+    assert captured["k"] == 5
+    assert captured["filters"] == {"tenant": "acme"}
+    assert captured["quantization_mode"] == "fp8"
+    assert captured["use_colbandit"] is True
+    assert result["dense"] == [(7, 0.8)]
+    assert result["union_ids"] == [7]
+
+
 def test_hybrid_manager_uses_ontology_query_payload_for_solver_features() -> None:
     manager = HybridSearchManager.__new__(HybridSearchManager)
     manager.roq_bits = None
@@ -170,3 +251,173 @@ def test_hybrid_manager_uses_ontology_query_payload_for_solver_features() -> Non
     assert by_id["11"]["ontology_entity_coverage"] > by_id["12"]["ontology_entity_coverage"]
     assert by_id["11"]["centrality_score"] > by_id["12"]["centrality_score"]
     assert by_id["11"]["auxiliary_score"] > by_id["12"]["auxiliary_score"]
+
+
+def test_hybrid_manager_cross_encoder_rerank_promotes_base_relevance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = HybridSearchManager.__new__(HybridSearchManager)
+    manager.roq_bits = None
+    manager._last_refine_context = {}
+    shared_vector = [1.0, 0.0]
+    manager.hnsw = types.SimpleNamespace(
+        retrieve=lambda ids: [
+            {
+                "id": 11,
+                "vector": shared_vector,
+                "payload": {"text": "invoice total due"},
+            },
+            {
+                "id": 12,
+                "vector": shared_vector,
+                "payload": {"text": "board report summary"},
+            },
+        ]
+    )
+
+    class DummyCrossEncoder:
+        def predict(self, pairs, batch_size=32, show_progress_bar=False):
+            assert len(pairs) == 2
+            return np.asarray(
+                [0.95 if "invoice" in document else 0.10 for _, document in pairs],
+                dtype=np.float32,
+            )
+
+    monkeypatch.setattr(manager, "_get_cross_encoder", lambda model_name: DummyCrossEncoder())
+
+    candidates = manager._build_solver_candidates(
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        [11, 12],
+        query_text="invoice total due",
+        retrieval_features={
+            11: {"base_relevance": 0.20},
+            12: {"base_relevance": 0.80},
+        },
+        refine_options={
+            "use_cross_encoder": True,
+            "cross_encoder_model": "dummy-cross-encoder",
+            "cross_encoder_top_k": 2,
+            "cross_encoder_batch_size": 8,
+        },
+    )
+
+    by_id = {candidate["chunk_id"]: candidate for candidate in candidates}
+    assert by_id["11"]["cross_encoder_score"] == pytest.approx(0.95)
+    assert by_id["11"]["base_relevance"] == pytest.approx(0.95)
+    assert by_id["12"]["cross_encoder_score"] == pytest.approx(0.10)
+    assert by_id["12"]["base_relevance"] == pytest.approx(0.10)
+    assert manager._last_refine_context["rerank"]["applied"] is True
+
+
+def test_hybrid_manager_nli_scores_surface_utility_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    manager = HybridSearchManager.__new__(HybridSearchManager)
+
+    class DummyTokenizer:
+        def __call__(self, left, right, **kwargs):
+            batch = len(right)
+            return {
+                "input_ids": torch.ones((batch, 4), dtype=torch.long),
+                "attention_mask": torch.ones((batch, 4), dtype=torch.long),
+            }
+
+    class DummyModel:
+        def __call__(self, **kwargs):
+            _ = kwargs
+            logits = torch.tensor(
+                [
+                    [5.0, 1.0, 0.2],  # entailment-heavy
+                    [0.2, 1.0, 5.0],  # contradiction-heavy
+                ],
+                dtype=torch.float32,
+            )
+            return types.SimpleNamespace(logits=logits)
+
+    monkeypatch.setattr(
+        manager,
+        "_get_nli_model",
+        lambda model_name: {
+            "tokenizer": DummyTokenizer(),
+            "model": DummyModel(),
+            "device": torch.device("cpu"),
+            "id2label": {0: "entailment", 1: "neutral", 2: "contradiction"},
+        },
+    )
+
+    retrieval_features = {
+        11: {"base_relevance": 0.7},
+        12: {"base_relevance": 0.6},
+    }
+    summary = manager._apply_nli_scores(
+        valid_items=[
+            {"id": 11, "text": "claim is supported"},
+            {"id": 12, "text": "claim is contradicted"},
+        ],
+        query_text="supported claim",
+        retrieval_features=retrieval_features,
+        model_name="dummy-nli",
+        batch_size=2,
+        top_k=2,
+    )
+
+    assert summary["applied"] is True
+    assert retrieval_features[11]["utility_score"] > retrieval_features[12]["utility_score"]
+    assert retrieval_features[11]["nli_entailment"] > retrieval_features[12]["nli_entailment"]
+    assert retrieval_features[12]["nli_contradiction"] > retrieval_features[11]["nli_contradiction"]
+
+
+def test_hybrid_manager_confidence_gate_skips_expensive_rerank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = HybridSearchManager.__new__(HybridSearchManager)
+    manager.roq_bits = None
+    manager._last_refine_context = {}
+    shared_vector = [1.0, 0.0]
+    manager.hnsw = types.SimpleNamespace(
+        retrieve=lambda ids: [
+            {
+                "id": 11,
+                "vector": shared_vector,
+                "payload": {"text": "top candidate"},
+            },
+            {
+                "id": 12,
+                "vector": shared_vector,
+                "payload": {"text": "runner up"},
+            },
+        ]
+    )
+
+    def fail_cross_encoder(**kwargs):
+        raise AssertionError("cross-encoder should have been skipped by confidence gate")
+
+    def fail_nli(**kwargs):
+        raise AssertionError("nli scorer should have been skipped by confidence gate")
+
+    monkeypatch.setattr(manager, "_apply_cross_encoder_scores", fail_cross_encoder)
+    monkeypatch.setattr(manager, "_apply_nli_scores", fail_nli)
+
+    candidates = manager._build_solver_candidates(
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        [11, 12],
+        query_text="top candidate",
+        retrieval_features={
+            11: {"base_relevance": 0.95},
+            12: {"base_relevance": 0.10},
+        },
+        refine_options={
+            "use_cross_encoder": True,
+            "use_nli": True,
+            "confidence_gating": True,
+            "confidence_min_candidates": 2,
+            "confidence_gap_threshold": 0.20,
+        },
+    )
+
+    assert len(candidates) == 2
+    assert manager._last_refine_context["confidence_gate"]["applied"] is True
+    assert manager._last_refine_context["rerank"]["reason"] == "confidence_gate_skip"
+    assert manager._last_refine_context["nli"]["reason"] == "confidence_gate_skip"

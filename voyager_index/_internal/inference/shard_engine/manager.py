@@ -8,6 +8,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import pickle
 import time
 import threading
 from pathlib import Path
@@ -45,6 +46,7 @@ from .config import (
     StorageLayout,
     TransferMode,
 )
+from .colbandit_reranker import ColBanditReranker
 from .fetch_pipeline import FetchPipeline, PinnedBufferPool
 from .lemur_router import CandidatePlan, LemurRouter
 from .memtable import MemTable
@@ -53,6 +55,7 @@ from .scorer import (
     PreloadedGpuCorpus,
     brute_force_maxsim,
     proxy_score_candidates,
+    score_roq4_topk,
     score_all_docs_topk,
     warmup_maxsim,
 )
@@ -195,6 +198,8 @@ class ShardSegmentManager:
         self._doc_mean_id_to_idx: Optional[Dict[int, int]] = None
         self._rust_index = None
         self._rust_tmpdir: Optional[str] = None
+        self._colbandit_reranker: Optional[ColBanditReranker] = None
+        self._roq_quantizer = None
         self._checkpoint_mgr = ShardCheckpointManager(self._path)
         self._file_lock: Optional[Any] = None
         if _FileLock is not None:
@@ -349,11 +354,188 @@ class ShardSegmentManager:
             self._is_built = True
             self._next_doc_id = max(ids) + 1 if ids else 0
             self._init_pipeline()
+
             self._try_gpu_preload()
             self._init_wal_and_memtable()
             self._build_and_save_doc_means(all_vecs, doc_offsets, list(ids))
 
             logger.info("Shard index built: %d docs at %s", n_docs, self._path)
+
+    @staticmethod
+    def _apply_search_overrides(scfg: SearchConfig, **kwargs) -> SearchConfig:
+        override_keys = (
+            "max_docs_exact",
+            "lemur_search_k_cap",
+            "n_full_scores",
+            "n_centroid_approx",
+            "transfer_mode",
+            "pinned_pool_buffers",
+            "pinned_buffer_max_tokens",
+            "use_colbandit",
+            "quantization_mode",
+            "variable_length_strategy",
+            "gpu_corpus_rerank_topn",
+        )
+        for key in override_keys:
+            if key not in kwargs or kwargs[key] is None:
+                continue
+            value = kwargs[key]
+            if key == "transfer_mode" and isinstance(value, str):
+                value = TransferMode(value)
+            setattr(scfg, key, value)
+        return scfg
+
+    def _get_colbandit_reranker(self) -> ColBanditReranker:
+        if self._colbandit_reranker is None:
+            self._colbandit_reranker = ColBanditReranker()
+        return self._colbandit_reranker
+
+    def _load_roq_quantizer(self):
+        if self._roq_quantizer is False:
+            return None
+        if self._roq_quantizer is not None:
+            return self._roq_quantizer
+        quantizer_path = self._path / "roq_quantizer.pkl"
+        if not quantizer_path.exists():
+            self._roq_quantizer = False
+            return None
+        try:
+            with open(quantizer_path, "rb") as handle:
+                self._roq_quantizer = pickle.load(handle)
+        except Exception as exc:
+            logger.warning("Failed to load ROQ quantizer from %s: %s", quantizer_path, exc)
+            self._roq_quantizer = False
+            return None
+        return self._roq_quantizer
+
+    def _score_pipeline_fetch(
+        self,
+        q: torch.Tensor,
+        shard_groups: Dict[int, List[int]],
+        internal_k: int,
+        scfg: SearchConfig,
+        dev: torch.device,
+        *,
+        exact_path: str,
+        use_colbandit: bool,
+    ) -> Tuple[List[Tuple[int, float]], Dict[str, Any]]:
+        if self._pipeline is None:
+            return [], self._empty_exact_stage_stats(exact_path)
+        shard_chunks, fetch_stats = self._pipeline.fetch_candidate_docs(
+            shard_groups,
+            max_docs=scfg.max_docs_exact,
+        )
+        stage_stats = self._empty_exact_stage_stats(exact_path)
+        stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
+        stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
+        stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
+        stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", 0)
+        if not shard_chunks:
+            return [], stage_stats
+        if use_colbandit:
+            ids, scores, score_stats = self._get_colbandit_reranker().rerank_shard_chunks(
+                q,
+                shard_chunks,
+                k=internal_k,
+                device=dev,
+                quantization_mode=scfg.quantization_mode,
+                variable_length_strategy=scfg.variable_length_strategy,
+            )
+        else:
+            ids, scores, score_stats = score_all_docs_topk(
+                q,
+                shard_chunks,
+                k=internal_k,
+                device=dev,
+                quantization_mode=scfg.quantization_mode,
+                variable_length_strategy=scfg.variable_length_strategy,
+                return_stats=True,
+            )
+        stage_stats.update(score_stats)
+        stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", stage_stats.get("num_docs_scored", 0))
+        return list(zip(ids, scores)), stage_stats
+
+    def _score_roq4_candidates(
+        self,
+        q: torch.Tensor,
+        shard_groups: Dict[int, List[int]],
+        internal_k: int,
+        dev: torch.device,
+    ) -> Optional[Tuple[List[Tuple[int, float]], Dict[str, Any]]]:
+        if dev.type != "cuda" or self._store is None:
+            return None
+        quantizer = self._load_roq_quantizer()
+        if quantizer is None:
+            return None
+        try:
+            with Timer(sync_cuda=False) as t_prepare:
+                query_np = q.detach().cpu().numpy().astype(np.float32)
+                quantized_query = quantizer.quantize(query_np, store=False)
+                query_codes = torch.from_numpy(np.asarray(quantized_query["codes"], dtype=np.uint8)[np.newaxis])
+                query_meta = torch.from_numpy(
+                    quantizer.build_triton_meta(quantized_query, include_norm_sq=True)[np.newaxis],
+                )
+
+            with Timer(sync_cuda=False) as t_fetch:
+                doc_ids: List[int] = []
+                doc_codes_rows: List[np.ndarray] = []
+                doc_meta_rows: List[np.ndarray] = []
+                num_shards = 0
+                for shard_id, dids in shard_groups.items():
+                    loaded = self._store.load_shard_roq4(shard_id)
+                    if loaded is None:
+                        continue
+                    num_shards += 1
+                    shard_codes, shard_meta, shard_offsets, shard_ids = loaded
+                    row_by_doc = {int(doc_id): idx for idx, doc_id in enumerate(shard_ids.tolist())}
+                    for did in dids:
+                        row = row_by_doc.get(int(did))
+                        if row is None:
+                            continue
+                        start = int(shard_offsets[row, 0])
+                        end = int(shard_offsets[row, 1])
+                        doc_ids.append(int(did))
+                        doc_codes_rows.append(shard_codes[start:end].cpu().numpy())
+                        doc_meta_rows.append(shard_meta[start:end].cpu().numpy())
+                if not doc_ids:
+                    return None
+                max_tok = max(item.shape[0] for item in doc_codes_rows)
+                n_bytes = doc_codes_rows[0].shape[1]
+                meta_cols = doc_meta_rows[0].shape[1]
+                doc_codes = np.zeros((len(doc_ids), max_tok, n_bytes), dtype=np.uint8)
+                doc_meta = np.zeros((len(doc_ids), max_tok, meta_cols), dtype=np.float32)
+                documents_mask = np.zeros((len(doc_ids), max_tok), dtype=np.float32)
+                for idx, (codes, meta) in enumerate(zip(doc_codes_rows, doc_meta_rows)):
+                    tok_count = codes.shape[0]
+                    doc_codes[idx, :tok_count] = codes
+                    doc_meta[idx, :tok_count] = meta
+                    documents_mask[idx, :tok_count] = 1.0
+
+            with Timer(sync_cuda=True) as t_exact:
+                ids, scores = score_roq4_topk(
+                    query_codes=query_codes,
+                    query_meta=query_meta,
+                    doc_codes=torch.from_numpy(doc_codes),
+                    doc_meta=torch.from_numpy(doc_meta),
+                    doc_ids=doc_ids,
+                    k=internal_k,
+                    documents_mask=torch.from_numpy(documents_mask),
+                    device=dev,
+                )
+            if not ids and doc_ids:
+                return None
+            stage_stats = self._empty_exact_stage_stats("roq4_pipeline")
+            stage_stats["prepare_ms"] = t_prepare.elapsed_ms
+            stage_stats["fetch_ms"] = t_fetch.elapsed_ms
+            stage_stats["exact_ms"] = t_exact.elapsed_ms
+            stage_stats["maxsim_ms"] = t_exact.elapsed_ms
+            stage_stats["num_shards_fetched"] = num_shards
+            stage_stats["num_docs_scored"] = len(doc_ids)
+            stage_stats["h2d_bytes"] = int(doc_codes.nbytes + doc_meta.nbytes + documents_mask.nbytes)
+            return list(zip(ids, scores)), stage_stats
+        except Exception as exc:
+            logger.warning("ROQ4 serving path failed; falling back to standard scoring: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Load
@@ -601,6 +783,49 @@ class ShardSegmentManager:
         if not exact_candidate_ids:
             return [], [], "none", self._empty_exact_stage_stats("none")
 
+        shard_groups = docs_by_shard or self._group_candidate_ids_by_shard(exact_candidate_ids)
+        quant_mode = str(getattr(scfg, "quantization_mode", "") or "").strip().lower()
+        want_roq4 = dev.type == "cuda" and quant_mode == "roq4"
+        want_quantized_kernel = dev.type == "cuda" and quant_mode in {"int8", "fp8"}
+        want_colbandit = bool(getattr(scfg, "use_colbandit", False))
+
+        if want_roq4:
+            roq_result = self._score_roq4_candidates(
+                q,
+                shard_groups,
+                internal_k,
+                dev,
+            )
+            if roq_result is not None:
+                results, stage_stats = roq_result
+                return results, exact_candidate_ids, "roq4_pipeline", stage_stats
+
+        if want_colbandit and self._pipeline is not None:
+            results, stage_stats = self._score_pipeline_fetch(
+                q,
+                shard_groups,
+                internal_k,
+                scfg,
+                dev,
+                exact_path="colbandit_pipeline_fetch",
+                use_colbandit=True,
+            )
+            if results or stage_stats.get("num_docs_scored", 0) > 0:
+                return results, exact_candidate_ids, "colbandit_pipeline_fetch", stage_stats
+
+        if want_quantized_kernel and self._pipeline is not None:
+            results, stage_stats = self._score_pipeline_fetch(
+                q,
+                shard_groups,
+                internal_k,
+                scfg,
+                dev,
+                exact_path="pipeline_quantized",
+                use_colbandit=False,
+            )
+            if results or stage_stats.get("num_docs_scored", 0) > 0:
+                return results, exact_candidate_ids, "pipeline_quantized", stage_stats
+
         if self._gpu_corpus is not None and dev.type == "cuda":
             rerank_topn = max(int(getattr(scfg, "gpu_corpus_rerank_topn", 0) or 0), internal_k)
             ids, scores, score_stats = self._gpu_corpus.score_candidates(
@@ -647,30 +872,16 @@ class ShardSegmentManager:
                 )
             except (AttributeError, RuntimeError):
                 if self._pipeline is not None and dev.type == "cuda":
-                    shard_groups = docs_by_shard or self._group_candidate_ids_by_shard(exact_candidate_ids)
-                    shard_chunks, fetch_stats = self._pipeline.fetch_candidate_docs(
-                        shard_groups, max_docs=scfg.max_docs_exact,
+                    results, stage_stats = self._score_pipeline_fetch(
+                        q,
+                        shard_groups,
+                        internal_k,
+                        scfg,
+                        dev,
+                        exact_path="cuda_pipeline_fetch_fallback",
+                        use_colbandit=False,
                     )
-                    if shard_chunks:
-                        ids, scores, score_stats = score_all_docs_topk(
-                            q, shard_chunks, k=internal_k, device=dev,
-                            quantization_mode=scfg.quantization_mode,
-                            variable_length_strategy=scfg.variable_length_strategy,
-                            return_stats=True,
-                        )
-                        stage_stats = self._empty_exact_stage_stats("cuda_pipeline_fetch_fallback")
-                        stage_stats.update(score_stats)
-                        stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
-                        stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
-                        stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
-                        stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", len(exact_candidate_ids))
-                        return list(zip(ids, scores)), exact_candidate_ids, "cuda_pipeline_fetch_fallback", stage_stats
-                    stage_stats = self._empty_exact_stage_stats("cuda_pipeline_fetch_fallback")
-                    stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
-                    stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
-                    stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
-                    stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", 0)
-                    return [], exact_candidate_ids, "cuda_pipeline_fetch_fallback", stage_stats
+                    return results, exact_candidate_ids, "cuda_pipeline_fetch_fallback", stage_stats
 
                 with Timer(sync_cuda=False) as t_fetch:
                     raw_bytes, offsets_arr, doc_ids_arr = self._rust_index.fetch_candidate_embeddings(
@@ -704,29 +915,17 @@ class ShardSegmentManager:
                 return [], exact_candidate_ids, "rust_fetch_torch_fallback", stage_stats
 
         if self._pipeline is not None:
-            shard_groups = docs_by_shard or self._group_candidate_ids_by_shard(exact_candidate_ids)
-            shard_chunks, fetch_stats = self._pipeline.fetch_candidate_docs(
-                shard_groups, max_docs=scfg.max_docs_exact,
+            results, stage_stats = self._score_pipeline_fetch(
+                q,
+                shard_groups,
+                internal_k,
+                scfg,
+                dev,
+                exact_path="pipeline_fetch",
+                use_colbandit=False,
             )
-            if shard_chunks:
-                ids, scores, score_stats = score_all_docs_topk(
-                    q, shard_chunks, k=internal_k, device=dev,
-                    quantization_mode=scfg.quantization_mode,
-                    variable_length_strategy=scfg.variable_length_strategy,
-                    return_stats=True,
-                )
-                stage_stats = self._empty_exact_stage_stats("pipeline_fetch")
-                stage_stats.update(score_stats)
-                stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
-                stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
-                stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
-                stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", len(exact_candidate_ids))
-                return list(zip(ids, scores)), exact_candidate_ids, "pipeline_fetch", stage_stats
-            stage_stats = self._empty_exact_stage_stats("pipeline_fetch")
-            stage_stats["fetch_ms"] = fetch_stats.get("fetch_ms", 0.0)
-            stage_stats["h2d_bytes"] = fetch_stats.get("h2d_bytes", 0)
-            stage_stats["num_shards_fetched"] = fetch_stats.get("num_shards", 0)
-            stage_stats["num_docs_scored"] = fetch_stats.get("num_docs", 0)
+            if results:
+                return results, exact_candidate_ids, "pipeline_fetch", stage_stats
             return [], exact_candidate_ids, "pipeline_fetch", stage_stats
         return [], exact_candidate_ids, "none", self._empty_exact_stage_stats("none")
 
@@ -735,6 +934,7 @@ class ShardSegmentManager:
         query_vectors: np.ndarray,
         k: int = 10,
         n_probes: Optional[int] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
         if not self._is_built:
             raise RuntimeError("Index not built or loaded")
@@ -746,7 +946,7 @@ class ShardSegmentManager:
             else query_vectors.float()
         )
         dev = self._resolve_scoring_device()
-        scfg = self._config.to_search_config()
+        scfg = self._apply_search_overrides(self._config.to_search_config(), **kwargs)
         internal_k = k
         n_sealed = len(self._doc_ids) if self._doc_ids else 0
         effective_k = min(scfg.k_candidates, max(n_sealed, 1))
@@ -823,7 +1023,7 @@ class ShardSegmentManager:
         q = torch.from_numpy(query_vectors).float() if isinstance(query_vectors, np.ndarray) else query_vectors.float()
         dev = self._resolve_scoring_device()
 
-        scfg = self._config.to_search_config()
+        scfg = self._apply_search_overrides(self._config.to_search_config(), **kwargs)
         n_sealed = len(self._doc_ids) if self._doc_ids else 0
 
         internal_k = k * 4 if filters else k
@@ -933,7 +1133,7 @@ class ShardSegmentManager:
 
         self._ensure_warmup()
         dev = self._resolve_scoring_device()
-        scfg = self._config.to_search_config()
+        scfg = self._apply_search_overrides(self._config.to_search_config(), **kwargs)
         n_sealed = len(self._doc_ids) if self._doc_ids else 0
         effective_k = min(scfg.k_candidates, max(n_sealed, 1))
         query_tensors = [

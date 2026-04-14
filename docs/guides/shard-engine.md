@@ -1,10 +1,10 @@
 # Shard Engine Guide
 
 The shard engine is a LEMUR-routed late-interaction retrieval backend built for
-simplicity and GPU-accelerated exact scoring. It avoids graph construction
-entirely, relying instead on a learned routing MLP (LEMUR) to reduce
-multi-vector candidate generation to single-vector MIPS, then scoring
-candidates with the Triton MaxSim kernel.
+simplicity and high-throughput exact or quantized scoring. It avoids graph
+construction entirely, relying instead on a learned routing MLP (LEMUR) to
+reduce multi-vector candidate generation to single-vector MIPS, then scoring
+candidates with Triton on CUDA or exact/full-precision fallback paths on CPU.
 
 ## Architecture
 
@@ -13,8 +13,8 @@ Query tokens
   → LEMUR MLP → latent features
   → FAISS ANN index → candidate doc IDs
   → GPU gather (from GPU-resident corpus or shard fetch)
-  → Triton MaxSim (FP16 / ROQ 4-bit)
-  → optional Col-Bandit pruning
+  → optional ColBANDIT pruning
+  → Triton / exact / INT8 / FP8 / ROQ4 scoring
   → top-K results
 ```
 
@@ -26,6 +26,11 @@ Key properties:
   `D[candidate_ids]` gather followed by a fused MaxSim kernel launch
 - **Disk-backed fallback**: for large corpora, safetensors-backed shards
   are fetched on-demand with pinned-memory pipelining
+- **Quantized serving**: request or collection level selection of exact,
+  `int8`, `fp8`, or `roq4` scoring on the CUDA/Triton path, with truthful
+  fallback behavior when those kernels are unavailable
+- **Production ColBANDIT path**: query-time pruning is wired into the real
+  shard serving flow instead of being a side experiment
 - **Full CRUD**: insert, delete, upsert via WAL + memtable, identical
   durability model to the GEM engine
 
@@ -71,17 +76,26 @@ idx = (IndexBuilder("my_index", dim=128)
 # Create shard collection
 curl -X POST http://localhost:8080/collections/my_col \
   -H "Content-Type: application/json" \
-  -d '{"dimension": 128, "kind": "shard", "n_shards": 256}'
+  -d '{
+    "dimension": 128,
+    "kind": "shard",
+    "n_shards": 256,
+    "compression": "fp16",
+    "quantization_mode": "fp8",
+    "transfer_mode": "pinned",
+    "router_device": "cpu",
+    "use_colbandit": true
+  }'
 
 # Add points
 curl -X POST http://localhost:8080/collections/my_col/points \
   -H "Content-Type: application/json" \
-  -d '{"points": [{"id": "doc_1", "vectors": [[0.1, ...], ...], "payload": {"title": "Doc 1"}}]}'
+  -d '{"points": [{"id": "doc_1", "vectors": {"encoding":"float16","shape":[32,128],"dtype":"float16","data_b64":"..."}, "payload": {"title": "Doc 1"}}]}'
 
 # Search
 curl -X POST http://localhost:8080/collections/my_col/search \
   -H "Content-Type: application/json" \
-  -d '{"vectors": [[0.1, ...], ...], "top_k": 10}'
+  -d '{"vectors": {"encoding":"float16","shape":[32,128],"dtype":"float16","data_b64":"..."}, "top_k": 10, "quantization_mode": "fp8"}'
 ```
 
 ## Configuration
@@ -92,11 +106,21 @@ curl -X POST http://localhost:8080/collections/my_col/search \
 |-----------|---------|-------------|
 | `n_shards` | 256 | Number of storage shards |
 | `dim` | 128 | Embedding dimension |
-| `compression` | `fp16` | Storage compression (`fp16`, `roq4`) |
+| `compression` | `fp16` | Storage compression (`fp16`, `int8`, `roq4`) |
 | `k_candidates` | 2000 | LEMUR candidate count per query |
-| `use_colbandit` | `false` | Enable Col-Bandit query-time pruning |
+| `use_colbandit` | `false` | Enable ColBANDIT query-time pruning |
 | `lemur_epochs` | 10 | LEMUR MLP training epochs |
 | `transfer_mode` | `pinned` | CPU→GPU transfer strategy |
+| `quantization_mode` | exact | Scoring mode (`none`, `int8`, `fp8`, `roq4`) |
+| `router_device` | `cpu` | Device used by the LEMUR router |
+| `lemur_search_k_cap` | 2048 | LEMUR search cap before routing/scoring |
+| `max_docs_exact` | 10000 | Exact-stage document budget |
+| `n_full_scores` | 4096 | Proxy shortlist size before exact full scoring |
+| `pinned_pool_buffers` | 3 | Pinned-memory transfer buffer pool size |
+| `pinned_buffer_max_tokens` | 50000 | Max tokens per pinned transfer buffer |
+| `gpu_corpus_rerank_topn` | 16 | GPU rerank frontier size |
+| `n_centroid_approx` | 0 | Optional centroid-approx candidate stage |
+| `variable_length_strategy` | `bucketed` | Variable-length exact scheduling |
 | `seed` | 42 | Random seed for reproducibility |
 
 ### Tuning Tips
@@ -105,8 +129,17 @@ curl -X POST http://localhost:8080/collections/my_col/search \
   and reduce if latency is too high at your corpus size.
 - **`n_shards`**: should be roughly `sqrt(n_docs / 100)` for balanced
   shard sizes. Default of 256 works well up to ~500K docs.
-- **ROQ 4-bit**: enables ~4x bandwidth reduction for disk-backed corpora.
-  Set `compression="roq4"` via `ShardEngineConfig`.
+- **`compression` vs `quantization_mode`**: compression controls stored shard
+  representation; quantization controls the active scoring kernel.
+- **`n_full_scores`**: reduce it to trim exact work after proxy pruning; raise it
+  only when recall audits show the shortlist is too aggressive.
+- **Pinned transfer knobs**: `pinned_pool_buffers` and
+  `pinned_buffer_max_tokens` matter only for CPU->GPU fetch pipelines, not the
+  pure CPU exact path.
+- **ROQ 4-bit**: enables strong bandwidth reduction for disk-backed corpora.
+  Set `compression="roq4"` and optionally `quantization_mode="roq4"` on CUDA.
+- **ColBANDIT**: enable it when you want pruning in the production shard path;
+  disable it when measuring exact latency/quality baselines.
 
 ## CRUD and Durability
 
@@ -117,11 +150,12 @@ The shard engine uses the same WAL + memtable pattern as the GEM engine:
    The `UPDATE_PAYLOAD` op records payload-only changes without vectors.
 2. **MemTable**: in-memory buffer for mutable documents, searched alongside
    sealed shards via score merging
-3. **Flush / Compaction**: `flush()` syncs the WAL to disk. The memtable is
-   retained for crash safety (real L0-to-sealed merge is planned but not yet
-   implemented). The `CompactionScheduler` runs WAL checkpoints periodically.
-4. **Crash Recovery**: on `load()`, WAL entries are replayed into a fresh
-   memtable, restoring all uncommitted mutations.
+3. **Flush / Checkpoint**: `flush()` syncs the WAL and checkpoints memtable
+   state. The memtable is retained for crash safety; real L0-to-sealed merge is
+   still planned.
+4. **Crash Recovery**: on `load()`, checkpoint state is restored first and only
+   WAL entries after the saved logical offset are replayed into a fresh
+   memtable.
 
 ## Admin Endpoints
 
@@ -129,19 +163,19 @@ All admin endpoints require a `shard` collection:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/collections/{name}/compact` | POST | Trigger memtable flush + WAL truncation |
+| `/collections/{name}/compact` | POST | Sync WAL and checkpoint memtable state (no sealed compaction yet) |
 | `/collections/{name}/shards` | GET | List all shards with doc counts and token stats |
 | `/collections/{name}/shards/{id}` | GET | Detail for a specific shard |
 | `/collections/{name}/wal/status` | GET | WAL entry count, memtable size, tombstone count |
-| `/collections/{name}/checkpoint` | POST | Force WAL checkpoint (flush + truncate) |
-| `/collections/{name}/scroll` | POST | Paginated iteration over document IDs |
-| `/collections/{name}/retrieve` | POST | Retrieve specific documents by ID |
+| `/collections/{name}/checkpoint` | POST | Force a WAL sync + memtable checkpoint |
+| `/collections/{name}/scroll` | POST | Paginated iteration over document IDs (shard collections only) |
+| `/collections/{name}/retrieve` | POST | Retrieve specific documents by ID (shard collections only) |
 | `/collections/{name}/search/batch` | POST | Batch search over multiple queries |
 
 ## Hybrid Search
 
 The shard engine integrates with `HybridSearchManager` for BM25 + dense
-fusion:
+fusion in programmatic flows:
 
 ```python
 from voyager_index._internal.inference.index_core.hybrid_manager import HybridSearchManager
@@ -153,7 +187,10 @@ hybrid = HybridSearchManager(
 )
 ```
 
-Dense and sparse results are returned separately. RRF scores are computed internally for the optional Tabu Search solver refinement step (`refine()`).
+Dense collections expose `dense_hybrid_mode="rrf"` and `"tabu"` directly on the
+HTTP search request. Shard collection HTTP search remains vector-only and does
+not accept `query_text`; use `HybridSearchManager` if you want BM25 fusion with
+the shard backend in-process.
 
 ## GPU Memory and Auto-Tiering
 
@@ -163,6 +200,10 @@ The shard engine automatically detects available GPU memory:
   contiguous FP16 tensor. Scoring is zero-copy gather + MaxSim kernel.
 - **Disk-backed** (corpus exceeds VRAM): safetensors shards are fetched
   on-demand with configurable pinned-memory buffering. Suitable for 1M+ docs.
+- **CPU-only host**: when CUDA is unavailable, the same shard collection stays
+  searchable with the CPU path and the same routed retrieval / ColBANDIT
+  controls, but Triton quantization modes fall back to full-precision scoring
+  and `roq4` exact scoring remains CUDA-only.
 
 Memory formula for GPU-resident mode:
 ```
@@ -184,4 +225,4 @@ Example: 100K docs × 128 tokens × 128 dim = ~3.3 GB.
 | WAL + CRUD | Yes | Yes |
 | ROQ 4-bit | Yes | Yes |
 | Filters | Roaring bitmap | Payload scan |
-| Hybrid search | BM25 + Tabu | BM25 + RRF/Tabu |
+| Hybrid search | BM25 + Tabu | Programmatic BM25 + RRF/Tabu |

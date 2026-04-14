@@ -4,12 +4,15 @@ import argparse
 import json
 import statistics
 from pathlib import Path
+import sys
 import tempfile
 import time
 
 from fastapi.testclient import TestClient
 import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from voyager_index import ColPaliConfig, ColPaliEngine, TRITON_AVAILABLE, fast_colbert_scores
 from voyager_index.server import create_app

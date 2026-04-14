@@ -4,12 +4,9 @@ API routes for the voyager-index reference server.
 from __future__ import annotations
 
 import logging
-import threading
-import uuid
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .models import (
@@ -27,6 +24,7 @@ from .models import (
     MutationTaskResponse,
     MutationTaskStatus,
     OptimizeRequest,
+    ReferenceOptimizeRequest,
     RenderDocumentsRequest,
     RenderDocumentsResponse,
     RerankRequest,
@@ -56,19 +54,15 @@ def get_service(request: Request) -> SearchService:
 
 
 def _raise_service_error(exc: ServiceError, request: Request | None = None) -> None:
-    rid = ""
-    if request and hasattr(request, "state"):
-        rid = getattr(request.state, "request_id", "")
+    payload = ErrorResponse(
+        code=exc.error_code,
+        message=exc.detail,
+        detail=exc.detail,
+        status_code=exc.status_code,
+    ).model_dump(exclude_none=True)
     raise HTTPException(
         status_code=exc.status_code,
-        detail=ErrorResponse(
-            code=getattr(exc, "error_code", "service_error"),
-            message=exc.detail,
-            request_id=rid,
-            error=getattr(exc, "error_code", "service_error"),
-            detail=exc.detail,
-            status_code=exc.status_code,
-        ).model_dump(),
+        detail=payload,
     ) from exc
 
 
@@ -105,7 +99,7 @@ async def reference_optimizer_health(service: SearchService = Depends(get_servic
 
 @router.post("/reference/optimize", tags=["Optimizer"])
 async def reference_optimize(
-    body: Dict[str, Any],
+    body: ReferenceOptimizeRequest = Body(...),
     service: SearchService = Depends(get_service),
 ):
     """
@@ -115,7 +109,7 @@ async def reference_optimize(
     ``candidates``, ``constraints``, ``solver_config``, ``metadata``.
     """
     try:
-        return service.reference_optimize(body)
+        return service.reference_optimize(body.model_dump(exclude_none=True))
     except ServiceError as exc:
         _raise_service_error(exc)
 
@@ -282,7 +276,7 @@ async def search(
         _raise_service_error(exc)
 
 
-@router.post("/collections/{name}/scroll", response_model=ScrollResponse, tags=["Points"])
+@router.post("/collections/{name}/scroll", response_model=ScrollResponse, tags=["Shard Admin"])
 async def scroll_collection(
     name: str,
     request: ScrollRequest,
@@ -294,7 +288,7 @@ async def scroll_collection(
         _raise_service_error(exc)
 
 
-@router.post("/collections/{name}/retrieve", response_model=RetrieveResponse, tags=["Points"])
+@router.post("/collections/{name}/retrieve", response_model=RetrieveResponse, tags=["Shard Admin"])
 async def retrieve_points(
     name: str,
     request: RetrieveRequest,
@@ -393,69 +387,6 @@ async def checkpoint_collection(
     return {"status": "ok", **result}
 
 
-# ------------------------------------------------------------------
-# Async mutation task queue
-# ------------------------------------------------------------------
-
-_task_store: Dict[str, Dict[str, Any]] = {}
-_task_lock = threading.Lock()
-_TASK_MAX_AGE_S = 3600  # evict completed tasks older than 1 hour
-_TASK_MAX_ENTRIES = 10_000
-
-
-def _evict_stale_tasks() -> None:
-    """Remove completed/failed tasks older than _TASK_MAX_AGE_S (called under lock)."""
-    now = datetime.now(timezone.utc)
-    stale = []
-    for tid, rec in _task_store.items():
-        if rec["status"] in (MutationTaskStatus.COMPLETED, MutationTaskStatus.FAILED):
-            completed = rec.get("completed_at")
-            if completed:
-                try:
-                    age = (now - datetime.fromisoformat(completed)).total_seconds()
-                    if age > _TASK_MAX_AGE_S:
-                        stale.append(tid)
-                except (ValueError, TypeError):
-                    stale.append(tid)
-    for tid in stale:
-        _task_store.pop(tid, None)
-
-
-def _submit_task(fn: Callable) -> str:
-    """Run *fn* in a background thread, return a task_id immediately."""
-    task_id = uuid.uuid4().hex[:12]
-    record: Dict[str, Any] = {
-        "status": MutationTaskStatus.PENDING,
-        "result": None,
-        "error": None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "completed_at": None,
-    }
-    with _task_lock:
-        if len(_task_store) >= _TASK_MAX_ENTRIES:
-            _evict_stale_tasks()
-        _task_store[task_id] = record
-
-    def _worker():
-        with _task_lock:
-            _task_store[task_id]["status"] = MutationTaskStatus.RUNNING
-        try:
-            res = fn()
-            with _task_lock:
-                _task_store[task_id]["status"] = MutationTaskStatus.COMPLETED
-                _task_store[task_id]["result"] = res
-                _task_store[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
-        except Exception as exc:
-            logger.error("Async task %s failed: %s", task_id, exc, exc_info=True)
-            with _task_lock:
-                _task_store[task_id]["status"] = MutationTaskStatus.FAILED
-                _task_store[task_id]["error"] = str(exc)
-                _task_store[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
-
-    threading.Thread(target=_worker, name=f"task-{task_id}", daemon=True).start()
-    return task_id
-
-
 @router.post(
     "/collections/{name}/points/async",
     response_model=MutationTaskResponse,
@@ -468,7 +399,7 @@ async def add_points_async(
     service: SearchService = Depends(get_service),
 ):
     """Accept points for asynchronous ingestion; returns 202 with a task ID."""
-    task_id = _submit_task(
+    task_id = service.submit_task(
         lambda: {"added": service.add_points(name, request_body.points)},
     )
     return MutationTaskResponse(task_id=task_id, status=MutationTaskStatus.PENDING)
@@ -486,19 +417,19 @@ async def delete_points_async(
     service: SearchService = Depends(get_service),
 ):
     """Accept point deletions for asynchronous processing."""
-    task_id = _submit_task(
+    task_id = service.submit_task(
         lambda: {"deleted": service.delete_points(name, request_body.ids)},
     )
     return MutationTaskResponse(task_id=task_id, status=MutationTaskStatus.PENDING)
 
 
 @router.get("/tasks/{task_id}", response_model=TaskStatusResponse, tags=["Tasks"])
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, service: SearchService = Depends(get_service)):
     """Poll the status of an async mutation task."""
-    with _task_lock:
-        record = _task_store.get(task_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        record = service.get_task_status(task_id)
+    except ServiceError as exc:
+        _raise_service_error(exc)
     return TaskStatusResponse(task_id=task_id, **record)
 
 

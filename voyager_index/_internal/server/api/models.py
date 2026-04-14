@@ -27,6 +27,11 @@ class SearchStrategy(str, Enum):
     SHARD_ROUTED = "shard_routed"
 
 
+class DenseHybridMode(str, Enum):
+    RRF = "rrf"
+    TABU = "tabu"
+
+
 class MultimodalOptimizeMode(str, Enum):
     AUTO = "auto"
     MAXSIM_ONLY = "maxsim_only"
@@ -39,14 +44,37 @@ class ScreeningMode(str, Enum):
     NONE = "none"
 
 
+class TransportVectorPayload(BaseModel):
+    """Base64 vector transport payload shared with the optimizer contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    encoding: str
+    shape: List[int]
+    data_b64: str
+    dtype: str = "float32"
+    num_bits: Optional[int] = None
+    block_size: Optional[int] = None
+    num_rounds: Optional[int] = None
+    seed: int = 42
+    scales_b64: Optional[str] = None
+    offsets_b64: Optional[str] = None
+    norms_sq_b64: Optional[str] = None
+    code_sums_b64: Optional[str] = None
+    code_shape: Optional[List[int]] = None
+
+
 class PointVector(BaseModel):
     """Vector or multivector payload for a point."""
 
     id: Union[str, int] = Field(..., description="External point ID")
-    vector: Optional[List[float]] = Field(default=None, description="Single embedding vector")
-    vectors: Optional[List[List[float]]] = Field(
+    vector: Optional[Union[List[float], TransportVectorPayload]] = Field(
         default=None,
-        description="Multi-vector embedding matrix",
+        description="Single embedding vector as raw floats or a base64 transport payload",
+    )
+    vectors: Optional[Union[List[List[float]], TransportVectorPayload]] = Field(
+        default=None,
+        description="Multi-vector embedding matrix as raw floats or a base64 transport payload",
     )
     payload: Optional[Dict[str, Any]] = Field(default=None, description="Metadata payload")
 
@@ -91,6 +119,18 @@ class CreateCollectionRequest(BaseModel):
     n_shards: Optional[int] = Field(default=None, ge=1, le=65536, description="Number of shards (shard collections)")
     k_candidates: Optional[int] = Field(default=None, ge=1, le=100000, description="LEMUR candidate count (shard collections)")
     use_colbandit: bool = Field(default=False, description="Enable Col-Bandit reranking (shard collections)")
+    compression: Optional[str] = Field(default=None, description="Shard storage compression: fp16, int8, or roq4")
+    quantization_mode: Optional[str] = Field(default=None, description="Shard scoring mode: int8, fp8, roq4, or empty for exact")
+    transfer_mode: Optional[str] = Field(default=None, description="Shard CPU->GPU transfer mode: pageable, pinned, or double_buffered")
+    router_device: Optional[str] = Field(default=None, description="Device used by the LEMUR router, typically cpu or cuda")
+    lemur_search_k_cap: Optional[int] = Field(default=None, ge=1, le=8192, description="Optional LEMUR search cap for shard collections")
+    max_docs_exact: Optional[int] = Field(default=None, ge=1, le=1000000, description="Optional exact-stage document cap for shard collections")
+    n_full_scores: Optional[int] = Field(default=None, ge=1, le=1000000, description="Optional shard proxy shortlist size before exact full scoring")
+    pinned_pool_buffers: Optional[int] = Field(default=None, ge=1, le=64, description="Optional pinned-memory buffer pool size for shard transfers")
+    pinned_buffer_max_tokens: Optional[int] = Field(default=None, ge=1, le=5000000, description="Optional max tokens per pinned transfer buffer for shard fetch")
+    gpu_corpus_rerank_topn: Optional[int] = Field(default=None, ge=1, le=4096, description="Optional shard GPU-corpus rerank frontier size")
+    n_centroid_approx: Optional[int] = Field(default=None, ge=0, le=1000000, description="Optional centroid-approx candidate count for shard collections")
+    variable_length_strategy: Optional[str] = Field(default=None, description="Shard variable-length exact strategy, e.g. bucketed")
     max_documents: Optional[int] = Field(
         default=None, ge=1,
         description="Maximum documents in this collection; oldest are evicted on overflow",
@@ -98,6 +138,9 @@ class CreateCollectionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_kind_specific_options(self) -> "CreateCollectionRequest":
+        valid_compressions = {"fp16", "int8", "roq4"}
+        valid_quant_modes = {"", "none", "int8", "fp8", "roq4"}
+        valid_transfer_modes = {"pageable", "pinned", "double_buffered"}
         if self.kind not in (CollectionKind.DENSE, CollectionKind.SHARD):
             if self.distance != DistanceMetric.COSINE:
                 raise ValueError("Only dense and shard collections support configurable distance metrics")
@@ -106,10 +149,33 @@ class CreateCollectionRequest(BaseModel):
         if self.kind != CollectionKind.LATE_INTERACTION and self.storage_mode != "sync":
             raise ValueError("storage_mode is only supported for late-interaction collections")
         if self.kind != CollectionKind.SHARD:
-            if self.n_shards is not None or self.k_candidates is not None:
-                raise ValueError("n_shards and k_candidates are only for shard collections")
+            shard_only_values = (
+                self.n_shards,
+                self.k_candidates,
+                self.compression,
+                self.quantization_mode,
+                self.transfer_mode,
+                self.router_device,
+                self.lemur_search_k_cap,
+                self.max_docs_exact,
+                self.n_full_scores,
+                self.pinned_pool_buffers,
+                self.pinned_buffer_max_tokens,
+                self.gpu_corpus_rerank_topn,
+                self.n_centroid_approx,
+                self.variable_length_strategy,
+            )
+            if any(value is not None for value in shard_only_values):
+                raise ValueError("Shard tuning fields are only supported for shard collections")
             if self.use_colbandit:
                 raise ValueError("use_colbandit is only for shard collections")
+        else:
+            if self.compression is not None and self.compression not in valid_compressions:
+                raise ValueError("compression must be one of: fp16, int8, roq4")
+            if self.quantization_mode is not None and self.quantization_mode not in valid_quant_modes:
+                raise ValueError("quantization_mode must be one of: '', none, int8, fp8, roq4")
+            if self.transfer_mode is not None and self.transfer_mode not in valid_transfer_modes:
+                raise ValueError("transfer_mode must be one of: pageable, pinned, double_buffered")
         return self
 
 
@@ -148,9 +214,22 @@ class SearchRequest(BaseModel):
         }
     })
 
-    vector: Optional[List[float]] = Field(default=None, description="Single query vector for dense search, or a single-token query for late-interaction/multimodal search")
-    vectors: Optional[List[List[float]]] = Field(default=None, description="Multi-vector query for late-interaction or multimodal search")
+    vector: Optional[Union[List[float], TransportVectorPayload]] = Field(
+        default=None,
+        description=(
+            "Single query vector as raw floats or a base64 transport payload. "
+            "Also accepted as a single-token query for late-interaction and multimodal search."
+        ),
+    )
+    vectors: Optional[Union[List[List[float]], TransportVectorPayload]] = Field(
+        default=None,
+        description="Multi-vector query as raw floats or a base64 transport payload",
+    )
     query_text: Optional[str] = Field(default=None, description="Optional sparse text query")
+    query_payload: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional query-side metadata forwarded to solver refinement (e.g. ontology hints or refine options).",
+    )
     top_k: int = Field(default=10, ge=1, le=1000, description="Number of results")
     filter: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -159,6 +238,68 @@ class SearchRequest(BaseModel):
     with_payload: bool = Field(default=True, description="Include payload in results")
     with_vector: bool = Field(default=False, description="Include stored vectors in results")
     strategy: SearchStrategy = Field(default=SearchStrategy.SIMPLE, description="Search strategy")
+    dense_hybrid_mode: Optional[DenseHybridMode] = Field(
+        default=None,
+        description="Dense collections only: use plain BM25+dense RRF fusion or Tabu solver refinement over the fused pool.",
+    )
+    quantization_mode: Optional[str] = Field(
+        default=None,
+        description="Shard collections only: override the scoring precision mode (int8, fp8, roq4, or empty for exact).",
+    )
+    use_colbandit: Optional[bool] = Field(
+        default=None,
+        description="Shard collections only: override Col-Bandit pruning for this request.",
+    )
+    transfer_mode: Optional[str] = Field(
+        default=None,
+        description="Shard collections only: override CPU->GPU transfer mode for this request.",
+    )
+    max_docs_exact: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=1000000,
+        description="Shard collections only: override the exact-stage document cap for this request.",
+    )
+    n_full_scores: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=1000000,
+        description="Shard collections only: override the proxy shortlist size before exact full scoring.",
+    )
+    lemur_search_k_cap: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=8192,
+        description="Shard collections only: override the router search cap for this request.",
+    )
+    gpu_corpus_rerank_topn: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=4096,
+        description="Shard collections only: override the GPU corpus rerank frontier.",
+    )
+    n_centroid_approx: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=1000000,
+        description="Shard collections only: override centroid-approx candidate scoring count.",
+    )
+    variable_length_strategy: Optional[str] = Field(
+        default=None,
+        description="Shard collections only: override variable-length exact scheduling, e.g. bucketed.",
+    )
+    pinned_pool_buffers: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=64,
+        description="Shard collections only: override pinned-memory transfer buffer pool size.",
+    )
+    pinned_buffer_max_tokens: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=5000000,
+        description="Shard collections only: override the max tokens per pinned transfer buffer.",
+    )
     max_tokens: Optional[int] = Field(
         default=None,
         ge=1,
@@ -170,6 +311,80 @@ class SearchRequest(BaseModel):
         ge=1,
         le=256,
         description="Optional selection cap for optimized dense refinement",
+    )
+    max_per_cluster: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=32,
+        description="Optional per-cluster cap for optimized solver stages.",
+    )
+    solver_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional solver config overrides for optimized solver-backed search.",
+    )
+    optimizer_policy: Optional[Union[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Optional optimizer policy preset name or override dict (e.g. 'post_rerank_v1').",
+    )
+    refine_use_cross_encoder: bool = Field(
+        default=False,
+        description="For optimized dense search, rerank the fused pool with a cross-encoder before Tabu packing.",
+    )
+    refine_cross_encoder_model: Optional[str] = Field(
+        default=None,
+        description="Optional sentence-transformers CrossEncoder model id for dense refinement.",
+    )
+    refine_cross_encoder_top_k: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=512,
+        description="Optional cap on candidates reranked by the cross-encoder before Tabu packing.",
+    )
+    refine_cross_encoder_batch_size: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=256,
+        description="Optional batch size for cross-encoder reranking during optimized dense refinement.",
+    )
+    refine_use_nli: bool = Field(
+        default=False,
+        description="For optimized dense search, score the fused pool with an NLI/utility head before Tabu packing.",
+    )
+    refine_nli_model: Optional[str] = Field(
+        default=None,
+        description="Optional transformers sequence-classification model id for NLI refinement.",
+    )
+    refine_nli_top_k: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=512,
+        description="Optional cap on candidates scored by the NLI/utility head before Tabu packing.",
+    )
+    refine_nli_batch_size: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=256,
+        description="Optional batch size for NLI/utility scoring during optimized dense refinement.",
+    )
+    refine_nli_promote_base_relevance: bool = Field(
+        default=False,
+        description="Blend NLI utility back into base relevance before optimization (disabled by default for low-risk rollout).",
+    )
+    refine_confidence_gating: bool = Field(
+        default=False,
+        description="Skip expensive CE/NLI passes when the fused top of list is already unambiguous.",
+    )
+    refine_confidence_gap_threshold: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Minimum top-score gap required to skip expensive CE/NLI refinement.",
+    )
+    refine_confidence_min_candidates: Optional[int] = Field(
+        default=None,
+        ge=2,
+        le=512,
+        description="Minimum candidate count before confidence gating is considered.",
     )
     multimodal_optimize_mode: Optional[MultimodalOptimizeMode] = Field(
         default=None,
@@ -216,10 +431,16 @@ class SearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_query(self) -> "SearchRequest":
+        valid_quant_modes = {"", "none", "int8", "fp8", "roq4"}
+        valid_transfer_modes = {"pageable", "pinned", "double_buffered"}
         if self.vector is None and self.vectors is None and not self.query_text:
             raise ValueError("Provide 'vector', 'vectors', or 'query_text'")
         if self.vector is not None and self.vectors is not None:
             raise ValueError("Provide only one of 'vector' or 'vectors'")
+        if self.quantization_mode is not None and self.quantization_mode not in valid_quant_modes:
+            raise ValueError("quantization_mode must be one of: '', none, int8, fp8, roq4")
+        if self.transfer_mode is not None and self.transfer_mode not in valid_transfer_modes:
+            raise ValueError("transfer_mode must be one of: pageable, pinned, double_buffered")
         return self
 
 
@@ -252,6 +473,63 @@ class OptimizeRequest(BaseModel):
             }
         },
     )
+
+
+class OptimizerCandidateRequest(BaseModel):
+    """Canonical candidate shape for the stateless optimizer API."""
+
+    chunk_id: str = Field(..., description="Candidate chunk identifier")
+    text: str = Field(..., description="Candidate text content")
+    token_count: int = Field(..., ge=0, description="Token count contributed by this chunk")
+    vectors: TransportVectorPayload = Field(..., description="Base64 vector payload for this candidate")
+    fact_density: float = Field(default=0.5, description="Optional fact density score")
+    centrality_score: float = Field(default=0.5, description="Optional centrality score")
+    recency_score: float = Field(default=0.5, description="Optional recency score")
+    auxiliary_score: float = Field(default=0.0, description="Optional auxiliary score")
+    rhetorical_role: str = Field(default="unknown", description="Optional rhetorical role label")
+    cluster_id: Optional[int] = Field(default=None, description="Optional cluster assignment")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Optional metadata such as dense/sparse/RRF scores")
+
+
+class ReferenceOptimizeRequest(BaseModel):
+    """Typed OpenAPI contract for the canonical `/reference/optimize` endpoint."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "query_text": "invoice total due",
+                "query_vectors": {
+                    "encoding": "float32",
+                    "shape": [1, 4],
+                    "dtype": "float32",
+                    "data_b64": "...",
+                },
+                "candidates": [
+                    {
+                        "chunk_id": "invoice",
+                        "text": "invoice total due",
+                        "token_count": 64,
+                        "vectors": {
+                            "encoding": "float32",
+                            "shape": [1, 4],
+                            "dtype": "float32",
+                            "data_b64": "...",
+                        },
+                        "metadata": {"dense_score": 1.0, "rrf_score": 0.03},
+                    }
+                ],
+                "constraints": {"max_tokens": 96, "max_chunks": 1},
+                "solver_config": {"iterations": 16},
+            }
+        }
+    )
+
+    query_text: str = Field(..., description="Original user query text")
+    query_vectors: TransportVectorPayload = Field(..., description="Base64 vector payload for the query embedding(s)")
+    candidates: List[OptimizerCandidateRequest] = Field(..., description="Candidate chunks considered by the solver")
+    constraints: Dict[str, Any] = Field(default_factory=dict, description="Optimization constraints such as max_tokens or max_chunks")
+    solver_config: Dict[str, Any] = Field(default_factory=dict, description="Optional solver config overrides")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Optional request-level metadata")
 
 
 class RenderDocumentsRequest(BaseModel):
@@ -350,6 +628,20 @@ class CollectionInfo(BaseModel):
     n_shards: Optional[int] = None
     k_candidates: Optional[int] = None
     total_tokens: Optional[int] = None
+    compression: Optional[str] = None
+    quantization_mode: Optional[str] = None
+    transfer_mode: Optional[str] = None
+    router_device: Optional[str] = None
+    use_colbandit: Optional[bool] = None
+    max_docs_exact: Optional[int] = None
+    n_full_scores: Optional[int] = None
+    pinned_pool_buffers: Optional[int] = None
+    pinned_buffer_max_tokens: Optional[int] = None
+    lemur_search_k_cap: Optional[int] = None
+    gpu_corpus_rerank_topn: Optional[int] = None
+    n_centroid_approx: Optional[int] = None
+    variable_length_strategy: Optional[str] = None
+    hybrid_search: Optional[bool] = None
 
 
 class CollectionListResponse(BaseModel):

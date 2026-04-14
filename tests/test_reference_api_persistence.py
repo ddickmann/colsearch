@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from fastapi.testclient import TestClient
 import numpy as np
@@ -77,6 +78,38 @@ def test_late_interaction_collection_persists_across_restart(tmp_path: Path) -> 
         assert info.json()["num_points"] == 1
         assert search.status_code == 200
         assert search.json()["results"][0]["id"] == "doc-1"
+
+
+def test_dense_mutations_become_visible_across_service_instances(tmp_path: Path) -> None:
+    service_a = SearchService(str(tmp_path))
+    service_a.create_collection("dense", CreateCollectionRequest(dimension=4, kind="dense"))
+    service_b = SearchService(str(tmp_path))
+
+    try:
+        assert service_a.add_points(
+            "dense",
+            [PointVector(id="doc-1", vector=[1, 0, 0, 0], payload={"text": "alpha"})],
+        ) == 1
+
+        first = service_b.search(
+            "dense",
+            SearchRequest(query_text="alpha", top_k=1),
+        )
+        assert [item.id for item in first.results] == ["doc-1"]
+
+        assert service_a.add_points(
+            "dense",
+            [PointVector(id="doc-2", vector=[0, 1, 0, 0], payload={"text": "beta"})],
+        ) == 1
+
+        second = service_b.search(
+            "dense",
+            SearchRequest(query_text="beta", top_k=1),
+        )
+        assert [item.id for item in second.results] == ["doc-2"]
+    finally:
+        service_a.close()
+        service_b.close()
 
 
 def test_multimodal_collection_persists_across_restart(tmp_path: Path) -> None:
@@ -309,6 +342,45 @@ def test_late_interaction_runtime_profiles_are_populated(tmp_path: Path) -> None
     assert runtime.engine.last_write_profile["doc_count"] == 1
     assert runtime.engine.last_search_profile["mode"] in {"triton_cache", "triton_load", "triton_mmap"}
     assert runtime.engine.last_search_profile["doc_count"] == 1
+
+
+def test_async_task_status_is_shared_across_clients(tmp_path: Path) -> None:
+    with _create_client(tmp_path) as writer, _create_client(tmp_path) as reader:
+        assert writer.post(
+            "/collections/dense",
+            json={"dimension": 4, "kind": "dense"},
+        ).status_code == 200
+
+        accepted = writer.post(
+            "/collections/dense/points/async",
+            json={
+                "points": [
+                    {"id": "doc-1", "vector": [1, 0, 0, 0], "payload": {"text": "alpha"}}
+                ]
+            },
+        )
+        assert accepted.status_code == 202
+        task_id = accepted.json()["task_id"]
+
+        status_payload = None
+        for _ in range(40):
+            status = reader.get(f"/tasks/{task_id}")
+            assert status.status_code == 200
+            status_payload = status.json()
+            if status_payload["status"] == "completed":
+                break
+            time.sleep(0.05)
+
+        assert status_payload is not None
+        assert status_payload["status"] == "completed"
+        assert status_payload["result"]["added"] == 1
+
+        search = reader.post(
+            "/collections/dense/search",
+            json={"query_text": "alpha", "top_k": 1},
+        )
+        assert search.status_code == 200
+        assert search.json()["results"][0]["id"] == "doc-1"
 
 
 def test_uncommitted_collection_delete_recovers_on_restart(tmp_path: Path) -> None:

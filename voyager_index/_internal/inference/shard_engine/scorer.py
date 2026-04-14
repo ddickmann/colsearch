@@ -519,7 +519,8 @@ class PreloadedGpuCorpus:
 
     @staticmethod
     def fits_on_gpu(n_docs: int, max_tok: int, dim: int, dtype=torch.float16) -> bool:
-        bytes_needed = PreloadedGpuCorpus.estimate_gpu_bytes(n_docs, max_tok, dim, dtype=dtype)
+        dtype_itemsize = dtype.itemsize
+        bytes_needed = int(n_docs * max_tok * dim * dtype_itemsize)
         bytes_needed += n_docs * max_tok * 4  # mask
         if not torch.cuda.is_available():
             return False

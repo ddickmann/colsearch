@@ -19,10 +19,13 @@ import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from voyager_index import __version__ as PACKAGE_VERSION
 
 from .api.routes import router
 from .api.service import SearchService
@@ -46,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 def create_app(
     title: str = "Voyager Index Reference API",
-    version: str = "0.1.0",
+    version: str = PACKAGE_VERSION,
     enable_cors: bool = False,
     index_path: Optional[str] = None,
 ) -> FastAPI:
@@ -101,13 +104,16 @@ def create_app(
         description="""
 ## Voyager Index Reference API
 
-Local-first reference service for the open-source `voyager-index` runtime.
+Single-host production reference service for the open-source `voyager-index` runtime.
 
 ### Features
 
 - Durable collection metadata on disk
+- Single-host multi-worker runtime reloads for collection mutations and async task polling
 - Dense, late-interaction, and multimodal collection types
-- Hybrid dense+sparse retrieval for dense collections
+- Hybrid dense+sparse retrieval for dense collections with explicit `dense_hybrid_mode: "rrf"` or `"tabu"`
+- Base64 or JSON float-array vector transport on collection ingest/search
+- Shard-engine CPU/GPU routing with ColBANDIT and INT8/FP8/ROQ4 selection
 - MaxSim-backed late-interaction retrieval
 - Stateless fulfilment optimizer at `/reference/optimize` (canonical contract; needs `latence_solver`)
 - Source-doc preprocessing at `/reference/preprocess/documents` for PDF, DOCX, XLSX, and image inputs
@@ -129,18 +135,18 @@ curl -X POST http://localhost:8080/collections/docs \\
   -d '{"dimension": 128, "kind": "dense"}'
 ```
 
-3. Add points:
+3. Add points (base64 is the preferred transport for larger vectors):
 ```bash
 curl -X POST http://localhost:8080/collections/docs/points \\
   -H "Content-Type: application/json" \\
-  -d '{"points": [{"id": "1", "vector": [...]}]}'
+  -d '{"points": [{"id": "1", "vector": {"encoding":"float32","shape":[1,128],"dtype":"float32","data_b64":"..."}}]}'
 ```
 
 4. Search:
 ```bash
 curl -X POST http://localhost:8080/collections/docs/search \\
   -H "Content-Type: application/json" \\
-  -d '{"vector": [...], "top_k": 10}'
+  -d '{"vector": {"encoding":"float32","shape":[1,128],"dtype":"float32","data_b64":"..."}, "top_k": 10}'
 ```
         """,
         version=version,
@@ -170,6 +176,27 @@ curl -X POST http://localhost:8080/collections/docs/search \\
         )
 
     # --- Structured error handlers ---
+    @app.exception_handler(HTTPException)
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException):
+        rid = getattr(request.state, "request_id", "") if hasattr(request, "state") else ""
+        payload = exc.detail if isinstance(exc.detail, dict) else {}
+        raw_details = payload.get("details")
+        details = raw_details if isinstance(raw_details, dict) else None
+        message = str(payload.get("message") or payload.get("detail") or exc.detail)
+        response = structured_error_response(
+            exc.status_code,
+            code=str(payload.get("code") or f"http_{exc.status_code}"),
+            message=message,
+            details=details,
+            request_id=rid,
+            detail=str(payload.get("detail") or message),
+            include_status_code=True,
+        )
+        if exc.headers:
+            response.headers.update({key: value for key, value in exc.headers.items() if value is not None})
+        return response
+
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
         rid = getattr(request.state, "request_id", "") if hasattr(request, "state") else ""
@@ -179,6 +206,8 @@ curl -X POST http://localhost:8080/collections/docs/search \\
             message="Request validation failed",
             details={"errors": exc.errors()},
             request_id=rid,
+            detail="Request validation failed",
+            include_status_code=True,
         )
 
     @app.exception_handler(Exception)
@@ -190,6 +219,8 @@ curl -X POST http://localhost:8080/collections/docs/search \\
             code="internal_error",
             message="Internal server error",
             request_id=rid,
+            detail="Internal server error",
+            include_status_code=True,
         )
 
     app.include_router(router, prefix="")
@@ -202,7 +233,8 @@ def main() -> None:
 
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", 8080))
-    workers = min(int(os.environ.get("WORKERS", 1)), 4)
+    default_workers = min(max(os.cpu_count() or 1, 2), 4)
+    workers = min(int(os.environ.get("WORKERS", default_workers)), 8)
     if workers < 1:
         workers = 1
 

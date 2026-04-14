@@ -35,14 +35,22 @@ When reporting, include:
 
 ## Current Deployment Posture
 
-The reference server is designed as a local-first service. It is not intended to
-be presented as an internet-hardened multi-tenant product without additional
-authentication, network controls, and deployment-specific hardening.
+The reference server now supports single-host multi-worker deployments for QPS
+scaling. Collection mutations coordinate through OS-backed locks, collection
+metadata revisions, and shared async task state so multiple local workers can
+observe durable changes without manual restarts.
+
+The server is still a reference deployment, not a turnkey multi-tenant control
+plane. If you expose it on the public internet, you are expected to place it
+behind your own authentication, TLS termination, request filtering, and network
+policy.
 
 Current guarantees and limits:
 
 - collection names are restricted to a single validated path segment
 - collection metadata writes are atomic and collection mutations use snapshot rollback
+- single-host multi-worker mutation visibility is supported for local worker processes sharing the same storage root
 - legacy unsafe local index formats such as pickle-backed HNSW fallback state and monolithic ColPali `.pt` snapshots are rejected
-- the reference service intentionally runs with `WORKERS=1`; multi-process coordination is not implemented
 - `/health` is a liveness check and `/ready` reports degraded startup state such as sparse-index load failures
+- built-in middleware provides request IDs, rate limiting, and concurrency limiting, but you should still run a reverse proxy / ingress layer for internet-facing deployments
+- distributed multi-host coordination is out of scope for the reference server and requires an external control plane if you need it

@@ -4,6 +4,7 @@ Durable collection service for the voyager-index reference API.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -12,20 +13,27 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 import numpy as np
 import torch
 
+from voyager_index.transport import decode_payload
 from voyager_index._internal.inference.config import IndexConfig
 from voyager_index._internal.inference.engines.colpali import ColPaliConfig, ColPaliEngine
 from voyager_index._internal.inference.index_core.hybrid_manager import HybridSearchManager
 from voyager_index._internal.inference.index_core.index import ColbertIndex
 from voyager_index._internal.inference.shard_engine import ShardSegmentManager
-from voyager_index._internal.inference.shard_engine.config import Compression
+from voyager_index._internal.inference.shard_engine.config import Compression, TransferMode
 from voyager_index._internal.inference.shard_engine.manager import ShardEngineConfig
 
 from .models import (
@@ -41,9 +49,13 @@ from .models import (
     SearchRequest,
     SearchResponse,
     SearchStrategy,
+    MutationTaskStatus,
+    TransportVectorPayload,
 )
 
 logger = logging.getLogger(__name__)
+_TASK_MAX_AGE_S = 3600
+_TASK_MAX_ENTRIES = 10_000
 
 
 class ServiceError(Exception):
@@ -89,6 +101,7 @@ class CollectionRuntime:
     engine: Any
     record_index: Dict[int, Dict[str, Any]]
     payload_filter_index: Dict[str, Dict[str, set[int]]]
+    meta_mtime_ns: int = 0
 
 
 @dataclass
@@ -104,6 +117,10 @@ class SearchService:
         self.root_path.mkdir(parents=True, exist_ok=True)
         self._journal_root = self.root_path / ".voyager-journal"
         self._journal_root.mkdir(parents=True, exist_ok=True)
+        self._lock_root = self.root_path / ".voyager-locks"
+        self._lock_root.mkdir(parents=True, exist_ok=True)
+        self._task_root = self.root_path / ".voyager-tasks"
+        self._task_root.mkdir(parents=True, exist_ok=True)
         self.request_count = 0
         self.total_latency = 0.0
         self.nodes_visited_total = 0
@@ -115,6 +132,7 @@ class SearchService:
         self.filter_scan_limit = int(os.environ.get("VOYAGER_FILTER_SCAN_LIMIT", "10000"))
         self.filter_scan_limit_hits = 0
         self._metrics_lock = threading.Lock()
+        self._task_thread_lock = threading.Lock()
         self._collections_lock = threading.RLock()
         self._collection_locks: Dict[str, threading.RLock] = {}
         self._recover_pending_journals()
@@ -159,6 +177,27 @@ class SearchService:
 
     def _metadata_path(self, name: str) -> Path:
         return self._collection_path(name) / "collection.json"
+
+    def _collection_lockfile_path(self, name: str) -> Path:
+        safe_name = self._validate_collection_name(name)
+        digest = hashlib.sha256(safe_name.encode("utf-8")).hexdigest()
+        return self._lock_root / f"{digest}.lock"
+
+    @contextlib.contextmanager
+    def _cross_process_collection_lock(self, name: str) -> Iterator[None]:
+        lock_path = self._collection_lockfile_path(name)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _task_record_path(self, task_id: str) -> Path:
+        return self._task_root / f"{task_id}.json"
 
     def _resolve_user_path(self, raw_path: str, *, relative_to_root: bool = False) -> Path:
         candidate = Path(raw_path).expanduser()
@@ -262,13 +301,16 @@ class SearchService:
         self._fsync_parent(path)
 
     def _write_meta(self, runtime: CollectionRuntime) -> None:
+        runtime.meta["revision"] = int(runtime.meta.get("revision", 0)) + 1
         runtime.meta["updated_at"] = self._now()
         metadata_path = self._metadata_path(runtime.name)
         self._write_json_atomic(metadata_path, runtime.meta)
+        runtime.meta_mtime_ns = metadata_path.stat().st_mtime_ns
 
     def _load_meta(self, name: str) -> Dict[str, Any]:
         with open(self._metadata_path(name), "r", encoding="utf-8") as handle:
             meta = json.load(handle)
+        meta["revision"] = int(meta.get("revision", 0))
         meta["records"] = self._sanitize_records(meta)
         return meta
 
@@ -349,8 +391,24 @@ class SearchService:
             shard_cfg = ShardEngineConfig(
                 dim=int(meta["dimension"]),
                 n_shards=int(meta.get("n_shards", 256)),
+                compression=Compression(str(meta.get("compression", Compression.FP16.value))),
                 k_candidates=int(meta.get("k_candidates", 2000)),
+                max_docs_exact=int(meta.get("max_docs_exact", 10_000)),
+                n_full_scores=int(meta.get("n_full_scores", 4096)),
+                lemur_search_k_cap=(
+                    int(meta["lemur_search_k_cap"])
+                    if meta.get("lemur_search_k_cap") is not None
+                    else 2048
+                ),
+                transfer_mode=TransferMode(str(meta.get("transfer_mode", TransferMode.PINNED.value))),
+                pinned_pool_buffers=int(meta.get("pinned_pool_buffers", 3)),
+                pinned_buffer_max_tokens=int(meta.get("pinned_buffer_max_tokens", 50_000)),
                 use_colbandit=bool(meta.get("use_colbandit", False)),
+                quantization_mode=self._normalize_quantization_mode(meta.get("quantization_mode")),
+                variable_length_strategy=str(meta.get("variable_length_strategy", "bucketed") or "bucketed"),
+                gpu_corpus_rerank_topn=int(meta.get("gpu_corpus_rerank_topn", 16)),
+                n_centroid_approx=int(meta.get("n_centroid_approx", 0)),
+                router_device=str(meta.get("router_device", "cpu") or "cpu"),
             )
             engine = ShardSegmentManager(
                 path=collection_dir / "shard",
@@ -372,6 +430,7 @@ class SearchService:
         return engine
 
     def _load_runtime(self, name: str) -> CollectionRuntime:
+        metadata_path = self._metadata_path(name)
         meta = self._load_meta(name)
         runtime = CollectionRuntime(
             name=name,
@@ -381,6 +440,7 @@ class SearchService:
             engine=self._build_engine(name, meta),
             record_index=self._refresh_record_index(meta),
             payload_filter_index=self._build_payload_filter_index(meta),
+            meta_mtime_ns=metadata_path.stat().st_mtime_ns if metadata_path.exists() else 0,
         )
         if runtime.kind == CollectionKind.DENSE:
             should_rebuild_sparse = (
@@ -395,6 +455,50 @@ class SearchService:
             if should_rebuild_sparse:
                 self._write_meta(runtime)
         return runtime
+
+    def _reload_runtime_from_disk(self, name: str) -> CollectionRuntime:
+        current = self.collections.get(name)
+        if current is not None:
+            self._close_runtime_engine(current)
+        runtime = self._load_runtime(name)
+        self.collections[name] = runtime
+        self._ensure_collection_lock(name)
+        self.load_failures.pop(name, None)
+        return runtime
+
+    def _sync_collection_registry(self) -> None:
+        disk_names = {
+            entry.name
+            for entry in self.root_path.iterdir()
+            if entry.is_dir()
+            and not entry.name.startswith(".")
+            and (entry / "collection.json").exists()
+        }
+        with self._collections_lock:
+            loaded_names = set(self.collections.keys())
+
+        removed = loaded_names - disk_names
+        for name in removed:
+            lock = self._ensure_collection_lock(name)
+            with lock:
+                with self._collections_lock:
+                    runtime = self.collections.pop(name, None)
+                if runtime is not None:
+                    self._close_runtime_engine(runtime)
+                self._remove_collection_lock(name)
+
+        added = disk_names - loaded_names
+        for name in sorted(added):
+            try:
+                runtime = self._load_runtime(name)
+            except Exception as exc:
+                self.load_failures[name] = str(exc)
+                logger.warning("Failed to load collection '%s': %s", name, exc)
+                continue
+            with self._collections_lock:
+                self.collections[name] = runtime
+            self._ensure_collection_lock(name)
+            self.load_failures.pop(name, None)
 
     def _engine_point_count(self, runtime: CollectionRuntime) -> int:
         if runtime.kind == CollectionKind.DENSE:
@@ -454,24 +558,7 @@ class SearchService:
         return sorted(candidates)
 
     def _load_collections(self) -> None:
-        for collection_dir in self.root_path.iterdir():
-            if not collection_dir.is_dir() or collection_dir.name.startswith("."):
-                continue
-            metadata_path = collection_dir / "collection.json"
-            if not metadata_path.exists():
-                continue
-
-            name = collection_dir.name
-            try:
-                runtime = self._load_runtime(name)
-            except Exception as exc:
-                self.load_failures[name] = str(exc)
-                logger.warning("Failed to load collection '%s': %s", name, exc)
-                continue
-            self.load_failures.pop(name, None)
-            self.collections[name] = runtime
-            self._ensure_collection_lock(name)
-            logger.info("Loaded collection '%s' (%s)", name, runtime.kind.value)
+        self._sync_collection_registry()
 
     def _ensure_collection_lock(self, name: str) -> threading.RLock:
         with self._collections_lock:
@@ -483,11 +570,39 @@ class SearchService:
 
     def _collection_context(self, name: str) -> tuple[CollectionRuntime, threading.RLock]:
         safe_name = self._validate_collection_name(name)
+        metadata_path = self._metadata_path(safe_name)
         with self._collections_lock:
             runtime = self.collections.get(safe_name)
             if runtime is None:
-                raise NotFoundError(f"Collection '{safe_name}' not found")
+                if safe_name in self.load_failures:
+                    raise NotFoundError(f"Collection '{safe_name}' not found")
+                if not metadata_path.exists():
+                    raise NotFoundError(f"Collection '{safe_name}' not found")
+                try:
+                    runtime = self._load_runtime(safe_name)
+                except Exception as exc:
+                    self.load_failures[safe_name] = str(exc)
+                    raise NotFoundError(f"Collection '{safe_name}' not found") from exc
+                self.load_failures.pop(safe_name, None)
+                self.collections[safe_name] = runtime
             lock = self._collection_locks.setdefault(safe_name, threading.RLock())
+        with lock:
+            if not metadata_path.exists():
+                with self._collections_lock:
+                    stale = self.collections.pop(safe_name, None)
+                if stale is not None:
+                    self._close_runtime_engine(stale)
+                self._remove_collection_lock(safe_name)
+                raise NotFoundError(f"Collection '{safe_name}' not found")
+            current_mtime_ns = metadata_path.stat().st_mtime_ns
+            if current_mtime_ns != runtime.meta_mtime_ns:
+                try:
+                    runtime = self._reload_runtime_from_disk(safe_name)
+                except Exception as exc:
+                    with self._collections_lock:
+                        self.collections.pop(safe_name, None)
+                    self.load_failures[safe_name] = str(exc)
+                    raise NotFoundError(f"Collection '{safe_name}' not found") from exc
         return runtime, lock
 
     def _backup_path(self, runtime: CollectionRuntime, backup_root: Path, path: Path) -> Path:
@@ -649,94 +764,111 @@ class SearchService:
                 logger.warning("Failed to recover journal '%s': %s", journal_name, exc)
 
     def list_collections(self) -> List[str]:
+        self._sync_collection_registry()
         with self._collections_lock:
             return sorted(self.collections.keys())
 
     def get_collection(self, name: str) -> CollectionRuntime:
-        with self._collections_lock:
-            safe_name = self._validate_collection_name(name)
-            if safe_name not in self.collections:
-                raise NotFoundError(f"Collection '{safe_name}' not found")
-            return self.collections[safe_name]
+        runtime, _lock = self._collection_context(name)
+        return runtime
 
     def create_collection(self, name: str, request: CreateCollectionRequest) -> CollectionRuntime:
-        with self._collections_lock:
-            safe_name = self._validate_collection_name(name)
-            if safe_name in self.collections:
-                raise ConflictError(f"Collection '{safe_name}' already exists")
+        safe_name = self._validate_collection_name(name)
+        with self._cross_process_collection_lock(safe_name):
+            with self._collections_lock:
+                if safe_name in self.collections or self._metadata_path(safe_name).exists():
+                    raise ConflictError(f"Collection '{safe_name}' already exists")
 
-            if request.kind not in (CollectionKind.DENSE, CollectionKind.SHARD):
-                if request.distance != DistanceMetric.COSINE:
-                    raise ValidationError("Only dense and shard collections support configurable distance metrics")
-                if request.m != 16 or request.ef_construction != 200:
-                    raise ValidationError("Only dense collections support configurable HNSW parameters")
-            if request.kind != CollectionKind.LATE_INTERACTION and request.storage_mode != "sync":
-                raise ValidationError("storage_mode is only supported for late-interaction collections")
+                if request.kind not in (CollectionKind.DENSE, CollectionKind.SHARD):
+                    if request.distance != DistanceMetric.COSINE:
+                        raise ValidationError("Only dense and shard collections support configurable distance metrics")
+                    if request.m != 16 or request.ef_construction != 200:
+                        raise ValidationError("Only dense collections support configurable HNSW parameters")
+                if request.kind != CollectionKind.LATE_INTERACTION and request.storage_mode != "sync":
+                    raise ValidationError("storage_mode is only supported for late-interaction collections")
 
-            collection_dir = self._collection_path(safe_name)
-            backup = self._begin_create_collection_mutation(safe_name, request.kind)
-            collection_dir.mkdir(parents=True, exist_ok=True)
+                collection_dir = self._collection_path(safe_name)
+                backup = self._begin_create_collection_mutation(safe_name, request.kind)
+                collection_dir.mkdir(parents=True, exist_ok=True)
 
-            meta = {
-                "name": safe_name,
-                "kind": request.kind.value,
-                "dimension": request.dimension,
-                "distance": request.distance.value,
-                "m": request.m,
-                "ef_construction": request.ef_construction,
-                "storage_mode": request.storage_mode,
-                "sparse_dirty": False,
-                "created_at": self._now(),
-                "updated_at": self._now(),
-                "next_internal_id": 0,
-                "records": {},
-            }
-            if request.max_documents is not None:
-                meta["max_documents"] = request.max_documents
-            if request.kind == CollectionKind.SHARD:
-                meta["n_shards"] = request.n_shards or 256
-                meta["k_candidates"] = request.k_candidates or 2000
-                meta["use_colbandit"] = request.use_colbandit
-            try:
-                runtime = CollectionRuntime(
-                    name=safe_name,
-                    kind=request.kind,
-                    path=collection_dir,
-                    meta=meta,
-                    engine=self._build_engine(safe_name, meta),
-                    record_index={},
-                    payload_filter_index={},
-                )
-                self._write_meta(runtime)
-                self.collections[safe_name] = runtime
-                self._collection_locks[safe_name] = threading.RLock()
-                self._commit_journal(backup)
-                return runtime
-            except Exception:
-                self.collections.pop(safe_name, None)
-                self._collection_locks.pop(safe_name, None)
-                if collection_dir.exists():
-                    shutil.rmtree(collection_dir, ignore_errors=True)
-                raise
-            finally:
-                self._cleanup_journal(backup.backup_root)
+                meta = {
+                    "name": safe_name,
+                    "kind": request.kind.value,
+                    "dimension": request.dimension,
+                    "distance": request.distance.value,
+                    "m": request.m,
+                    "ef_construction": request.ef_construction,
+                    "storage_mode": request.storage_mode,
+                    "sparse_dirty": False,
+                    "created_at": self._now(),
+                    "updated_at": self._now(),
+                    "next_internal_id": 0,
+                    "records": {},
+                    "revision": 0,
+                }
+                if request.max_documents is not None:
+                    meta["max_documents"] = request.max_documents
+                if request.kind == CollectionKind.SHARD:
+                    meta["n_shards"] = request.n_shards or 256
+                    meta["k_candidates"] = request.k_candidates or 2000
+                    meta["use_colbandit"] = request.use_colbandit
+                    meta["compression"] = str(request.compression or Compression.FP16.value)
+                    meta["quantization_mode"] = self._normalize_quantization_mode(request.quantization_mode)
+                    meta["transfer_mode"] = str(request.transfer_mode or TransferMode.PINNED.value)
+                    meta["pinned_pool_buffers"] = int(request.pinned_pool_buffers or 3)
+                    meta["pinned_buffer_max_tokens"] = int(request.pinned_buffer_max_tokens or 50_000)
+                    meta["router_device"] = str(request.router_device or "cpu")
+                    meta["lemur_search_k_cap"] = (
+                        int(request.lemur_search_k_cap)
+                        if request.lemur_search_k_cap is not None
+                        else 2048
+                    )
+                    meta["max_docs_exact"] = int(request.max_docs_exact or 10_000)
+                    meta["n_full_scores"] = int(request.n_full_scores or 4096)
+                    meta["gpu_corpus_rerank_topn"] = int(request.gpu_corpus_rerank_topn or 16)
+                    meta["n_centroid_approx"] = int(request.n_centroid_approx or 0)
+                    meta["variable_length_strategy"] = str(request.variable_length_strategy or "bucketed")
+                try:
+                    runtime = CollectionRuntime(
+                        name=safe_name,
+                        kind=request.kind,
+                        path=collection_dir,
+                        meta=meta,
+                        engine=self._build_engine(safe_name, meta),
+                        record_index={},
+                        payload_filter_index={},
+                    )
+                    self._write_meta(runtime)
+                    self.collections[safe_name] = runtime
+                    self._collection_locks[safe_name] = threading.RLock()
+                    self._commit_journal(backup)
+                    return runtime
+                except Exception:
+                    self.collections.pop(safe_name, None)
+                    self._collection_locks.pop(safe_name, None)
+                    if collection_dir.exists():
+                        shutil.rmtree(collection_dir, ignore_errors=True)
+                    raise
+                finally:
+                    self._cleanup_journal(backup.backup_root)
 
     def delete_collection(self, name: str) -> None:
         runtime, collection_lock = self._collection_context(name)
         deleted = False
         with collection_lock:
-            backup = self._begin_delete_collection_mutation(runtime)
-            staged_path = backup.backup_root / "staged_collection"
-            try:
-                self._close_runtime_engine(runtime)
-                if runtime.path.exists():
-                    runtime.path.rename(staged_path)
-                with self._collections_lock:
-                    self.collections.pop(runtime.name, None)
-            except Exception:
-                if staged_path.exists() and not runtime.path.exists():
-                    staged_path.rename(runtime.path)
-                raise
+            with self._cross_process_collection_lock(runtime.name):
+                backup = self._begin_delete_collection_mutation(runtime)
+                staged_path = backup.backup_root / "staged_collection"
+                try:
+                    self._close_runtime_engine(runtime)
+                    if runtime.path.exists():
+                        runtime.path.rename(staged_path)
+                    with self._collections_lock:
+                        self.collections.pop(runtime.name, None)
+                except Exception:
+                    if staged_path.exists() and not runtime.path.exists():
+                        staged_path.rename(runtime.path)
+                    raise
         try:
             if staged_path.exists():
                 shutil.rmtree(staged_path)
@@ -782,6 +914,53 @@ class SearchService:
         payload.setdefault("external_id", point.id)
         return payload
 
+    def _decode_transport_array(
+        self,
+        value: Any,
+        *,
+        field_name: str,
+    ) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        if isinstance(value, TransportVectorPayload):
+            try:
+                array = decode_payload(value.model_dump())
+            except Exception as exc:
+                raise ValidationError(f"Invalid {field_name} payload: {exc}") from exc
+        else:
+            array = np.asarray(value, dtype=np.float32)
+        return np.asarray(array, dtype=np.float32)
+
+    def _coerce_single_vector_input(
+        self,
+        value: Any,
+        *,
+        field_name: str,
+    ) -> Optional[np.ndarray]:
+        array = self._decode_transport_array(value, field_name=field_name)
+        if array is None:
+            return None
+        if array.ndim == 2 and array.shape[0] == 1:
+            array = array[0]
+        if array.ndim != 1:
+            raise ValidationError(f"{field_name} must decode to a single vector")
+        return np.ascontiguousarray(array, dtype=np.float32)
+
+    def _coerce_multi_vector_input(
+        self,
+        value: Any,
+        *,
+        field_name: str,
+    ) -> Optional[np.ndarray]:
+        array = self._decode_transport_array(value, field_name=field_name)
+        if array is None:
+            return None
+        if array.ndim == 1:
+            array = array.reshape(1, -1)
+        if array.ndim != 2:
+            raise ValidationError(f"{field_name} must decode to a 2D vector matrix")
+        return np.ascontiguousarray(array, dtype=np.float32)
+
     def _trim_late_interaction_vectors(
         self,
         runtime: CollectionRuntime,
@@ -797,159 +976,267 @@ class SearchService:
     def add_points(self, name: str, points: List[PointVector]) -> int:
         runtime, collection_lock = self._collection_context(name)
         with collection_lock:
-            backup = self._begin_collection_mutation(runtime, operation="add_points")
-            try:
-                record_keys = [str(point.id) for point in points]
-                if len(record_keys) != len(set(record_keys)):
-                    raise ValidationError("Point IDs must be unique within a single request")
+            with self._cross_process_collection_lock(runtime.name):
+                backup = self._begin_collection_mutation(runtime, operation="add_points")
+                try:
+                    record_keys = [str(point.id) for point in points]
+                    if len(record_keys) != len(set(record_keys)):
+                        raise ValidationError("Point IDs must be unique within a single request")
 
-                payloads = [self._prepare_payload(point) for point in points]
-                corpus = [
-                    payload.get("text") or payload.get("content") or ""
-                    for payload in payloads
-                ]
-                existing_internal_ids = [
-                    int(runtime.meta["records"][record_key]["internal_id"])
-                    for record_key in record_keys
-                    if record_key in runtime.meta["records"]
-                ]
-                if existing_internal_ids:
-                    self._delete_internal_ids(runtime, existing_internal_ids)
-
-                if runtime.kind == CollectionKind.DENSE:
-                    if any(point.vector is None for point in points):
-                        raise ValidationError("Dense collections require single vectors")
-                    vectors = np.asarray([point.vector for point in points], dtype=np.float32)
-                    if vectors.ndim != 2 or vectors.shape[1] != int(runtime.meta["dimension"]):
-                        raise ValidationError("Dense vectors must match the collection dimension")
-                    ids = [self._next_internal_id(runtime) for _ in points]
-                    runtime.engine.hnsw.add(vectors, ids=ids, payloads=payloads)
-                    for record_key in record_keys:
-                        runtime.meta["records"].pop(record_key, None)
-                    for record_key, point, payload, text_value, internal_id in zip(record_keys, points, payloads, corpus, ids):
-                        runtime.meta["records"][record_key] = {
-                            "external_id": point.id,
-                            "internal_id": internal_id,
-                            "payload": payload,
-                            "text": text_value,
-                        }
-                    self._sync_dense_sparse_state(runtime, rebuild_sparse=False)
-                    self._flush_runtime_engine(runtime)
-                elif runtime.kind == CollectionKind.LATE_INTERACTION:
-                    if any(point.vectors is None for point in points):
-                        raise ValidationError("Late-interaction collections require multi-vectors")
-                    tensor = torch.from_numpy(np.asarray([point.vectors for point in points], dtype=np.float32))
-                    if tensor.dim() != 3 or tensor.shape[-1] != int(runtime.meta["dimension"]):
-                        raise ValidationError("Late-interaction tensors must have shape (docs, tokens, dim)")
-                    if runtime.engine.storage.num_docs == 0 and not runtime.engine.storage.data_file.exists():
-                        def batch_gen():
-                            yield tensor.detach().cpu(), payloads
-                        assigned_ids = runtime.engine.build_from_batches(
-                            batch_gen(),
-                            collection_name="default",
-                            max_tokens=tensor.shape[1],
-                        )
-                    else:
-                        assigned_ids = runtime.engine.add_documents(tensor, metadata=payloads)
-                    for record_key in record_keys:
-                        runtime.meta["records"].pop(record_key, None)
-                    for record_key, point, payload, text_value, internal_id in zip(record_keys, points, payloads, corpus, assigned_ids):
-                        runtime.meta["records"][record_key] = {
-                            "external_id": point.id,
-                            "internal_id": int(internal_id),
-                            "payload": payload,
-                            "text": text_value,
-                        }
-                    if assigned_ids:
-                        runtime.meta["next_internal_id"] = max(
-                            int(runtime.meta.get("next_internal_id", 0)),
-                            max(int(item_id) for item_id in assigned_ids) + 1,
-                        )
-                    self._refresh_runtime_indexes(runtime)
-                elif runtime.kind == CollectionKind.SHARD:
-                    if any(point.vectors is None for point in points):
-                        raise ValidationError("Shard collections require multi-vectors")
-                    multi_vecs = [
-                        np.asarray(point.vectors, dtype=np.float32) for point in points
+                    payloads = [self._prepare_payload(point) for point in points]
+                    corpus = [
+                        payload.get("text") or payload.get("content") or ""
+                        for payload in payloads
                     ]
-                    if any(v.ndim != 2 or v.shape[1] != int(runtime.meta["dimension"]) for v in multi_vecs):
-                        raise ValidationError("Shard multi-vectors must have shape (tokens, dim)")
-                    ids = [self._next_internal_id(runtime) for _ in points]
-                    runtime.engine.add_multidense(multi_vecs, ids, payloads)
-                    for record_key in record_keys:
-                        runtime.meta["records"].pop(record_key, None)
-                    for record_key, point, payload, text_value, internal_id in zip(
-                        record_keys, points, payloads, corpus, ids,
-                    ):
-                        runtime.meta["records"][record_key] = {
-                            "external_id": point.id,
-                            "internal_id": internal_id,
-                            "payload": payload,
-                            "text": text_value,
-                        }
-                    self._flush_runtime_engine(runtime)
-                    self._refresh_runtime_indexes(runtime)
-                else:
-                    if any(point.vectors is None for point in points):
-                        raise ValidationError("Multimodal collections require multi-vectors")
-                    vectors = np.asarray([point.vectors for point in points], dtype=np.float32)
-                    if vectors.ndim != 3 or vectors.shape[-1] != int(runtime.meta["dimension"]):
-                        raise ValidationError("Multimodal tensors must have shape (docs, patches, dim)")
-                    ids = [self._next_internal_id(runtime) for _ in points]
-                    runtime.engine.add_documents(vectors, doc_ids=ids)
-                    for record_key in record_keys:
-                        runtime.meta["records"].pop(record_key, None)
-                    for record_key, point, payload, text_value, internal_id in zip(record_keys, points, payloads, corpus, ids):
-                        runtime.meta["records"][record_key] = {
-                            "external_id": point.id,
-                            "internal_id": internal_id,
-                            "payload": payload,
-                            "text": text_value,
-                        }
-                    self._refresh_runtime_indexes(runtime)
+                    existing_internal_ids = [
+                        int(runtime.meta["records"][record_key]["internal_id"])
+                        for record_key in record_keys
+                        if record_key in runtime.meta["records"]
+                    ]
+                    if existing_internal_ids:
+                        self._delete_internal_ids(runtime, existing_internal_ids)
 
-                self._evict_if_over_limit(runtime)
-                self._write_meta(runtime)
-                self._commit_journal(backup)
-                return len(points)
-            except Exception:
-                self._restore_collection_mutation(runtime, backup)
-                raise
-            finally:
-                self._cleanup_journal(backup.backup_root)
+                    if runtime.kind == CollectionKind.DENSE:
+                        if any(point.vector is None for point in points):
+                            raise ValidationError("Dense collections require single vectors")
+                        vectors = np.stack(
+                            [
+                                self._coerce_single_vector_input(
+                                    point.vector,
+                                    field_name=f"points[{idx}].vector",
+                                )
+                                for idx, point in enumerate(points)
+                            ],
+                            axis=0,
+                        )
+                        if vectors.ndim != 2 or vectors.shape[1] != int(runtime.meta["dimension"]):
+                            raise ValidationError("Dense vectors must match the collection dimension")
+                        ids = [self._next_internal_id(runtime) for _ in points]
+                        runtime.engine.hnsw.add(vectors, ids=ids, payloads=payloads)
+                        for record_key in record_keys:
+                            runtime.meta["records"].pop(record_key, None)
+                        for record_key, point, payload, text_value, internal_id in zip(record_keys, points, payloads, corpus, ids):
+                            runtime.meta["records"][record_key] = {
+                                "external_id": point.id,
+                                "internal_id": internal_id,
+                                "payload": payload,
+                                "text": text_value,
+                            }
+                        self._sync_dense_sparse_state(runtime, rebuild_sparse=False)
+                        self._flush_runtime_engine(runtime)
+                    elif runtime.kind == CollectionKind.LATE_INTERACTION:
+                        if any(point.vectors is None for point in points):
+                            raise ValidationError("Late-interaction collections require multi-vectors")
+                        tensor = torch.from_numpy(
+                            np.stack(
+                                [
+                                    self._coerce_multi_vector_input(
+                                        point.vectors,
+                                        field_name=f"points[{idx}].vectors",
+                                    )
+                                    for idx, point in enumerate(points)
+                                ],
+                                axis=0,
+                            ),
+                        )
+                        if tensor.dim() != 3 or tensor.shape[-1] != int(runtime.meta["dimension"]):
+                            raise ValidationError("Late-interaction tensors must have shape (docs, tokens, dim)")
+                        if runtime.engine.storage.num_docs == 0 and not runtime.engine.storage.data_file.exists():
+                            def batch_gen():
+                                yield tensor.detach().cpu(), payloads
+                            assigned_ids = runtime.engine.build_from_batches(
+                                batch_gen(),
+                                collection_name="default",
+                                max_tokens=tensor.shape[1],
+                            )
+                        else:
+                            assigned_ids = runtime.engine.add_documents(tensor, metadata=payloads)
+                        for record_key in record_keys:
+                            runtime.meta["records"].pop(record_key, None)
+                        for record_key, point, payload, text_value, internal_id in zip(record_keys, points, payloads, corpus, assigned_ids):
+                            runtime.meta["records"][record_key] = {
+                                "external_id": point.id,
+                                "internal_id": int(internal_id),
+                                "payload": payload,
+                                "text": text_value,
+                            }
+                        if assigned_ids:
+                            runtime.meta["next_internal_id"] = max(
+                                int(runtime.meta.get("next_internal_id", 0)),
+                                max(int(item_id) for item_id in assigned_ids) + 1,
+                            )
+                        self._refresh_runtime_indexes(runtime)
+                    elif runtime.kind == CollectionKind.SHARD:
+                        if any(point.vectors is None for point in points):
+                            raise ValidationError("Shard collections require multi-vectors")
+                        multi_vecs = [
+                            self._coerce_multi_vector_input(
+                                point.vectors,
+                                field_name=f"points[{idx}].vectors",
+                            )
+                            for idx, point in enumerate(points)
+                        ]
+                        if any(v.ndim != 2 or v.shape[1] != int(runtime.meta["dimension"]) for v in multi_vecs):
+                            raise ValidationError("Shard multi-vectors must have shape (tokens, dim)")
+                        ids = [self._next_internal_id(runtime) for _ in points]
+                        runtime.engine.add_multidense(multi_vecs, ids, payloads)
+                        for record_key in record_keys:
+                            runtime.meta["records"].pop(record_key, None)
+                        for record_key, point, payload, text_value, internal_id in zip(
+                            record_keys, points, payloads, corpus, ids,
+                        ):
+                            runtime.meta["records"][record_key] = {
+                                "external_id": point.id,
+                                "internal_id": internal_id,
+                                "payload": payload,
+                                "text": text_value,
+                            }
+                        self._flush_runtime_engine(runtime)
+                        self._refresh_runtime_indexes(runtime)
+                    else:
+                        if any(point.vectors is None for point in points):
+                            raise ValidationError("Multimodal collections require multi-vectors")
+                        vectors = np.stack(
+                            [
+                                self._coerce_multi_vector_input(
+                                    point.vectors,
+                                    field_name=f"points[{idx}].vectors",
+                                )
+                                for idx, point in enumerate(points)
+                            ],
+                            axis=0,
+                        )
+                        if vectors.ndim != 3 or vectors.shape[-1] != int(runtime.meta["dimension"]):
+                            raise ValidationError("Multimodal tensors must have shape (docs, patches, dim)")
+                        ids = [self._next_internal_id(runtime) for _ in points]
+                        runtime.engine.add_documents(vectors, doc_ids=ids)
+                        for record_key in record_keys:
+                            runtime.meta["records"].pop(record_key, None)
+                        for record_key, point, payload, text_value, internal_id in zip(record_keys, points, payloads, corpus, ids):
+                            runtime.meta["records"][record_key] = {
+                                "external_id": point.id,
+                                "internal_id": internal_id,
+                                "payload": payload,
+                                "text": text_value,
+                            }
+                        self._refresh_runtime_indexes(runtime)
+
+                    self._evict_if_over_limit(runtime)
+                    self._write_meta(runtime)
+                    self._commit_journal(backup)
+                    return len(points)
+                except Exception:
+                    self._restore_collection_mutation(runtime, backup)
+                    raise
+                finally:
+                    self._cleanup_journal(backup.backup_root)
 
     def delete_points(self, name: str, point_ids: List[Any]) -> int:
         runtime, collection_lock = self._collection_context(name)
         with collection_lock:
-            backup = self._begin_collection_mutation(runtime, operation="delete_points")
+            with self._cross_process_collection_lock(runtime.name):
+                backup = self._begin_collection_mutation(runtime, operation="delete_points")
+                try:
+                    record_keys = [str(point_id) for point_id in point_ids]
+                    internal_ids = [
+                        int(runtime.meta["records"][record_key]["internal_id"])
+                        for record_key in record_keys
+                        if record_key in runtime.meta["records"]
+                    ]
+                    if not internal_ids:
+                        return 0
+
+                    self._delete_internal_ids(runtime, internal_ids)
+                    for record_key in record_keys:
+                        runtime.meta["records"].pop(record_key, None)
+
+                    if runtime.kind == CollectionKind.DENSE:
+                        self._sync_dense_sparse_state(runtime, rebuild_sparse=False)
+                        self._flush_runtime_engine(runtime)
+                    else:
+                        self._refresh_runtime_indexes(runtime)
+
+                    self._write_meta(runtime)
+                    self._commit_journal(backup)
+                    return len(internal_ids)
+                except Exception:
+                    self._restore_collection_mutation(runtime, backup)
+                    raise
+                finally:
+                    self._cleanup_journal(backup.backup_root)
+
+    def _read_task_record(self, task_id: str) -> Dict[str, Any]:
+        path = self._task_record_path(task_id)
+        if not path.exists():
+            raise NotFoundError("Task not found")
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def _write_task_record(self, task_id: str, record: Dict[str, Any]) -> None:
+        self._write_json_atomic(self._task_record_path(task_id), record)
+
+    def _evict_stale_task_records(self) -> None:
+        now = datetime.now(timezone.utc)
+        for record_path in self._task_root.glob("*.json"):
             try:
-                record_keys = [str(point_id) for point_id in point_ids]
-                internal_ids = [
-                    int(runtime.meta["records"][record_key]["internal_id"])
-                    for record_key in record_keys
-                    if record_key in runtime.meta["records"]
-                ]
-                if not internal_ids:
-                    return 0
-
-                self._delete_internal_ids(runtime, internal_ids)
-                for record_key in record_keys:
-                    runtime.meta["records"].pop(record_key, None)
-
-                if runtime.kind == CollectionKind.DENSE:
-                    self._sync_dense_sparse_state(runtime, rebuild_sparse=False)
-                    self._flush_runtime_engine(runtime)
-                else:
-                    self._refresh_runtime_indexes(runtime)
-
-                self._write_meta(runtime)
-                self._commit_journal(backup)
-                return len(internal_ids)
+                with open(record_path, "r", encoding="utf-8") as handle:
+                    record = json.load(handle)
             except Exception:
-                self._restore_collection_mutation(runtime, backup)
-                raise
-            finally:
-                self._cleanup_journal(backup.backup_root)
+                record_path.unlink(missing_ok=True)
+                continue
+            if record.get("status") not in (MutationTaskStatus.COMPLETED.value, MutationTaskStatus.FAILED.value):
+                continue
+            completed = record.get("completed_at")
+            if not completed:
+                continue
+            try:
+                age = (now - datetime.fromisoformat(completed)).total_seconds()
+            except (TypeError, ValueError):
+                age = _TASK_MAX_AGE_S + 1
+            if age > _TASK_MAX_AGE_S:
+                record_path.unlink(missing_ok=True)
+
+    def submit_task(self, fn: Callable[[], Dict[str, Any]]) -> str:
+        task_id = uuid.uuid4().hex[:12]
+        record: Dict[str, Any] = {
+            "status": MutationTaskStatus.PENDING.value,
+            "result": None,
+            "error": None,
+            "created_at": self._now(),
+            "completed_at": None,
+        }
+        with self._task_thread_lock:
+            task_count = sum(1 for _ in self._task_root.glob("*.json"))
+            if task_count >= _TASK_MAX_ENTRIES:
+                self._evict_stale_task_records()
+            self._write_task_record(task_id, record)
+
+        def _worker() -> None:
+            try:
+                running = self._read_task_record(task_id)
+                running["status"] = MutationTaskStatus.RUNNING.value
+                self._write_task_record(task_id, running)
+                result = fn()
+                running["status"] = MutationTaskStatus.COMPLETED.value
+                running["result"] = result
+                running["completed_at"] = self._now()
+                self._write_task_record(task_id, running)
+            except Exception as exc:
+                logger.error("Async task %s failed: %s", task_id, exc, exc_info=True)
+                failed = {
+                    "status": MutationTaskStatus.FAILED.value,
+                    "result": None,
+                    "error": str(exc),
+                    "created_at": record["created_at"],
+                    "completed_at": self._now(),
+                }
+                self._write_task_record(task_id, failed)
+
+        threading.Thread(target=_worker, name=f"task-{task_id}", daemon=True).start()
+        return task_id
+
+    def get_task_status(self, task_id: str) -> Dict[str, Any]:
+        return self._read_task_record(task_id)
 
     # ------------------------------------------------------------------
     # Shard admin
@@ -1068,7 +1355,7 @@ class SearchService:
 
     def _dense_query_vector(self, runtime: CollectionRuntime, request: SearchRequest) -> Optional[np.ndarray]:
         if request.vector is not None:
-            query = np.asarray(request.vector, dtype=np.float32)
+            query = self._coerce_single_vector_input(request.vector, field_name="vector")
         elif request.vectors is not None:
             raise ValidationError("Dense search requires 'vector'; 'vectors' is only supported for late-interaction or multimodal collections")
         else:
@@ -1086,7 +1373,11 @@ class SearchService:
         }
 
     def _dense_solver_constraints(self, request: SearchRequest) -> Any:
-        if request.max_tokens is None and request.max_chunks is None:
+        if (
+            request.max_tokens is None
+            and request.max_chunks is None
+            and request.max_per_cluster is None
+        ):
             return None
         try:
             from latence_solver import SolverConstraints  # type: ignore
@@ -1097,11 +1388,103 @@ class SearchService:
         return SolverConstraints(
             max_tokens=request.max_tokens or 1024,
             max_chunks=request.max_chunks or 10,
-            max_per_cluster=2,
+            max_per_cluster=request.max_per_cluster or 2,
         )
 
+    @staticmethod
+    def _request_solver_config(
+        request: SearchRequest,
+        *,
+        defaults: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        merged = dict(defaults or {})
+        if request.solver_config:
+            merged.update(dict(request.solver_config))
+        if request.optimizer_policy is not None:
+            merged["optimizer_policy"] = request.optimizer_policy
+        return merged
+
+    @staticmethod
+    def _dense_refine_options(request: SearchRequest) -> Optional[Dict[str, Any]]:
+        if not (
+            request.refine_use_cross_encoder
+            or request.refine_use_nli
+            or request.refine_confidence_gating
+            or request.refine_cross_encoder_model
+            or request.refine_nli_model
+        ):
+            return None
+        if (request.refine_use_cross_encoder or request.refine_use_nli) and not (request.query_text or "").strip():
+            raise ValidationError(
+                "Optimized dense search with refine_use_cross_encoder/refine_use_nli requires query_text"
+            )
+        options: Dict[str, Any] = {}
+        if request.refine_use_cross_encoder:
+            options["use_cross_encoder"] = True
+        if request.refine_cross_encoder_model:
+            options["cross_encoder_model"] = request.refine_cross_encoder_model
+        if request.refine_cross_encoder_top_k is not None:
+            options["cross_encoder_top_k"] = int(request.refine_cross_encoder_top_k)
+        if request.refine_cross_encoder_batch_size is not None:
+            options["cross_encoder_batch_size"] = int(request.refine_cross_encoder_batch_size)
+        if request.refine_use_nli:
+            options["use_nli"] = True
+        if request.refine_nli_model:
+            options["nli_model"] = request.refine_nli_model
+        if request.refine_nli_top_k is not None:
+            options["nli_top_k"] = int(request.refine_nli_top_k)
+        if request.refine_nli_batch_size is not None:
+            options["nli_batch_size"] = int(request.refine_nli_batch_size)
+        if request.refine_nli_promote_base_relevance:
+            options["nli_promote_base_relevance"] = True
+        if request.refine_confidence_gating:
+            options["confidence_gating"] = True
+        if request.refine_confidence_gap_threshold is not None:
+            options["confidence_gap_threshold"] = float(request.refine_confidence_gap_threshold)
+        if request.refine_confidence_min_candidates is not None:
+            options["confidence_min_candidates"] = int(request.refine_confidence_min_candidates)
+        return options or None
+
+    @staticmethod
+    def _dense_uses_solver(request: SearchRequest) -> bool:
+        if request.dense_hybrid_mode is not None:
+            return request.dense_hybrid_mode.value == "tabu"
+        return request.strategy == SearchStrategy.OPTIMIZED
+
+    @staticmethod
+    def _normalize_quantization_mode(value: Optional[str]) -> str:
+        normalized = str(value or "").strip().lower()
+        return "" if normalized in {"", "none"} else normalized
+
+    @staticmethod
+    def _shard_search_overrides(request: SearchRequest) -> Dict[str, Any]:
+        overrides: Dict[str, Any] = {}
+        if request.quantization_mode is not None:
+            overrides["quantization_mode"] = SearchService._normalize_quantization_mode(request.quantization_mode)
+        if request.use_colbandit is not None:
+            overrides["use_colbandit"] = bool(request.use_colbandit)
+        if request.transfer_mode is not None:
+            overrides["transfer_mode"] = request.transfer_mode
+        if request.max_docs_exact is not None:
+            overrides["max_docs_exact"] = int(request.max_docs_exact)
+        if request.n_full_scores is not None:
+            overrides["n_full_scores"] = int(request.n_full_scores)
+        if request.lemur_search_k_cap is not None:
+            overrides["lemur_search_k_cap"] = int(request.lemur_search_k_cap)
+        if request.gpu_corpus_rerank_topn is not None:
+            overrides["gpu_corpus_rerank_topn"] = int(request.gpu_corpus_rerank_topn)
+        if request.n_centroid_approx is not None:
+            overrides["n_centroid_approx"] = int(request.n_centroid_approx)
+        if request.variable_length_strategy is not None:
+            overrides["variable_length_strategy"] = str(request.variable_length_strategy)
+        if request.pinned_pool_buffers is not None:
+            overrides["pinned_pool_buffers"] = int(request.pinned_pool_buffers)
+        if request.pinned_buffer_max_tokens is not None:
+            overrides["pinned_buffer_max_tokens"] = int(request.pinned_buffer_max_tokens)
+        return overrides
+
     def _dense_refine_candidate_k(self, request: SearchRequest) -> int:
-        if request.strategy != SearchStrategy.OPTIMIZED:
+        if not self._dense_uses_solver(request):
             return request.top_k
         requested_chunks = request.max_chunks or min(10, request.top_k)
         widened = min(256, max(request.top_k * 4, requested_chunks * 6, 24))
@@ -1191,9 +1574,11 @@ class SearchService:
         if hasattr(self, "_multimodal_optimizer_pipeline"):
             return True
         try:
-            import latence_solver  # type: ignore  # noqa: F401
-        except ImportError:
+            self._get_multimodal_optimizer_pipeline()
+        except ValidationError:
             return False
+        except Exception:
+            return True
         return True
 
     def _multimodal_candidate_factory(
@@ -1318,7 +1703,7 @@ class SearchService:
         return {
             "max_tokens": int(request.max_tokens or max(total_tokens, 1)),
             "max_chunks": int(request.max_chunks or default_max_chunks),
-            "max_per_cluster": 2,
+            "max_per_cluster": int(request.max_per_cluster or 2),
         }
 
     def _trim_multimodal_solver_items_to_payload(
@@ -1412,8 +1797,11 @@ class SearchService:
             query_vectors=query_embedding,
             candidate_items=candidate_items,
             constraints=constraints,
-            solver_config={"iterations": 48},
-            metadata={"multimodal_mode": "solver_prefilter_maxsim"},
+            solver_config=self._request_solver_config(request, defaults={"iterations": 48}),
+            metadata={
+                "multimodal_mode": "solver_prefilter_maxsim",
+                "optimizer_policy": request.optimizer_policy,
+            },
         )
         solver_elapsed_ms = (time.perf_counter() - optimize_start) * 1000.0
         selected_ids = self._solver_selected_internal_ids(
@@ -1508,8 +1896,11 @@ class SearchService:
             query_vectors=query_embedding,
             candidate_items=candidate_items,
             constraints=constraints,
-            solver_config={"iterations": 48},
-            metadata={"multimodal_mode": "maxsim_then_solver"},
+            solver_config=self._request_solver_config(request, defaults={"iterations": 48}),
+            metadata={
+                "multimodal_mode": "maxsim_then_solver",
+                "optimizer_policy": request.optimizer_policy,
+            },
         )
         solver_elapsed_ms = (time.perf_counter() - optimize_start) * 1000.0
         selected_ids = self._solver_selected_internal_ids(
@@ -1552,8 +1943,8 @@ class SearchService:
         query: np.ndarray,
         fused: List[tuple[int, float]],
     ) -> tuple[List[tuple[int, float]], Optional[dict[str, Any]]]:
-        if request.strategy != SearchStrategy.OPTIMIZED:
-            return fused, None
+        if not self._dense_uses_solver(request):
+            return fused[: request.top_k], None
         if not getattr(runtime.engine, "solver_available", False):
             raise ValidationError(
                 "Optimized dense search requires the latence_solver native package to be installed"
@@ -1561,12 +1952,21 @@ class SearchService:
         if query is None:
             raise ValidationError("Optimized dense search requires 'vector' so the solver can score dense candidates")
 
-        refined = runtime.engine.refine(
-            query_vector=query,
-            query_text=request.query_text or "",
-            candidate_ids=[doc_id for doc_id, _ in fused],
-            constraints=self._dense_solver_constraints(request),
-        )
+        try:
+            refined = runtime.engine.refine(
+                query_vector=query,
+                query_text=request.query_text or "",
+                query_payload=request.query_payload,
+                candidate_ids=[doc_id for doc_id, _ in fused],
+                solver_config=self._request_solver_config(request),
+                constraints=self._dense_solver_constraints(request),
+                optimizer_policy=request.optimizer_policy,
+                refine_options=self._dense_refine_options(request),
+            )
+        except ImportError as exc:
+            raise ValidationError(
+                "Cross-encoder dense refinement requires sentence-transformers to be installed."
+            ) from exc
         selected_ids = [
             int(doc_id)
             for doc_id in refined.get("selected_internal_ids", [])
@@ -1646,13 +2046,17 @@ class SearchService:
 
             if runtime.kind == CollectionKind.DENSE:
                 query = self._dense_query_vector(runtime, request)
+                use_dense_solver = self._dense_uses_solver(request)
                 if query is None and not request.query_text:
                     raise ValidationError("Dense search requires a vector or query_text")
-                if request.strategy == SearchStrategy.OPTIMIZED and query is None:
-                    raise ValidationError("Optimized dense search requires 'vector' because solver refinement is dense-query aware")
+                if use_dense_solver and query is None:
+                    raise ValidationError("Tabu-refined dense search requires 'vector' because solver refinement is dense-query aware")
                 if request.query_text and runtime.meta.get("sparse_dirty"):
-                    self._sync_dense_sparse_state(runtime, rebuild_sparse=True)
-                    self._write_meta(runtime)
+                    with self._cross_process_collection_lock(runtime.name):
+                        runtime = self.get_collection(runtime.name)
+                        if runtime.meta.get("sparse_dirty"):
+                            self._sync_dense_sparse_state(runtime, rebuild_sparse=True)
+                            self._write_meta(runtime)
                 if not runtime.meta.get("records"):
                     elapsed_ms = (time.perf_counter() - start) * 1000.0
                     self._record_search_metrics(elapsed_ms)
@@ -1701,9 +2105,11 @@ class SearchService:
                 if request.query_text:
                     raise ValidationError("Late-interaction collections do not support query_text search")
                 if request.vectors is not None:
-                    query_tensor = torch.tensor([request.vectors], dtype=torch.float32, device=self.device)
+                    query_vectors = self._coerce_multi_vector_input(request.vectors, field_name="vectors")
+                    query_tensor = torch.from_numpy(query_vectors[None, ...]).to(self.device, dtype=torch.float32)
                 elif request.vector is not None:
-                    query_tensor = torch.tensor([[request.vector]], dtype=torch.float32, device=self.device)
+                    query_vector = self._coerce_single_vector_input(request.vector, field_name="vector")
+                    query_tensor = torch.from_numpy(query_vector.reshape(1, 1, -1)).to(self.device, dtype=torch.float32)
                 else:
                     raise ValidationError("Late-interaction search requires 'vectors' or 'vector'")
 
@@ -1756,10 +2162,12 @@ class SearchService:
                     raise ValidationError("Shard collections do not support query_text search")
                 if request.strategy == SearchStrategy.OPTIMIZED:
                     logger.debug("SearchStrategy.OPTIMIZED is not applicable to shard collections; using shard routing")
+                shard_overrides = self._shard_search_overrides(request)
                 if request.vectors is not None:
-                    query_np = np.asarray(request.vectors, dtype=np.float32)
+                    query_np = self._coerce_multi_vector_input(request.vectors, field_name="vectors")
                 elif request.vector is not None:
-                    query_np = np.asarray([request.vector], dtype=np.float32)
+                    query_vector = self._coerce_single_vector_input(request.vector, field_name="vector")
+                    query_np = np.asarray([query_vector], dtype=np.float32)
                 else:
                     raise ValidationError("Shard search requires 'vectors' or 'vector'")
                 if query_np.shape[-1] != int(runtime.meta["dimension"]):
@@ -1774,6 +2182,7 @@ class SearchService:
                     k=request.top_k,
                     filters=request.filter,
                     n_probes=request.n_probes,
+                    **shard_overrides,
                 )
                 selected_pairs = [
                     (did, sc) for did, sc in shard_results
@@ -1793,9 +2202,10 @@ class SearchService:
                 if request.query_text:
                     raise ValidationError("Multimodal collections do not support query_text search")
                 if request.vectors is not None:
-                    query_embedding = np.asarray(request.vectors, dtype=np.float32)
+                    query_embedding = self._coerce_multi_vector_input(request.vectors, field_name="vectors")
                 elif request.vector is not None:
-                    query_embedding = np.asarray([request.vector], dtype=np.float32)
+                    query_vector = self._coerce_single_vector_input(request.vector, field_name="vector")
+                    query_embedding = np.asarray([query_vector], dtype=np.float32)
                 else:
                     raise ValidationError("Multimodal search requires 'vectors' or 'vector'")
 
@@ -1909,9 +2319,35 @@ class SearchService:
             shard_n_shards = None
             shard_k_candidates = None
             shard_total_tokens = None
+            shard_compression = None
+            shard_quantization_mode = None
+            shard_transfer_mode = None
+            shard_router_device = None
+            shard_use_colbandit = None
+            shard_max_docs_exact = None
+            shard_n_full_scores = None
+            shard_pinned_pool_buffers = None
+            shard_pinned_buffer_max_tokens = None
+            shard_lemur_search_k_cap = None
+            shard_gpu_corpus_rerank_topn = None
+            shard_n_centroid_approx = None
+            shard_variable_length_strategy = None
             if runtime.kind == CollectionKind.SHARD:
                 shard_n_shards = runtime.meta.get("n_shards")
                 shard_k_candidates = runtime.meta.get("k_candidates")
+                shard_compression = runtime.meta.get("compression")
+                shard_quantization_mode = runtime.meta.get("quantization_mode")
+                shard_transfer_mode = runtime.meta.get("transfer_mode")
+                shard_router_device = runtime.meta.get("router_device")
+                shard_use_colbandit = runtime.meta.get("use_colbandit")
+                shard_max_docs_exact = runtime.meta.get("max_docs_exact")
+                shard_n_full_scores = runtime.meta.get("n_full_scores")
+                shard_pinned_pool_buffers = runtime.meta.get("pinned_pool_buffers")
+                shard_pinned_buffer_max_tokens = runtime.meta.get("pinned_buffer_max_tokens")
+                shard_lemur_search_k_cap = runtime.meta.get("lemur_search_k_cap")
+                shard_gpu_corpus_rerank_topn = runtime.meta.get("gpu_corpus_rerank_topn")
+                shard_n_centroid_approx = runtime.meta.get("n_centroid_approx")
+                shard_variable_length_strategy = runtime.meta.get("variable_length_strategy")
                 store = getattr(runtime.engine, "_store", None)
                 if store and store.manifest:
                     shard_total_tokens = store.manifest.total_tokens
@@ -1931,6 +2367,20 @@ class SearchService:
                 n_shards=shard_n_shards,
                 k_candidates=shard_k_candidates,
                 total_tokens=shard_total_tokens,
+                compression=shard_compression,
+                quantization_mode=shard_quantization_mode,
+                transfer_mode=shard_transfer_mode,
+                router_device=shard_router_device,
+                use_colbandit=shard_use_colbandit,
+                max_docs_exact=shard_max_docs_exact,
+                n_full_scores=shard_n_full_scores,
+                pinned_pool_buffers=shard_pinned_pool_buffers,
+                pinned_buffer_max_tokens=shard_pinned_buffer_max_tokens,
+                lemur_search_k_cap=shard_lemur_search_k_cap,
+                gpu_corpus_rerank_topn=shard_gpu_corpus_rerank_topn,
+                n_centroid_approx=shard_n_centroid_approx,
+                variable_length_strategy=shard_variable_length_strategy,
+                hybrid_search=(runtime.kind == CollectionKind.DENSE),
             )
 
     def reference_preprocess_documents(self, request: RenderDocumentsRequest) -> Dict[str, Any]:
@@ -2063,23 +2513,24 @@ class SearchService:
         """Merge payload fields into specified points."""
         runtime, collection_lock = self._collection_context(name)
         with collection_lock:
-            records = runtime.meta.get("records") or {}
-            updated = 0
-            for pid in point_ids:
-                key = str(pid)
-                if key not in records:
-                    continue
-                existing = records[key].get("payload") or {}
-                existing.update(payload)
-                records[key]["payload"] = existing
-                internal_id = int(records[key]["internal_id"])
-                if runtime.kind == CollectionKind.SHARD and hasattr(runtime.engine, "upsert_payload"):
-                    runtime.engine.upsert_payload(internal_id, payload)
-                updated += 1
-            if updated:
-                self._refresh_runtime_indexes(runtime)
-                self._write_meta(runtime)
-            return updated
+            with self._cross_process_collection_lock(runtime.name):
+                records = runtime.meta.get("records") or {}
+                updated = 0
+                for pid in point_ids:
+                    key = str(pid)
+                    if key not in records:
+                        continue
+                    existing = records[key].get("payload") or {}
+                    existing.update(payload)
+                    records[key]["payload"] = existing
+                    internal_id = int(records[key]["internal_id"])
+                    if runtime.kind == CollectionKind.SHARD and hasattr(runtime.engine, "upsert_payload"):
+                        runtime.engine.upsert_payload(internal_id, payload)
+                    updated += 1
+                if updated:
+                    self._refresh_runtime_indexes(runtime)
+                    self._write_meta(runtime)
+                return updated
 
     def delete_payload_keys(
         self, name: str, point_ids: List[Any], keys: List[str],
@@ -2087,48 +2538,50 @@ class SearchService:
         """Remove specific payload keys from specified points."""
         runtime, collection_lock = self._collection_context(name)
         with collection_lock:
-            records = runtime.meta.get("records") or {}
-            updated = 0
-            for pid in point_ids:
-                key = str(pid)
-                if key not in records:
-                    continue
-                existing = records[key].get("payload") or {}
-                changed = False
-                for k in keys:
-                    if k in existing:
-                        del existing[k]
-                        changed = True
-                if changed:
-                    records[key]["payload"] = existing
-                    if runtime.kind == CollectionKind.SHARD and hasattr(runtime.engine, "upsert_payload"):
-                        internal_id = int(records[key]["internal_id"])
-                        runtime.engine.upsert_payload(internal_id, existing)
-                    updated += 1
-            if updated:
-                self._refresh_runtime_indexes(runtime)
-                self._write_meta(runtime)
-            return updated
+            with self._cross_process_collection_lock(runtime.name):
+                records = runtime.meta.get("records") or {}
+                updated = 0
+                for pid in point_ids:
+                    key = str(pid)
+                    if key not in records:
+                        continue
+                    existing = records[key].get("payload") or {}
+                    changed = False
+                    for k in keys:
+                        if k in existing:
+                            del existing[k]
+                            changed = True
+                    if changed:
+                        records[key]["payload"] = existing
+                        if runtime.kind == CollectionKind.SHARD and hasattr(runtime.engine, "upsert_payload"):
+                            internal_id = int(records[key]["internal_id"])
+                            runtime.engine.upsert_payload(internal_id, existing)
+                        updated += 1
+                if updated:
+                    self._refresh_runtime_indexes(runtime)
+                    self._write_meta(runtime)
+                return updated
 
     def clear_payload(self, name: str, point_ids: List[Any]) -> int:
         """Clear all payload fields from specified points."""
         runtime, collection_lock = self._collection_context(name)
         with collection_lock:
-            records = runtime.meta.get("records") or {}
-            updated = 0
-            for pid in point_ids:
-                key = str(pid)
-                if key not in records:
-                    continue
-                records[key]["payload"] = {}
-                if runtime.kind == CollectionKind.SHARD and hasattr(runtime.engine, "upsert_payload"):
-                    internal_id = int(records[key]["internal_id"])
-                    runtime.engine.upsert_payload(internal_id, {})
-                updated += 1
-            if updated:
-                self._refresh_runtime_indexes(runtime)
-                self._write_meta(runtime)
-            return updated
+            with self._cross_process_collection_lock(runtime.name):
+                records = runtime.meta.get("records") or {}
+                updated = 0
+                for pid in point_ids:
+                    key = str(pid)
+                    if key not in records:
+                        continue
+                    records[key]["payload"] = {}
+                    if runtime.kind == CollectionKind.SHARD and hasattr(runtime.engine, "upsert_payload"):
+                        internal_id = int(records[key]["internal_id"])
+                        runtime.engine.upsert_payload(internal_id, {})
+                    updated += 1
+                if updated:
+                    self._refresh_runtime_indexes(runtime)
+                    self._write_meta(runtime)
+                return updated
 
     def get_point_payload(self, name: str, point_id: str) -> Dict[str, Any]:
         """Return the payload dict for a single point."""
@@ -2348,6 +2801,7 @@ class SearchService:
         return issues
 
     def readiness_report(self) -> Dict[str, Any]:
+        self._sync_collection_registry()
         issues: List[Dict[str, str]] = [
             {
                 "scope": "service",

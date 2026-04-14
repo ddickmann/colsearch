@@ -7,6 +7,7 @@ Orchestrates fusion between HNSW (Dense) and BM25 (Sparse) retrieval.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -36,6 +37,8 @@ from voyager_index._internal.inference.stateless_optimizer import (
 )
 
 logger = logging.getLogger(__name__)
+DEFAULT_REFINE_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEFAULT_REFINE_NLI_MODEL = "cross-encoder/nli-distilroberta-base"
 
 try:
     from .hnsw_manager import HnswSegmentManager
@@ -123,12 +126,20 @@ class HybridSearchManager:
 
         # Sparse Index
         self.bm25_path = self.shard_path / "bm25"
+        self.bm25_params_path = self.bm25_path / "params.index.json"
         self.stemmer = Stemmer.Stemmer(stemmer_lang) if Stemmer is not None else None
         self.retriever = None
         self._legacy_bm25: Any = None
         self.sparse_error: Optional[str] = None
-        self.sparse_index_present = (self.bm25_path / "params.index.json").exists()
+        self.sparse_index_present = self.bm25_params_path.exists()
         self.sparse_dirty = False
+
+        # Buffer for real-time updates (bm25s is static)
+        # TODO: Implement dynamic buffer or periodic re-indexing
+        self.corpus_buffer: List[str] = []
+        self.ids_buffer: List[int] = []
+        self.payload_buffer: List[Dict[str, Any]] = []
+
         self._load_bm25()
 
         # Solver
@@ -159,19 +170,23 @@ class HybridSearchManager:
         self.solver_available = self.solver is not None
         self._optimizer_pipeline: Optional[GpuFulfilmentPipeline] = None
         self._last_search_context: Optional[Dict[str, Any]] = None
-
-        # Buffer for real-time updates (bm25s is static)
-        # TODO: Implement dynamic buffer or periodic re-indexing
-        self.corpus_buffer: List[str] = []
-        self.ids_buffer: List[int] = []
-        self.payload_buffer: List[Dict[str, Any]] = []
+        self._last_refine_context: Optional[Dict[str, Any]] = None
+        self._cross_encoder_models: Dict[str, Any] = {}
+        self._nli_models: Dict[str, Any] = {}
 
     def _load_bm25(self):
         """Load BM25 index if exists, falling back to LegacyBM25Engine."""
-        self.sparse_index_present = (self.bm25_path / "params.index.json").exists()
+        self.sparse_index_present = self.bm25_params_path.exists()
         if not self.sparse_index_present:
             self.retriever = None
             self.sparse_error = None
+            return
+        try:
+            json.loads(self.bm25_params_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.retriever = None
+            self._legacy_bm25 = None
+            self.sparse_error = f"bm25 metadata corrupted: {exc}"
             return
         if _BM25S_AVAILABLE:
             try:
@@ -181,7 +196,7 @@ class HybridSearchManager:
                 return
             except Exception as e:
                 logger.warning("bm25s load failed, trying legacy fallback: %s", e)
-        if LegacyBM25Engine is not None and self.corpus_buffer:
+        if LegacyBM25Engine is not None and getattr(self, "corpus_buffer", None):
             try:
                 self._legacy_bm25 = LegacyBM25Engine()
                 self._legacy_bm25.index_documents(self.corpus_buffer, self.ids_buffer)
@@ -195,6 +210,15 @@ class HybridSearchManager:
             self.sparse_error = "bm25s unavailable; corpus not yet loaded for legacy fallback"
         else:
             self.sparse_error = "bm25s unavailable and legacy fallback failed"
+
+    def _write_bm25_metadata(self, backend: str) -> None:
+        self.bm25_path.mkdir(parents=True, exist_ok=True)
+        if self.bm25_params_path.exists():
+            return
+        self.bm25_params_path.write_text(
+            json.dumps({"backend": backend, "doc_count": len(self.ids_buffer)}),
+            encoding="utf-8",
+        )
 
     def _swap_bm25_generation(self, staged_path: Path) -> None:
         current_path = self.bm25_path
@@ -291,6 +315,7 @@ class HybridSearchManager:
                 next_retriever.index(corpus_tokens)
                 next_retriever.save(str(staged_dir))
                 self._swap_bm25_generation(staged_dir)
+                self._write_bm25_metadata("bm25s")
                 self.retriever = bm25s.BM25.load(str(self.bm25_path), load_corpus=True)
                 self._legacy_bm25 = None
                 self.sparse_error = None
@@ -309,6 +334,7 @@ class HybridSearchManager:
                 engine.index_documents(sanitized_corpus, self.ids_buffer)
                 self._legacy_bm25 = engine
                 self.retriever = None
+                self._write_bm25_metadata("legacy")
                 self.sparse_error = None
                 self.sparse_index_present = True
                 self.sparse_dirty = False
@@ -373,7 +399,8 @@ class HybridSearchManager:
         query_text: str,
         query_vector: Optional[np.ndarray],
         k: int = 50,
-        filters: Optional[Dict[str, Any]] = None
+        filters: Optional[Dict[str, Any]] = None,
+        dense_search_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Perform Hybrid Search.
@@ -385,8 +412,24 @@ class HybridSearchManager:
             - 'union_ids': List[int]
         """
         dense_results = []
+        dense_search_kwargs = dict(dense_search_kwargs or {})
         if query_vector is not None:
-            dense_results = self.hnsw.search(query_vector, k=k, filters=filters)
+            dense_query = query_vector
+            if (
+                self._dense_engine_type == "shard"
+                and isinstance(query_vector, np.ndarray)
+                and query_vector.ndim == 1
+            ):
+                dense_query = query_vector.reshape(1, -1)
+            if self._dense_engine_type == "shard" and hasattr(self.hnsw, "search_multivector"):
+                dense_results = self.hnsw.search_multivector(
+                    dense_query,
+                    k=k,
+                    filters=filters,
+                    **dense_search_kwargs,
+                )
+            else:
+                dense_results = self.hnsw.search(dense_query, k=k, filters=filters)
         dense_ids = {rid for rid, _ in dense_results}
 
         sparse_results = []
@@ -406,7 +449,14 @@ class HybridSearchManager:
         elif self._legacy_bm25 and query_text.strip():
             self._ensure_sparse_ready()
             results = self._legacy_bm25.search(query_text, top_k=k)
+            payload_by_id = {
+                int(doc_id): (self.payload_buffer[idx] if idx < len(self.payload_buffer) else {})
+                for idx, doc_id in enumerate(self.ids_buffer)
+            }
             for sr in results:
+                payload = payload_by_id.get(int(sr.doc_id), {})
+                if not self._matches_filter(payload, filters):
+                    continue
                 sparse_results.append((sr.doc_id, sr.score))
         elif query_text.strip() and self.sparse_dirty:
             self._ensure_sparse_ready()
@@ -443,6 +493,358 @@ class HybridSearchManager:
             "sparse": sparse_results,
             "union_ids": union_ids,
             "sparse_error": self.sparse_error,
+        }
+
+    @staticmethod
+    def _resolve_refine_options(
+        query_payload: Optional[Dict[str, Any]] = None,
+        refine_options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        resolved: Dict[str, Any] = {}
+        if isinstance(query_payload, dict) and isinstance(query_payload.get("refine_options"), dict):
+            resolved.update(dict(query_payload["refine_options"]))
+        if isinstance(refine_options, dict):
+            resolved.update(dict(refine_options))
+        resolved["use_cross_encoder"] = bool(
+            resolved.get("use_cross_encoder") or resolved.get("refine_use_cross_encoder")
+        )
+        resolved["cross_encoder_model"] = str(
+            resolved.get("cross_encoder_model") or DEFAULT_REFINE_CROSS_ENCODER_MODEL
+        )
+        resolved["cross_encoder_top_k"] = max(
+            1,
+            int(resolved.get("cross_encoder_top_k") or resolved.get("rerank_top_k") or 96),
+        )
+        resolved["cross_encoder_batch_size"] = max(
+            1,
+            int(resolved.get("cross_encoder_batch_size") or 16),
+        )
+        resolved["use_nli"] = bool(resolved.get("use_nli") or resolved.get("refine_use_nli"))
+        resolved["nli_model"] = str(resolved.get("nli_model") or DEFAULT_REFINE_NLI_MODEL)
+        resolved["nli_top_k"] = max(
+            1,
+            int(resolved.get("nli_top_k") or resolved.get("utility_top_k") or resolved.get("cross_encoder_top_k") or 64),
+        )
+        resolved["nli_batch_size"] = max(
+            1,
+            int(resolved.get("nli_batch_size") or resolved.get("cross_encoder_batch_size") or 16),
+        )
+        resolved["nli_promote_base_relevance"] = bool(
+            resolved.get("nli_promote_base_relevance") or resolved.get("promote_base_relevance")
+        )
+        resolved["confidence_gating"] = bool(
+            resolved.get("confidence_gating") or resolved.get("refine_confidence_gating")
+        )
+        resolved["confidence_gap_threshold"] = float(
+            resolved.get("confidence_gap_threshold") or 0.20
+        )
+        resolved["confidence_min_candidates"] = max(
+            2,
+            int(resolved.get("confidence_min_candidates") or 16),
+        )
+        return resolved
+
+    @staticmethod
+    def _cross_encoder_device() -> str:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return "cuda"
+            if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+                return "mps"
+        except ImportError:
+            pass
+        return "cpu"
+
+    def _get_cross_encoder(self, model_name: str) -> Any:
+        cache = getattr(self, "_cross_encoder_models", None)
+        if cache is None:
+            cache = {}
+            self._cross_encoder_models = cache
+        if model_name not in cache:
+            try:
+                from sentence_transformers import CrossEncoder
+            except ImportError as exc:  # pragma: no cover - depends on optional dependency
+                raise ImportError(
+                    "Cross-encoder refinement requires sentence-transformers to be installed"
+                ) from exc
+            device = self._cross_encoder_device()
+            logger.info("Loading cross-encoder %s for hybrid refine (device=%s)", model_name, device)
+            cache[model_name] = CrossEncoder(model_name, device=device)
+        return cache[model_name]
+
+    def _get_nli_model(self, model_name: str) -> Dict[str, Any]:
+        cache = getattr(self, "_nli_models", None)
+        if cache is None:
+            cache = {}
+            self._nli_models = cache
+        if model_name not in cache:
+            try:
+                import torch
+                from transformers import AutoModelForSequenceClassification, AutoTokenizer
+            except ImportError as exc:  # pragma: no cover - optional dependency path
+                raise ImportError(
+                    "NLI refinement requires transformers to be installed"
+                ) from exc
+            device_name = self._cross_encoder_device()
+            model_device = torch.device("cpu" if device_name == "cpu" else device_name)
+            logger.info("Loading NLI model %s for hybrid refine (device=%s)", model_name, model_device)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            model.to(model_device)
+            model.eval()
+            cache[model_name] = {
+                "tokenizer": tokenizer,
+                "model": model,
+                "device": model_device,
+                "id2label": {
+                    int(idx): str(label)
+                    for idx, label in dict(getattr(model.config, "id2label", {}) or {}).items()
+                },
+            }
+        return cache[model_name]
+
+    @staticmethod
+    def _nli_probability_summary(probabilities: np.ndarray, id2label: Dict[int, str]) -> tuple[float, float, float]:
+        entailment = 0.0
+        contradiction = 0.0
+        neutral = 0.0
+        if probabilities.ndim != 1:
+            probabilities = np.asarray(probabilities, dtype=np.float32).reshape(-1)
+        for idx, probability in enumerate(probabilities.tolist()):
+            label = str(id2label.get(idx, f"label_{idx}")).lower()
+            if any(token in label for token in ("entail", "support")):
+                entailment = max(entailment, float(probability))
+            elif any(token in label for token in ("contrad", "refute")):
+                contradiction = max(contradiction, float(probability))
+            elif any(token in label for token in ("neutral", "unknown", "other", "nei")):
+                neutral = max(neutral, float(probability))
+        if entailment <= 0.0 and contradiction <= 0.0 and neutral <= 0.0 and probabilities.size > 0:
+            entailment = float(np.max(probabilities))
+        return entailment, contradiction, neutral
+
+    @staticmethod
+    def _confidence_gate_summary(
+        valid_items: List[Dict[str, Any]],
+        retrieval_features: Dict[int, Dict[str, Any]],
+        refine_options: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not bool(refine_options.get("confidence_gating")):
+            return {"enabled": False, "applied": False, "reason": "disabled"}
+        if len(valid_items) < int(refine_options.get("confidence_min_candidates", 16)):
+            return {
+                "enabled": True,
+                "applied": False,
+                "reason": "too_few_candidates",
+                "candidate_count": len(valid_items),
+            }
+        ordered_scores = sorted(
+            (
+                float(retrieval_features.get(int(item["id"]), {}).get("base_relevance", 0.0) or 0.0)
+                for item in valid_items
+            ),
+            reverse=True,
+        )
+        if len(ordered_scores) < 2:
+            return {
+                "enabled": True,
+                "applied": False,
+                "reason": "insufficient_scores",
+                "candidate_count": len(valid_items),
+            }
+        top_score = float(ordered_scores[0])
+        runner_up = float(ordered_scores[1])
+        gap = max(top_score - runner_up, 0.0)
+        applied = gap >= float(refine_options.get("confidence_gap_threshold", 0.20))
+        return {
+            "enabled": True,
+            "applied": bool(applied),
+            "reason": "gap_threshold" if applied else "below_threshold",
+            "candidate_count": len(valid_items),
+            "top_score": top_score,
+            "runner_up_score": runner_up,
+            "gap": gap,
+            "threshold": float(refine_options.get("confidence_gap_threshold", 0.20)),
+        }
+
+    @staticmethod
+    def _payload_rerank_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        for key in (
+            "base_relevance",
+            "rerank_score",
+            "cross_encoder_score",
+            "ce_score",
+            "ltr_score",
+            "utility_score",
+            "nli_utility_score",
+            "nli_entailment",
+            "nli_contradiction",
+            "nli_neutral",
+            "teacher_utility_score",
+            "distilled_utility_score",
+            "rrf_score",
+            "dense_score",
+            "sparse_score",
+        ):
+            value = payload.get(key)
+            if isinstance(value, (int, float)):
+                metadata[key] = float(value)
+        if "base_relevance" not in metadata:
+            for key in ("rerank_score", "cross_encoder_score", "ce_score", "ltr_score"):
+                if key in metadata:
+                    metadata["base_relevance"] = float(metadata[key])
+                    break
+        for key in ("relevance_source", "rerank_source"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                metadata[key] = value.strip().lower()
+        return metadata
+
+    def _apply_cross_encoder_scores(
+        self,
+        *,
+        valid_items: List[Dict[str, Any]],
+        query_text: str,
+        retrieval_features: Dict[int, Dict[str, Any]],
+        model_name: str,
+        batch_size: int,
+        top_k: int,
+    ) -> Dict[str, Any]:
+        if not query_text.strip() or not valid_items:
+            return {
+                "enabled": False,
+                "applied": False,
+                "reason": "missing_query_text_or_candidates",
+                "model": model_name,
+                "reranked_count": 0,
+            }
+        ordered_ids = sorted(
+            (int(item["id"]) for item in valid_items),
+            key=lambda doc_id: float(retrieval_features.get(doc_id, {}).get("base_relevance", 0.0)),
+            reverse=True,
+        )[: min(max(top_k, 1), len(valid_items))]
+        if not ordered_ids:
+            return {
+                "enabled": True,
+                "applied": False,
+                "reason": "empty_ordered_ids",
+                "model": model_name,
+                "reranked_count": 0,
+            }
+        by_id = {int(item["id"]): item for item in valid_items}
+        scorer = self._get_cross_encoder(model_name)
+        pairs = [(query_text, by_id[doc_id]["text"]) for doc_id in ordered_ids]
+        scores = np.asarray(
+            scorer.predict(pairs, batch_size=batch_size, show_progress_bar=False),
+            dtype=np.float32,
+        ).reshape(-1)
+        for rank, (doc_id, score) in enumerate(zip(ordered_ids, scores.tolist()), start=1):
+            metadata = retrieval_features.setdefault(int(doc_id), {})
+            previous_base = float(metadata.get("base_relevance", 0.0) or 0.0)
+            metadata.setdefault("pre_rerank_base_relevance", previous_base)
+            metadata["cross_encoder_score"] = float(score)
+            metadata["rerank_score"] = float(score)
+            metadata["cross_encoder_rank"] = rank
+            metadata["base_relevance"] = float(score)
+            metadata["relevance_source"] = "cross_encoder"
+        return {
+            "enabled": True,
+            "applied": True,
+            "model": model_name,
+            "reranked_count": len(ordered_ids),
+            "batch_size": int(batch_size),
+            "top_k": int(top_k),
+        }
+
+    def _apply_nli_scores(
+        self,
+        *,
+        valid_items: List[Dict[str, Any]],
+        query_text: str,
+        retrieval_features: Dict[int, Dict[str, Any]],
+        model_name: str,
+        batch_size: int,
+        top_k: int,
+        promote_base_relevance: bool = False,
+    ) -> Dict[str, Any]:
+        if not query_text.strip() or not valid_items:
+            return {
+                "enabled": False,
+                "applied": False,
+                "reason": "missing_query_text_or_candidates",
+                "model": model_name,
+                "scored_count": 0,
+            }
+        ordered_ids = sorted(
+            (int(item["id"]) for item in valid_items),
+            key=lambda doc_id: float(retrieval_features.get(doc_id, {}).get("base_relevance", 0.0)),
+            reverse=True,
+        )[: min(max(top_k, 1), len(valid_items))]
+        if not ordered_ids:
+            return {
+                "enabled": True,
+                "applied": False,
+                "reason": "empty_ordered_ids",
+                "model": model_name,
+                "scored_count": 0,
+            }
+        bundle = self._get_nli_model(model_name)
+        tokenizer = bundle["tokenizer"]
+        model = bundle["model"]
+        device = bundle["device"]
+        id2label = bundle["id2label"]
+        by_id = {int(item["id"]): item for item in valid_items}
+        utility_values: List[float] = []
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - optional dependency path
+            raise ImportError("NLI refinement requires torch to be installed") from exc
+
+        for offset in range(0, len(ordered_ids), max(batch_size, 1)):
+            batch_ids = ordered_ids[offset : offset + max(batch_size, 1)]
+            batch_documents = [by_id[doc_id]["text"] for doc_id in batch_ids]
+            encoded = tokenizer(
+                [query_text] * len(batch_documents),
+                batch_documents,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            with torch.inference_mode():
+                logits = model(**encoded).logits
+                probabilities = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            for doc_id, row in zip(batch_ids, probabilities):
+                entailment, contradiction, neutral = self._nli_probability_summary(
+                    np.asarray(row, dtype=np.float32),
+                    id2label,
+                )
+                utility = self._clamp01(entailment * (1.0 - contradiction))
+                utility_values.append(float(utility))
+                metadata = retrieval_features.setdefault(int(doc_id), {})
+                metadata["nli_entailment"] = float(entailment)
+                metadata["nli_contradiction"] = float(contradiction)
+                metadata["nli_neutral"] = float(neutral)
+                metadata["nli_utility_score"] = float(utility)
+                metadata["utility_score"] = float(utility)
+                metadata["utility_source"] = "nli"
+                if promote_base_relevance:
+                    previous_base = float(metadata.get("base_relevance", 0.0) or 0.0)
+                    metadata.setdefault("pre_nli_base_relevance", previous_base)
+                    metadata["base_relevance"] = float(0.70 * previous_base + 0.30 * utility)
+        return {
+            "enabled": True,
+            "applied": True,
+            "model": model_name,
+            "scored_count": len(ordered_ids),
+            "batch_size": int(batch_size),
+            "top_k": int(top_k),
+            "promote_base_relevance": bool(promote_base_relevance),
+            "mean_utility": float(np.mean(utility_values)) if utility_values else 0.0,
+            "max_utility": float(np.max(utility_values)) if utility_values else 0.0,
         }
 
     @staticmethod
@@ -741,6 +1143,7 @@ class HybridSearchManager:
         query_text: str = "",
         query_payload: Optional[Dict[str, Any]] = None,
         retrieval_features: Optional[Dict[int, Dict[str, Any]]] = None,
+        refine_options: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         retrieved_data = self.hnsw.retrieve(candidate_ids)
         valid_items: List[Dict[str, Any]] = []
@@ -771,6 +1174,83 @@ class HybridSearchManager:
 
         if not valid_items:
             return []
+
+        merged_retrieval_features: Dict[int, Dict[str, Any]] = {
+            int(doc_id): dict(values)
+            for doc_id, values in dict(retrieval_features or {}).items()
+        }
+        for item in valid_items:
+            doc_id = int(item["id"])
+            merged = merged_retrieval_features.setdefault(doc_id, {})
+            payload_metadata = self._payload_rerank_metadata(item["payload"])
+            for key, value in payload_metadata.items():
+                merged.setdefault(key, value)
+            if any(
+                key in payload_metadata
+                for key in ("rerank_score", "cross_encoder_score", "ce_score", "ltr_score")
+            ):
+                merged["base_relevance"] = float(
+                    payload_metadata.get("base_relevance", merged.get("base_relevance", 0.0) or 0.0)
+                )
+                merged.setdefault("relevance_source", payload_metadata.get("relevance_source", "payload_rerank"))
+
+        resolved_refine_options = self._resolve_refine_options(
+            query_payload=query_payload,
+            refine_options=refine_options,
+        )
+        rerank_summary: Optional[Dict[str, Any]] = None
+        nli_summary: Optional[Dict[str, Any]] = None
+        confidence_gate = self._confidence_gate_summary(
+            valid_items=valid_items,
+            retrieval_features=merged_retrieval_features,
+            refine_options=resolved_refine_options,
+        )
+        if not confidence_gate.get("applied"):
+            if resolved_refine_options.get("use_cross_encoder"):
+                rerank_summary = self._apply_cross_encoder_scores(
+                    valid_items=valid_items,
+                    query_text=query_text,
+                    retrieval_features=merged_retrieval_features,
+                    model_name=str(resolved_refine_options["cross_encoder_model"]),
+                    batch_size=int(resolved_refine_options["cross_encoder_batch_size"]),
+                    top_k=int(resolved_refine_options["cross_encoder_top_k"]),
+                )
+            if resolved_refine_options.get("use_nli"):
+                nli_summary = self._apply_nli_scores(
+                    valid_items=valid_items,
+                    query_text=query_text,
+                    retrieval_features=merged_retrieval_features,
+                    model_name=str(resolved_refine_options["nli_model"]),
+                    batch_size=int(resolved_refine_options["nli_batch_size"]),
+                    top_k=int(resolved_refine_options["nli_top_k"]),
+                    promote_base_relevance=bool(
+                        resolved_refine_options.get("nli_promote_base_relevance", False)
+                    ),
+                )
+        else:
+            if resolved_refine_options.get("use_cross_encoder"):
+                rerank_summary = {
+                    "enabled": True,
+                    "applied": False,
+                    "reason": "confidence_gate_skip",
+                    "model": str(resolved_refine_options["cross_encoder_model"]),
+                    "reranked_count": 0,
+                }
+            if resolved_refine_options.get("use_nli"):
+                nli_summary = {
+                    "enabled": True,
+                    "applied": False,
+                    "reason": "confidence_gate_skip",
+                    "model": str(resolved_refine_options["nli_model"]),
+                    "scored_count": 0,
+                }
+        if hasattr(self, "_last_refine_context"):
+            self._last_refine_context = {
+                **dict(getattr(self, "_last_refine_context") or {}),
+                "rerank": rerank_summary,
+                "nli": nli_summary,
+                "confidence_gate": confidence_gate,
+            }
 
         centroid = np.mean(np.stack(pooled_vectors, axis=0), axis=0)
         dynamic_clusters = self._cluster_assignments(pooled_vectors)
@@ -830,7 +1310,7 @@ class HybridSearchManager:
             cluster_id = payload.get("cluster_id")
             if not isinstance(cluster_id, int):
                 cluster_id = dynamic_clusters[idx]
-            retrieval_metadata = dict(retrieval_features.get(int(item["id"]), {}) if retrieval_features else {})
+            retrieval_metadata = dict(merged_retrieval_features.get(int(item["id"]), {}))
 
             solver_candidates.append(
                 {
@@ -863,8 +1343,11 @@ class HybridSearchManager:
         query_text: str = "",
         query_payload: Optional[Dict[str, Any]] = None,
         solver_config: Optional[Any] = None,
-        constraints: Optional[Any] = None
+        constraints: Optional[Any] = None,
+        optimizer_policy: Optional[Any] = None,
+        refine_options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        self._last_refine_context = {}
         if not self.solver:
             fallback_ids = candidate_ids[: min(10, len(candidate_ids))]
             return {
@@ -901,12 +1384,37 @@ class HybridSearchManager:
                 elif "sparse_score" in combined:
                     combined["base_relevance"] = float(combined["sparse_score"])
                 retrieval_features[int(candidate_id)] = combined
+        resolved_refine_options = self._resolve_refine_options(
+            query_payload=query_payload,
+            refine_options=refine_options,
+        )
+        effective_optimizer_policy = optimizer_policy
+        advanced_query_utility = bool(
+            isinstance(query_payload, dict)
+            and any(
+                key in query_payload
+                for key in (
+                    "query_token_weights",
+                    "query_aspect_weights",
+                    "query_aspect_vectors",
+                    "query_expansion_vectors",
+                    "teacher_token_weights",
+                    "teacher_utility_score",
+                )
+            )
+        )
+        if effective_optimizer_policy is None:
+            if resolved_refine_options.get("use_nli") or advanced_query_utility:
+                effective_optimizer_policy = "frontier_v1"
+            elif resolved_refine_options.get("use_cross_encoder"):
+                effective_optimizer_policy = "post_rerank_v1"
         solver_candidates = self._build_solver_candidates(
             query_vector,
             candidate_ids,
             query_text=query_text,
             query_payload=query_payload,
             retrieval_features=retrieval_features,
+            refine_options=resolved_refine_options,
         )
         if not solver_candidates:
             return {
@@ -983,6 +1491,22 @@ class HybridSearchManager:
                 lambda_value = getattr(effective_solver_config, "lambda_", None)
                 if lambda_value is not None:
                     solver_config_payload["lambda"] = lambda_value
+        if effective_optimizer_policy is not None:
+            solver_config_payload["optimizer_policy"] = effective_optimizer_policy
+        policy_name = (
+            str(effective_optimizer_policy.get("name", "baseline_v1"))
+            if isinstance(effective_optimizer_policy, dict)
+            else str(effective_optimizer_policy or "baseline_v1")
+        )
+        rerank_applied = bool(((self._last_refine_context or {}).get("rerank") or {}).get("applied"))
+        nli_applied = bool(((self._last_refine_context or {}).get("nli") or {}).get("applied"))
+        logger.info(
+            "Hybrid refine candidates=%d policy=%s rerank=%s nli=%s",
+            len(solver_candidates),
+            policy_name,
+            rerank_applied,
+            nli_applied,
+        )
 
         request_candidates = []
         for candidate in solver_candidates:
@@ -1027,7 +1551,10 @@ class HybridSearchManager:
             query_text=query_text,
             constraints=constraints_payload,
             solver_config=solver_config_payload,
-            metadata={"query_payload": dict(query_payload or {})},
+            metadata={
+                "query_payload": dict(query_payload or {}),
+                "optimizer_policy": effective_optimizer_policy,
+            },
         )
         selected_ids = [str(item_id) for item_id in result.get("selected_ids", [])]
         candidate_by_id = {
@@ -1058,6 +1585,33 @@ class HybridSearchManager:
             "solver_backend_kind": result.get("solver_backend_kind"),
             "feature_summary": {
                 **result.get("feature_summary", {}),
+                "requested_optimizer_policy": policy_name,
+                "refine_rerank": dict((self._last_refine_context or {}).get("rerank") or {}),
+                "refine_nli": dict((self._last_refine_context or {}).get("nli") or {}),
+                "refine_confidence_gate": dict((self._last_refine_context or {}).get("confidence_gate") or {}),
+                "rerank_metadata_present": any(
+                    any(
+                        key in candidate
+                        for key in (
+                            "cross_encoder_score",
+                            "ce_score",
+                            "ltr_score",
+                            "rerank_score",
+                            "utility_score",
+                            "nli_utility_score",
+                            "nli_entailment",
+                            "nli_contradiction",
+                        )
+                    )
+                    for candidate in solver_candidates
+                ),
+                "nli_metadata_present": any(
+                    any(
+                        key in candidate
+                        for key in ("utility_score", "nli_utility_score", "nli_entailment", "nli_contradiction")
+                    )
+                    for candidate in solver_candidates
+                ),
                 "candidate_count": len(solver_candidates),
                 "query_text_used": bool(query_text.strip()),
                 "query_label": (
@@ -1065,6 +1619,14 @@ class HybridSearchManager:
                     if isinstance(query_payload, dict)
                     else None
                 ),
+                "candidate_avg_base_relevance": _mean_feature(solver_candidates, "base_relevance"),
+                "selected_avg_base_relevance": _mean_feature(selected_candidates, "base_relevance"),
+                "candidate_avg_utility_score": _mean_feature(solver_candidates, "utility_score"),
+                "selected_avg_utility_score": _mean_feature(selected_candidates, "utility_score"),
+                "candidate_avg_nli_entailment": _mean_feature(solver_candidates, "nli_entailment"),
+                "selected_avg_nli_entailment": _mean_feature(selected_candidates, "nli_entailment"),
+                "candidate_avg_nli_contradiction": _mean_feature(solver_candidates, "nli_contradiction"),
+                "selected_avg_nli_contradiction": _mean_feature(selected_candidates, "nli_contradiction"),
                 "candidate_avg_ontology_query_match": _mean_feature(solver_candidates, "ontology_query_match"),
                 "selected_avg_ontology_query_match": _mean_feature(selected_candidates, "ontology_query_match"),
                 "candidate_avg_ontology_entity_coverage": _mean_feature(solver_candidates, "ontology_entity_coverage"),

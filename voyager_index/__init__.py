@@ -5,10 +5,13 @@ Public OSS API for voyager-index.
 from __future__ import annotations
 
 from importlib import import_module
-from importlib.metadata import version as _pkg_version
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import Any
 
-__version__: str = _pkg_version("voyager-index")
+try:
+    __version__: str = _pkg_version("voyager-index")
+except PackageNotFoundError:
+    __version__ = "0+local"
 
 _EXPORTS = {
     "Index": ("voyager_index.index", "Index"),
@@ -39,6 +42,10 @@ _EXPORTS = {
     "SearchPipeline": ("voyager_index.search", "SearchPipeline"),
     "enumerate_renderable_documents": ("voyager_index.preprocessing", "enumerate_renderable_documents"),
     "render_documents": ("voyager_index.preprocessing", "render_documents"),
+    "VectorPayload": ("voyager_index.transport", "VectorPayload"),
+    "decode_payload": ("voyager_index.transport", "decode_payload"),
+    "encode_roq_payload": ("voyager_index.transport", "encode_roq_payload"),
+    "encode_vector_payload": ("voyager_index.transport", "encode_vector_payload"),
 }
 
 
@@ -83,4 +90,8 @@ __all__ = [
     "SearchPipeline",
     "enumerate_renderable_documents",
     "render_documents",
+    "VectorPayload",
+    "decode_payload",
+    "encode_roq_payload",
+    "encode_vector_payload",
 ]

@@ -167,6 +167,16 @@ class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
 # Structured error formatter
 # ------------------------------------------------------------------
 
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def structured_error_response(
     status_code: int,
     *,
@@ -174,13 +184,19 @@ def structured_error_response(
     message: str,
     details: dict | None = None,
     request_id: str = "",
+    detail: str | None = None,
+    include_status_code: bool = False,
 ) -> JSONResponse:
     """Build a consistent JSON error envelope."""
     body: dict = {"code": code, "message": message}
     if details:
-        body["details"] = details
+        body["details"] = _json_safe(details)
     if request_id:
         body["request_id"] = request_id
+    if detail is not None:
+        body["detail"] = detail
+    if include_status_code:
+        body["status_code"] = status_code
     return JSONResponse(
         status_code=status_code,
         content=body,

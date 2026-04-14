@@ -39,29 +39,56 @@ class ColBanditReranker:
         shard_chunks: List[ShardChunk],
         k: int = 10,
         device: torch.device | None = None,
+        quantization_mode: str = "",
+        variable_length_strategy: str = "bucketed",
     ) -> tuple[List[int], List[float], Dict[str, float]]:
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         total_docs = sum(len(doc_ids) for _, _, doc_ids in shard_chunks)
         if total_docs < self.config.min_candidates_for_bandit:
-            ids, scores = score_all_docs_topk(query, shard_chunks, k=k, device=device)
+            ids, scores, score_stats = score_all_docs_topk(
+                query,
+                shard_chunks,
+                k=k,
+                device=device,
+                quantization_mode=quantization_mode,
+                variable_length_strategy=variable_length_strategy,
+                return_stats=True,
+            )
             return ids, scores, {
                 "bandit_rounds": 0,
                 "bandit_docs_pruned": 0,
                 "bandit_docs_survived": float(total_docs),
+                **score_stats,
             }
 
         try:
-            return self._rerank(query, shard_chunks, k=k, device=device)
+            return self._rerank(
+                query,
+                shard_chunks,
+                k=k,
+                device=device,
+                quantization_mode=quantization_mode,
+                variable_length_strategy=variable_length_strategy,
+            )
         except Exception:
             if not self.config.fallback_full_maxsim:
                 raise
             logger.exception("Col-Bandit reranker failed; falling back to full MaxSim")
-            ids, scores = score_all_docs_topk(query, shard_chunks, k=k, device=device)
+            ids, scores, score_stats = score_all_docs_topk(
+                query,
+                shard_chunks,
+                k=k,
+                device=device,
+                quantization_mode=quantization_mode,
+                variable_length_strategy=variable_length_strategy,
+                return_stats=True,
+            )
             return ids, scores, {
                 "bandit_rounds": -1,
                 "bandit_docs_pruned": 0,
                 "bandit_docs_survived": float(total_docs),
+                **score_stats,
             }
 
     def _rerank(
@@ -70,6 +97,8 @@ class ColBanditReranker:
         shard_chunks: List[ShardChunk],
         k: int,
         device: torch.device,
+        quantization_mode: str,
+        variable_length_strategy: str,
     ) -> tuple[List[int], List[float], Dict[str, float]]:
         maxsim = _get_maxsim()
         q = query.to(device, dtype=torch.float16)
@@ -170,11 +199,20 @@ class ColBanditReranker:
 
         survivors = [flat_doc_ids[i] for i in torch.nonzero(active, as_tuple=False).squeeze(-1).tolist()]
         if not survivors:
-            ids, scores = score_all_docs_topk(query, shard_chunks, k=k, device=device)
+            ids, scores, score_stats = score_all_docs_topk(
+                query,
+                shard_chunks,
+                k=k,
+                device=device,
+                quantization_mode=quantization_mode,
+                variable_length_strategy=variable_length_strategy,
+                return_stats=True,
+            )
             return ids, scores, {
                 "bandit_rounds": float(rounds),
                 "bandit_docs_pruned": float(len(flat_doc_ids)),
                 "bandit_docs_survived": 0.0,
+                **score_stats,
             }
 
         docs_by_shard: Dict[int, set[int]] = {}
@@ -200,9 +238,18 @@ class ColBanditReranker:
                 pos += piece.shape[0]
             survivor_chunks.append((torch.cat(pieces, dim=0), new_offsets, new_ids))
 
-        ids, scores = score_all_docs_topk(query, survivor_chunks, k=k, device=device)
+        ids, scores, score_stats = score_all_docs_topk(
+            query,
+            survivor_chunks,
+            k=k,
+            device=device,
+            quantization_mode=quantization_mode,
+            variable_length_strategy=variable_length_strategy,
+            return_stats=True,
+        )
         return ids, scores, {
             "bandit_rounds": float(rounds),
             "bandit_docs_pruned": float(len(flat_doc_ids) - len(survivors)),
             "bandit_docs_survived": float(len(survivors)),
+            **score_stats,
         }

@@ -13,6 +13,10 @@ where graph construction cost and GPU memory are concerns. GEM and HNSW remain a
 for workloads that benefit from graph traversal (small corpora, very high recall targets,
 or pre-built graphs).
 
+For the currently shipped public-server posture, deployment defaults, base64
+transport contract, and exposed shard controls, see
+`docs/guides/max-performance-reference-api.md`.
+
 ---
 
 ## Table of Contents
@@ -465,27 +469,42 @@ and optional Tabu refinement. The shard-routed engine replaces the HNSW componen
                     └───────────────┘
 ```
 
-**Changes to `hybrid_manager.py`**:
-```python
-class HybridSearchManager:
-    def __init__(self, ..., dense_engine: str = "auto"):
-        if dense_engine == "shard":
-            self.dense_manager = ShardSegmentManager(...)
-        else:
-            self.dense_manager = HnswSegmentManager(...)
-        self.sparse_engine = BM25sEngine(...)
-        self.solver = TabuSearchSolver(...)  # optional
-```
-
 ### 7.2 Tabu Search Solver Integration
 
-The existing `TabuSearchSolver` (`latence_solver`, Rust knapsack solver) refines
-hybrid search results. It works on a candidate set and optimizes for a combined
-objective. The shard engine provides the dense candidate set; BM25 provides the
-sparse candidate set; the solver refines the union.
+The production Tabu path is best understood as **packing after fusion**, not as a
+drop-in replacement for fusion itself.
 
-No changes needed to the solver itself — it operates on (doc_id, score) pairs
-regardless of how they were produced.
+Current flow:
+
+1. Dense and sparse retrieval produce a fused candidate pool (`HybridSearchManager.search`).
+2. Candidate metadata carries retrieval signals such as `rrf_score`, `dense_score`,
+   `sparse_score`, and `base_relevance`.
+3. Optional rerank-grade metadata such as `cross_encoder_score`, `ltr_score`, or
+   `rerank_score` can be threaded into the optimizer request.
+4. `GpuFulfilmentPipeline` composes those signals into the QKP objective and the
+   Tabu solver picks a constrained, diversity-aware subset.
+
+This means the right comparison is:
+
+- RRF / weighted fusion: builds a stable pool and coarse order.
+- Cross-encoder / LTR: supplies stronger marginal relevance for that pool.
+- Tabu: allocates the final token or slot budget while penalizing redundancy and
+  rewarding coverage.
+
+The recommended optimizer policy when rerank metadata is present is
+`post_rerank_v1`. It increases trust in `base_relevance`, incorporates rerank
+agreement into the retrieval composite, and lets the controller raise the
+redundancy floor only after strong relevance evidence is available.
+
+Operational notes:
+
+- Optimized dense search can accept `solver_config`, `optimizer_policy`,
+  `query_payload`, and optional cross-encoder rerank settings on the service path.
+- Cross-encoder reranking is feature-flagged and runs on the fused pool before
+  packing. If enabled without an explicit optimizer policy, the pipeline defaults
+  to `post_rerank_v1`.
+- Fair offline evaluation should compare `ce_sort` against `tabu_ce`, where both
+  consume the same CE scores and differ only in packing versus listwise ordering.
 
 ### 7.3 BM25 Index Co-location
 
