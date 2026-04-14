@@ -59,7 +59,7 @@ clean: ## Remove build artifacts
 
 verify: ## Verify all native modules are importable
 	python -c "import voyager_index; print('voyager_index OK')"
-	python -c "import latence_solver; print('latence_solver OK')"
+	python -c "import importlib.util; print('latence_solver OK' if importlib.util.find_spec('latence_solver') else 'latence_solver not installed (optional)')"
 
 benchmark: ## Run the supported benchmark smoke
 	python benchmarks/oss_reference_benchmark.py --device cpu --points 32 --top-k 5

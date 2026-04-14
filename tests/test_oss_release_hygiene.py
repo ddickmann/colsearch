@@ -74,6 +74,14 @@ def test_root_pyproject_no_longer_packages_from_compat_src() -> None:
     assert "voyager_index._internal.inference.distributed" not in payload
 
 
+def test_release_workflow_only_builds_supported_native_wheels() -> None:
+    payload = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert "knapsack_solver" in payload
+    assert "hnsw_indexer" not in payload
+    assert "gem_router" not in payload
+    assert "gem_index" not in payload
+
+
 def test_reference_api_dockerfile_uses_root_src_tree() -> None:
     payload = (REPO_ROOT / "deploy" / "reference-api" / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY src /app/src" in payload

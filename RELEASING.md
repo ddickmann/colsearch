@@ -87,11 +87,11 @@ gh release create v0.X.Yrc1 --title "0.X.Yrc1" --prerelease --notes "Release can
 If a release is broken:
 
 ```bash
-pip install twine
-twine yank voyager-index 0.X.Y
+gh release edit v0.X.Y --draft
 ```
 
-Then publish a patch release immediately.
+Then yank the broken PyPI release from the PyPI UI or API and publish a patch
+release immediately.
 
 ## Prerequisites
 

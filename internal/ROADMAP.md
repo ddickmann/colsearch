@@ -52,9 +52,10 @@ fixed recall targets.
 **Deliverables:**
 - Download and preprocess ColBERT embeddings for MS MARCO passage (8.8M docs)
   and LoTTE (500K docs per domain)
-- Run `benchmarks/full_eval_harness.py` with `--config` pointing to real
-  dataset configs (already defined in `benchmarks/gem_paper_suite/configs/`)
-- Publish results as JSON + markdown tables in `benchmarks/results/`
+- Run `research/legacy/benchmarks/gem_paper_suite/runner.py` with `--config`
+  pointing to real dataset configs (already defined in
+  `research/legacy/benchmarks/gem_paper_suite/configs/`)
+- Publish results as JSON + markdown tables in `research/legacy/benchmarks/results/`
 - Add fixed-recall QPS columns: "at recall@10 >= 0.95, what QPS do we
   achieve?"
 - Add scale curves: 100K, 500K, 1M, 5M docs
@@ -89,7 +90,7 @@ reference C++ implementation.
 **Acceptance criteria:**
 - On MS MARCO subset (10K docs), recall@10 within 2% of C++ reference
 - Traversal stats (nodes visited) within 20% of C++ reference
-- Report artifact committed to `benchmarks/results/parity/`
+- Report artifact committed to `research/legacy/benchmarks/results/parity/`
 
 **Resources needed:** C++ compiler with OpenMP; GEM C++ repo build; same
 dataset embeddings as R1.
@@ -174,7 +175,7 @@ The current API provides injection and pruning but no validation pipeline.
   - Validation: held-out query latency reduction without recall drop
 - Ablation results: shortcuts on/off, degree caps (4/8/16), hard-query
   uplift measurement
-- Publish results in `benchmarks/results/shortcut_ablation.json`
+- Publish results in `research/legacy/benchmarks/results/shortcut_ablation.json`
 
 **Resources needed:** Query log dataset (or synthetic query-positive pairs);
 base index from R1 benchmarks.

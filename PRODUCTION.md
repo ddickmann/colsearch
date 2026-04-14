@@ -41,6 +41,7 @@ Use:
 - install `voyager-index[server,shard,gpu]`
 - use `transfer_mode="pinned"` or `transfer_mode="double_buffered"`
 - enable `quantization_mode` when you want GPU-side acceleration
+- for `compression="roq4"`, the shard assets persist `roq_codes` and `roq_meta` alongside offsets and IDs
 
 ### GPU corpus
 

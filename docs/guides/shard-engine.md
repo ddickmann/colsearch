@@ -14,6 +14,7 @@ Use the shard engine when you want:
 - a simpler mental model than graph-native retrieval
 - CPU fallback and GPU acceleration from the same collection layout
 - durable CRUD, WAL, checkpoint, and recovery
+- a runtime built on PyTorch plus optional Triton/native deps rather than a pure-Python serving path
 
 Not the best fit when you only need pooled dense vectors and do not care about
 late interaction.

@@ -6,6 +6,7 @@ Verifies:
 2. 1-bit RoQ quantization and Hamming distance calculation is working correctly
 """
 import numpy as np
+import pytest
 import torch
 import time
 
@@ -14,6 +15,9 @@ from voyager_index._internal.kernels.maxsim import fast_colbert_scores
 
 def test_triton_vs_python_accuracy():
     """Verify Triton FP16 produces identical rankings to Python FP32."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/Triton diagnostic requires a working CUDA runtime")
+
     print("=" * 60)
     print("TEST 1: Triton FP16 vs Python FP32 Score Accuracy")
     print("=" * 60)
@@ -86,8 +90,6 @@ def test_1bit_roq_correctness():
     
     torch.manual_seed(42)
     dim = 128
-    n_vecs = 10
-    
     # Create simple test vectors
     # Two identical vectors should have Hamming distance 0
     # Orthogonal vectors should have ~50% bit agreement (random)
@@ -110,6 +112,7 @@ def test_1bit_roq_correctness():
     
     print(f"\nTest 1: Identical vectors")
     print(f"  Hamming distance: {hamming} (expected: 0)")
+    assert int(hamming) == 0
     
     # Test 2: Opposite vectors (v and -v)
     v_neg = -v1
@@ -156,7 +159,7 @@ def test_1bit_roq_correctness():
             
             # Hamming similarity: dim - 2 * hamming
             xor_ij = np.unpackbits(codes_all[i:i+1]) ^ np.unpackbits(codes_all[j:j+1])
-            ham = xor_ij.sum()
+            ham = int(xor_ij.sum())
             # Linear proxy
             sim_lin = dim - 2 * ham
             hamming_sims.append(sim_lin)
@@ -173,7 +176,7 @@ def test_1bit_roq_correctness():
     print(f"  Correlation (Linear D-2*H): {corr_lin:.4f}")
     print(f"  Correlation (Cosine Corrected): {corr_cos:.4f}")
     
-    return corr_cos
+    assert np.isfinite(corr_cos)
 
 
 def test_roq_8bit_vs_fp32():
@@ -231,16 +234,10 @@ def test_roq_8bit_vs_fp32():
     else:
         print("✗ FAIL: 8-bit RoQ correlation is too low - possible bug!")
     
-    return corr
+    assert corr > 0.9
 
 
 if __name__ == "__main__":
     test_triton_vs_python_accuracy()
-    corr_1bit = test_1bit_roq_correctness()
-    corr_8bit = test_roq_8bit_vs_fp32()
-    
-    print("\n" + "=" * 60)
-    print("DIAGNOSTIC SUMMARY")
-    print("=" * 60)
-    print(f"1-bit RoQ IP correlation: {corr_1bit:.4f}")
-    print(f"8-bit RoQ IP correlation: {corr_8bit:.4f}")
+    test_1bit_roq_correctness()
+    test_roq_8bit_vs_fp32()
