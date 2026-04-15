@@ -6,6 +6,37 @@ reads in release order again.
 
 ## Unreleased
 
+## 0.1.4 — Shard Engine Decomposition And Release Evidence
+
+This release keeps the shard product surface stable while decomposing the large
+shard-engine modules behind compatibility facades and hardening the parity
+evidence required to ship that refactor safely.
+
+### Shard engine maintainability
+
+- split the shard manager, store, fetch pipeline, LEMUR router, builder, WAL,
+  and ColBANDIT reranker into focused internal modules while preserving public
+  import paths
+- reduced config coupling by separating serving configuration from sweep-only
+  configuration behind compatibility exports
+- introduced internal protocols for router, store, fetch, reranker, and native
+  exact backends to narrow cross-module ownership
+
+### Runtime capability visibility
+
+- surfaced fallback and capability state for LEMUR routing, pinned staging, and
+  native exact execution through shard statistics and reference API metadata
+- added startup logging for shard capability selection so development and
+  production runs expose fallback decisions explicitly
+
+### Validation and release confidence
+
+- added shard refactor contract coverage for import compatibility, artifact
+  parity, query trace stability, and runtime capability reporting
+- added a machine-readable shard refactor parity report and wired it into CI so
+  release evidence is reproducible instead of ad hoc
+- bumped the root package and supported native packages onto the `0.1.4` line
+- refreshed release hygiene checks to validate the aligned package versions
 ## 0.1.3 — Production Release Hardening
 
 This release closes the gap between the public product story and the shipped

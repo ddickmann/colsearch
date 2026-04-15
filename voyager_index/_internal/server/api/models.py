@@ -882,6 +882,10 @@ class CollectionInfo(BaseModel):
     n_centroid_approx: Optional[int] = None
     variable_length_strategy: Optional[str] = None
     hybrid_search: Optional[bool] = None
+    runtime_capabilities: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Additive shard/runtime capability metadata including active fallbacks.",
+    )
     graph_health: Optional[str] = Field(default=None, description="Optional Latence graph sidecar health for this collection.")
     graph_dataset_id: Optional[str] = Field(default=None, description="Latence dataset identifier backing the optional graph lane.")
     graph_contract_version: Optional[str] = Field(default=None, description="Version of the stored graph contract bundle.")
@@ -908,6 +912,10 @@ class HealthResponse(BaseModel):
     version: str
     collections: int
     gpu_available: bool
+    runtime_capabilities: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Global runtime capability probe results for optional shard backends.",
+    )
 
 
 class MetricsResponse(BaseModel):

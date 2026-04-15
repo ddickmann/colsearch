@@ -33,6 +33,7 @@ from voyager_index._internal.inference.index_core.graph_policy import LatenceGra
 from voyager_index._internal.inference.index_core.hybrid_manager import HybridSearchManager
 from voyager_index._internal.inference.index_core.latence_graph_sidecar import LatenceGraphSidecar
 from voyager_index._internal.inference.index_core.index import ColbertIndex
+from voyager_index._internal.inference.shard_engine.capabilities import detect_runtime_capabilities
 from voyager_index._internal.inference.shard_engine import ShardSegmentManager
 from voyager_index._internal.inference.shard_engine.config import Compression, TransferMode
 from voyager_index._internal.inference.shard_engine.manager import ShardEngineConfig
@@ -133,6 +134,7 @@ class SearchService:
         self.load_failures: Dict[str, str] = {}
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.gpu_available = torch.cuda.is_available()
+        self.runtime_capabilities = detect_runtime_capabilities()
         self.filter_scan_limit = int(os.environ.get("VOYAGER_FILTER_SCAN_LIMIT", "10000"))
         self.filter_scan_limit_hits = 0
         self._graph_policy = LatenceGraphPolicy()
@@ -140,6 +142,7 @@ class SearchService:
         self._task_thread_lock = threading.Lock()
         self._collections_lock = threading.RLock()
         self._collection_locks: Dict[str, threading.RLock] = {}
+        logger.info("Reference API runtime capabilities: %s", self.runtime_capabilities)
         self._recover_pending_journals()
         self._load_collections()
 
@@ -2542,7 +2545,9 @@ class SearchService:
             shard_gpu_corpus_rerank_topn = None
             shard_n_centroid_approx = None
             shard_variable_length_strategy = None
+            shard_runtime_capabilities = None
             if runtime.kind == CollectionKind.SHARD:
+                shard_stats = runtime.engine.get_statistics()
                 shard_n_shards = runtime.meta.get("n_shards")
                 shard_k_candidates = runtime.meta.get("k_candidates")
                 shard_compression = runtime.meta.get("compression")
@@ -2558,6 +2563,7 @@ class SearchService:
                 shard_gpu_corpus_rerank_topn = runtime.meta.get("gpu_corpus_rerank_topn")
                 shard_n_centroid_approx = runtime.meta.get("n_centroid_approx")
                 shard_variable_length_strategy = runtime.meta.get("variable_length_strategy")
+                shard_runtime_capabilities = shard_stats.get("runtime_capabilities")
                 store = getattr(runtime.engine, "_store", None)
                 if store and store.manifest:
                     shard_total_tokens = store.manifest.total_tokens
@@ -2594,6 +2600,7 @@ class SearchService:
                 gpu_corpus_rerank_topn=shard_gpu_corpus_rerank_topn,
                 n_centroid_approx=shard_n_centroid_approx,
                 variable_length_strategy=shard_variable_length_strategy,
+                runtime_capabilities=shard_runtime_capabilities,
                 hybrid_search=(runtime.kind == CollectionKind.DENSE),
                 graph_health=graph_sidecar.health if graph_sidecar is not None else None,
                 graph_dataset_id=graph_sidecar.dataset_id if graph_sidecar is not None else None,
@@ -3100,6 +3107,7 @@ class SearchService:
             "degraded_collections": degraded_collections,
             "failed_collection_loads": sorted(self.load_failures.keys()),
             "filter_scan_limit_hits": filter_scan_limit_hits,
+            "runtime_capabilities": self.runtime_capabilities,
             "issues": issues,
         }
 

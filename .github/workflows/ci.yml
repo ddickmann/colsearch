@@ -26,9 +26,9 @@ jobs:
       - name: Install ruff
         run: pip install ruff
       - name: Ruff check
-        run: ruff check scripts/packaged_install_smoke.py tests/test_oss_release_hygiene.py tests/test_release_polish_surface.py tests/test_full_feature_validation_native.py
+        run: ruff check scripts/packaged_install_smoke.py scripts/shard_refactor_parity_report.py voyager_index/index.py voyager_index/_internal/public_index voyager_index/_internal/inference/shard_engine/sweep_config.py voyager_index/_internal/inference/shard_engine/serving_config.py voyager_index/_internal/inference/shard_engine/interfaces.py voyager_index/_internal/inference/shard_engine/capabilities.py voyager_index/_internal/server/api/models.py voyager_index/_internal/server/api/routes.py voyager_index/_internal/server/api/service.py tests/test_shard_refactor_contracts.py tests/test_oss_release_hygiene.py tests/test_release_polish_surface.py tests/test_full_feature_validation_native.py
       - name: Ruff format check
-        run: ruff format --check scripts/packaged_install_smoke.py tests/test_oss_release_hygiene.py tests/test_release_polish_surface.py tests/test_full_feature_validation_native.py
+        run: ruff format --check scripts/packaged_install_smoke.py scripts/shard_refactor_parity_report.py voyager_index/index.py voyager_index/_internal/public_index voyager_index/_internal/inference/shard_engine/sweep_config.py voyager_index/_internal/inference/shard_engine/serving_config.py voyager_index/_internal/inference/shard_engine/interfaces.py voyager_index/_internal/inference/shard_engine/capabilities.py voyager_index/_internal/server/api/models.py voyager_index/_internal/server/api/routes.py voyager_index/_internal/server/api/service.py tests/test_shard_refactor_contracts.py tests/test_oss_release_hygiene.py tests/test_release_polish_surface.py tests/test_full_feature_validation_native.py
 
   base-install:
     runs-on: ubuntu-latest
@@ -367,6 +367,38 @@ jobs:
                  tests/test_hybrid_shard.py tests/test_shard_roq4.py \
                  tests/test_shard_http_api.py tests/test_shard_hardening.py \
                  -v --tb=short
+      - name: Write shard refactor parity report
+        run: |
+          mkdir -p validation-reports/shard-refactor-${{ matrix.python-version }}-${{ github.run_id }}
+          python scripts/shard_refactor_parity_report.py \
+            --output-json validation-reports/shard-refactor-${{ matrix.python-version }}-${{ github.run_id }}/report.json
+      - name: Assert shard refactor parity report
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(
+              Path("validation-reports/shard-refactor-${{ matrix.python-version }}-${{ github.run_id }}/report.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          assert report["parity"]["trace_keys_equal_after_reopen"] is True
+          assert report["parity"]["exact_path_equal_after_reopen"] is True
+          assert report["parity"]["prune_path_equal_after_reopen"] is True
+          assert report["parity"]["result_ids_equal_after_reopen"] is True
+          assert report["parity"]["runtime_capabilities_stable"] is True
+          assert report["api"]["health_status_code"] == 200
+          assert report["api"]["health_has_runtime_capabilities"] is True
+          assert report["api"]["create_collection_status_code"] == 200
+          assert report["api"]["collection_info_status_code"] == 200
+          assert report["api"]["collection_runtime_capability_keys"], "collection capability metadata missing"
+          PY
+      - name: Upload shard refactor parity bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-refactor-${{ matrix.python-version }}-report
+          path: validation-reports/shard-refactor-${{ matrix.python-version }}-${{ github.run_id }}
 
   docker-smoke:
     runs-on: ubuntu-latest

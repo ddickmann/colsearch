@@ -1,0 +1,197 @@
+"""Offline shard-engine build orchestration."""
+from __future__ import annotations
+
+import gc
+import json
+import logging
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from ..centroid_router import CentroidRouter
+from ..config import AnnBackend, BuildConfig, Compression, RouterType, StorageLayout
+from ..lemur_router import LemurRouter
+from ..pooling import TokenPooler
+from ..shard_store import ShardStore
+from .corpus import DEFAULT_NPZ, load_corpus
+from .layout import _index_dir, assign_storage_shards
+
+log = logging.getLogger(__name__)
+
+def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") -> Path:
+    index_dir = _index_dir(cfg)
+
+    if (index_dir / "manifest.json").exists():
+        router_path = index_dir / ("lemur" if cfg.router_type == RouterType.LEMUR else "router")
+        if (router_path / "router_state.json").exists():
+            log.info("Index already exists at %s, skipping build", index_dir)
+            return index_dir
+
+    index_dir.mkdir(parents=True, exist_ok=True)
+    all_vectors, doc_offsets, doc_ids, *_rest, dim = load_corpus(npz_path, max_docs=cfg.corpus_size)
+
+    active_vectors = all_vectors
+    active_offsets = doc_offsets
+    active_counts = np.array([e - s for s, e in doc_offsets], dtype=np.int32)
+    centroid_to_shard = None
+
+    # Optional token pooling
+    if cfg.pooling.enabled:
+        pooler = TokenPooler(
+            method=cfg.pooling.method,
+            pool_factor=cfg.pooling.pool_factor,
+            protected_tokens=cfg.pooling.protected_tokens,
+        )
+        pooled_vectors, pooled_offsets, pooled_counts = pooler.pool_docs(all_vectors, doc_offsets)
+        active_vectors = pooled_vectors.numpy()
+        active_offsets = pooled_offsets
+        active_counts = pooled_counts.numpy()
+        log.info(
+            "Token pooling reduced corpus from %d to %d token vectors (%.2fx)",
+            int(all_vectors.shape[0]), int(active_vectors.shape[0]),
+            float(all_vectors.shape[0]) / max(1, int(active_vectors.shape[0])),
+        )
+
+    # Train router
+    if cfg.router_type == RouterType.CENTROID:
+        t0 = time.time()
+        router, shard_assignments, centroid_to_shard = CentroidRouter.train(
+            all_vectors=np.asarray(active_vectors, dtype=np.float32),
+            doc_offsets=active_offsets,
+            n_centroids=cfg.n_centroids,
+            n_shards=cfg.n_shards,
+            sample_fraction=cfg.kmeans_sample_fraction,
+            max_iter=cfg.max_kmeans_iter,
+            seed=cfg.seed,
+            device=device,
+        )
+        train_s = time.time() - t0
+        log.info("Centroid router training done in %.1fs", train_s)
+    else:
+        t0 = time.time()
+        lemur_device = device if device != "cpu" else cfg.lemur.device
+        router = LemurRouter(
+            index_dir=index_dir / "lemur",
+            ann_backend=cfg.lemur.ann_backend.value,
+            device=lemur_device,
+        )
+        # Build FP16 tensor once, reuse for both passes
+        doc_vecs_f16 = torch.from_numpy(np.asarray(active_vectors)).to(torch.float16)
+        doc_counts_t = torch.from_numpy(active_counts)
+
+        # First pass: temporary token-balanced shards for LEMUR training
+        shard_assignments = assign_storage_shards(
+            active_offsets, cfg.n_shards, cfg.seed, StorageLayout.TOKEN_BALANCED,
+        )
+        doc_id_to_shard = {doc_id: int(shard_assignments[i]) for i, doc_id in enumerate(doc_ids)}
+        router.fit_initial(
+            pooled_doc_vectors=doc_vecs_f16,
+            pooled_doc_counts=doc_counts_t,
+            doc_ids=doc_ids,
+            doc_id_to_shard=doc_id_to_shard,
+            epochs=cfg.lemur.epochs,
+        )
+        # Second pass: use learned proxy weights for better shard layout
+        proxy_weights = router._weights.clone()
+        shard_assignments = assign_storage_shards(
+            active_offsets, cfg.n_shards, cfg.seed, cfg.layout, proxy_weights=proxy_weights,
+        )
+        doc_id_to_shard = {doc_id: int(shard_assignments[i]) for i, doc_id in enumerate(doc_ids)}
+        router.fit_initial(
+            pooled_doc_vectors=doc_vecs_f16,
+            pooled_doc_counts=doc_counts_t,
+            doc_ids=doc_ids,
+            doc_id_to_shard=doc_id_to_shard,
+            epochs=cfg.lemur.epochs,
+        )
+        del doc_vecs_f16, doc_counts_t
+        gc.collect()
+        train_s = time.time() - t0
+        log.info("LEMUR router training done in %.1fs", train_s)
+
+    if cfg.layout == StorageLayout.RANDOM:
+        rng = np.random.RandomState(cfg.seed + 1)
+        shard_assignments = rng.randint(0, cfg.n_shards, size=len(doc_ids)).astype(np.int32)
+        if cfg.router_type == RouterType.LEMUR:
+            doc_id_to_shard = {doc_id: int(shard_assignments[i]) for i, doc_id in enumerate(doc_ids)}
+            router._doc_id_to_shard = doc_id_to_shard
+            router.save()
+
+    # ROQ4: train quantizer and pre-encode all documents
+    roq_quantizer = None
+    roq_doc_codes = None
+    roq_doc_meta = None
+    if cfg.compression == Compression.ROQ4:
+        try:
+            from voyager_index._internal.inference.quantization.rotational import (
+                RotationalQuantizer, RoQConfig,
+            )
+            log.info("Training ROQ 4-bit quantizer ...")
+            roq_quantizer = RotationalQuantizer(RoQConfig(dim=dim, num_bits=4, seed=cfg.seed))
+            roq_doc_codes = []
+            roq_doc_meta = []
+            t_roq = time.time()
+            for i, (s, e) in enumerate(active_offsets):
+                vecs = np.asarray(active_vectors[s:e], dtype=np.float32)
+                q = roq_quantizer.quantize(vecs, store=False)
+                roq_doc_codes.append(np.asarray(q["codes"], dtype=np.uint8))
+                roq_doc_meta.append(roq_quantizer.build_triton_meta(q, include_norm_sq=True))
+                if (i + 1) % 2000 == 0:
+                    log.info("  ROQ encoded %d/%d docs (%.1fs)", i + 1, len(active_offsets), time.time() - t_roq)
+            log.info("ROQ encoding done in %.1fs", time.time() - t_roq)
+
+            # Save quantizer for query-time use
+            import pickle
+            with open(index_dir / "roq_quantizer.pkl", "wb") as f:
+                pickle.dump(roq_quantizer, f)
+        except ImportError:
+            log.warning("ROQ quantizer not available, falling back to FP16 storage for ROQ4")
+            cfg.compression = Compression.FP16
+
+    # Build shard store
+    t0 = time.time()
+    store = ShardStore(index_dir)
+    store.build(
+        all_vectors=np.asarray(active_vectors),
+        doc_offsets=active_offsets,
+        doc_ids=doc_ids,
+        shard_assignments=shard_assignments,
+        n_shards=cfg.n_shards,
+        dim=dim,
+        compression=cfg.compression,
+        centroid_to_shard=centroid_to_shard,
+        uniform_shard_tokens=cfg.uniform_shard_tokens,
+        roq_doc_codes=roq_doc_codes,
+        roq_doc_meta=roq_doc_meta,
+    )
+    build_s = time.time() - t0
+    log.info("Shard store built in %.1fs", build_s)
+
+    # Save router (LEMUR already saved itself via fit_initial; centroid needs explicit save)
+    if cfg.router_type == RouterType.CENTROID:
+        router.save(index_dir / "router")
+        log.info("Router saved to %s", index_dir / "router")
+
+    with open(index_dir / "build_meta.json", "w") as f:
+        json.dump({
+            "corpus_size": cfg.corpus_size,
+            "dim": dim,
+            "n_centroids": cfg.n_centroids,
+            "n_shards": cfg.n_shards,
+            "compression": cfg.compression.value,
+            "layout": cfg.layout.value,
+            "router_type": cfg.router_type.value,
+            "pooling_enabled": cfg.pooling.enabled,
+            "pool_factor": cfg.pooling.pool_factor,
+            "train_time_s": train_s,
+            "build_time_s": build_s,
+            "total_tokens": int(np.asarray(active_vectors).shape[0]),
+            "avg_tokens_per_doc": float(np.mean([e - s for s, e in active_offsets])),
+        }, f, indent=2)
+
+    gc.collect()
+    log.info("Build complete. Index at %s, RSS=%.1f GB", index_dir, _mem_gb())
+    return index_dir
+

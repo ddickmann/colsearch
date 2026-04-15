@@ -81,6 +81,7 @@ async def health_check(request: Request, service: SearchService = Depends(get_se
         version=request.app.version,
         collections=len(service.collections),
         gpu_available=service.gpu_available,
+        runtime_capabilities=service.runtime_capabilities,
     )
 
 

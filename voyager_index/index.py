@@ -10,85 +10,16 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 
+from voyager_index._internal.public_index.builder import IndexBuilder
+from voyager_index._internal.public_index.factory import create_index_manager
+from voyager_index._internal.public_index.models import IndexStats, ScrollPage, SearchResult
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SearchResult:
-    """A single search result with document ID, score, and optional payload."""
-
-    doc_id: int
-    score: float
-    payload: Optional[Dict[str, Any]] = None
-    token_scores: Optional[List[float]] = None
-    matched_tokens: Optional[List[int]] = None
-
-    def __repr__(self) -> str:
-        pay = f", payload={self.payload}" if self.payload is not None else ""
-        tok = f", token_scores=[{len(self.token_scores)} tokens]" if self.token_scores is not None else ""
-        return f"SearchResult(doc_id={self.doc_id}, score={self.score:.4f}{pay}{tok})"
-
-
-@dataclass
-class ScrollPage:
-    """A page of results from scroll iteration."""
-
-    results: List[SearchResult]
-    next_offset: Optional[int] = None
-
-
-@dataclass
-class IndexStats:
-    """Summary statistics for an Index."""
-
-    total_documents: int = 0
-    sealed_segments: int = 0
-    active_documents: int = 0
-    dim: int = 0
-    engine: str = ""
-
-
-def _check_gem_available() -> bool:
-    try:
-        from voyager_index._internal.inference.index_core.gem_manager import (
-            GemNativeSegmentManager,
-        )
-
-        if GemNativeSegmentManager is None:
-            return False
-        from latence_gem_index import GemSegment, PyMutableGemSegment
-
-        return GemSegment is not None and PyMutableGemSegment is not None
-    except ImportError:
-        return False
-
-
-def _check_hnsw_available() -> bool:
-    try:
-        from voyager_index._internal.inference.index_core.hnsw_manager import (
-            HnswSegmentManager,
-        )
-
-        return HnswSegmentManager is not None
-    except ImportError:
-        return False
-
-
-def _check_shard_available() -> bool:
-    try:
-        from voyager_index._internal.inference.shard_engine.manager import (
-            ShardSegmentManager,
-        )
-
-        return ShardSegmentManager is not None
-    except ImportError:
-        return False
 
 
 class Index:
@@ -184,94 +115,19 @@ class Index:
         self._payloads: Dict[int, Dict[str, Any]] = {}
         self._metrics_hook = None
 
-        # Mode-based engine selection and parameter tuning
-        resolved_engine = engine
-        if mode in ("colbert", "colpali"):
-            resolved_engine = "gem"
-            kwargs.setdefault("enable_shortcuts", mode == "colpali")
-        if engine == "auto":
-            if _check_gem_available():
-                resolved_engine = "gem"
-            elif _check_shard_available():
-                resolved_engine = "shard"
-            else:
-                resolved_engine = "hnsw"
-
-        self._engine = resolved_engine
-
-        if resolved_engine == "gem":
-            from voyager_index._internal.inference.index_core.gem_manager import (
-                GemNativeSegmentManager,
-            )
-
-            mgr_kwargs = dict(kwargs)
-            mgr_kwargs["enable_wal"] = enable_wal
-            self._manager = GemNativeSegmentManager(
-                shard_path=str(self._path / "shard"),
-                dim=dim,
-                n_fine=n_fine,
-                n_coarse=n_coarse,
-                max_degree=max_degree,
-                gem_ef_construction=ef_construction,
-                n_probes=n_probes,
-                **mgr_kwargs,
-            )
-        elif resolved_engine == "shard":
-            from voyager_index._internal.inference.shard_engine.manager import (
-                ShardEngineConfig,
-                ShardSegmentManager,
-            )
-
-            shard_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                in {
-                    "n_shards",
-                    "compression",
-                    "layout",
-                    "router_type",
-                    "ann_backend",
-                    "lemur_epochs",
-                    "k_candidates",
-                    "max_docs_exact",
-                    "lemur_search_k_cap",
-                    "n_full_scores",
-                    "transfer_mode",
-                    "pinned_pool_buffers",
-                    "pinned_buffer_max_tokens",
-                    "use_colbandit",
-                    "quantization_mode",
-                    "variable_length_strategy",
-                    "gpu_corpus_rerank_topn",
-                    "n_centroid_approx",
-                    "router_device",
-                    "uniform_shard_tokens",
-                    "seed",
-                }
-            }
-            shard_config = kwargs.get("shard_config") or ShardEngineConfig(
-                dim=dim,
-                **shard_kwargs,
-            )
-            device = kwargs.get("device", "cuda")
-            self._manager = ShardSegmentManager(
-                path=self._path / "shard",
-                config=shard_config,
-                device=device,
-            )
-        elif resolved_engine == "hnsw":
-            from voyager_index._internal.inference.index_core.hnsw_manager import (
-                HnswSegmentManager,
-            )
-
-            self._manager = HnswSegmentManager(
-                shard_path=str(self._path / "shard"),
-                dim=dim,
-                **kwargs,
-            )
-        else:
-            raise ValueError(f"Unknown engine: {engine!r}. Use 'gem', 'hnsw', 'shard', or 'auto'.")
+        self._engine, self._manager = create_index_manager(
+            path=self._path,
+            dim=dim,
+            engine=engine,
+            mode=mode,
+            n_fine=n_fine,
+            n_coarse=n_coarse,
+            max_degree=max_degree,
+            ef_construction=ef_construction,
+            n_probes=n_probes,
+            enable_wal=enable_wal,
+            kwargs=kwargs,
+        )
 
         if hasattr(self._manager, "_payloads"):
             self._payloads = dict(self._manager._payloads)
@@ -709,108 +565,3 @@ class Index:
         return self._engine
 
 
-class IndexBuilder:
-    """
-    Fluent builder for creating an :class:`Index` with custom configuration.
-
-    Every ``with_*`` method returns ``self`` so calls can be chained::
-
-        idx = (IndexBuilder("my_index", dim=128)
-               .with_shard(n_shards=64, k_candidates=512)
-               .with_wal(enabled=True)
-               .build())
-
-    Args:
-        path: Directory to store the index.
-        dim: Vector dimensionality (must match the embedding model).
-    """
-
-    def __init__(self, path: str, dim: int) -> None:
-        self._path = path
-        self._dim = dim
-        self._engine = "auto"
-        self._kwargs: Dict[str, Any] = {}
-
-    def with_gem(self, **kwargs: Any) -> "IndexBuilder":
-        """Select the GEM engine with optional keyword overrides.
-
-        Common kwargs: ``seed_batch_size``, ``n_fine``, ``n_coarse``,
-        ``max_degree``, ``ef_construction``, ``dual_graph``, ``use_emd``.
-        """
-        self._engine = "gem"
-        self._kwargs.update(kwargs)
-        return self
-
-    def with_hnsw(self, **kwargs: Any) -> "IndexBuilder":
-        """Select the HNSW engine (legacy single-vector backend)."""
-        self._engine = "hnsw"
-        self._kwargs.update(kwargs)
-        return self
-
-    def with_shard(self, **kwargs: Any) -> "IndexBuilder":
-        """Select the LEMUR-routed shard engine for scalable late-interaction retrieval.
-
-        Common kwargs: ``n_shards``, ``k_candidates``, ``lemur_epochs``,
-        ``compression``, ``device``.
-        """
-        self._engine = "shard"
-        self._kwargs.update(kwargs)
-        return self
-
-    def with_wal(self, enabled: bool = True) -> "IndexBuilder":
-        """Enable or disable the write-ahead log for crash recovery.
-
-        Args:
-            enabled: ``True`` (default) enables WAL + CRC32 checkpointing.
-        """
-        self._kwargs["enable_wal"] = enabled
-        return self
-
-    def with_quantization(self, n_fine: int = 256, n_coarse: int = 32) -> "IndexBuilder":
-        """Configure the two-stage codebook for qCH proxy scoring.
-
-        Args:
-            n_fine: Number of fine centroids (higher = better proxy accuracy,
-                more build time). Recommended: 128–2048 depending on corpus.
-            n_coarse: Number of coarse routing clusters.
-        """
-        self._kwargs["n_fine"] = n_fine
-        self._kwargs["n_coarse"] = n_coarse
-        return self
-
-    def with_gpu_rerank(self, device: str = "cuda") -> IndexBuilder:
-        """Enable GPU-accelerated MaxSim reranking.
-
-        GEM proxy search produces candidates ranked by quantized Chamfer
-        distance.  This option adds a second-stage exact late-interaction
-        rerank on the specified device for higher recall.
-
-        Args:
-            device: PyTorch device string (default ``'cuda'``).
-        """
-        self._kwargs["rerank_device"] = device
-        return self
-
-    def with_roq(self, bits: int = 4, device: str = "cuda") -> IndexBuilder:
-        """Enable ROQ (Rotational Quantization) compressed reranking.
-
-        Stores document vectors in ``bits``-bit quantized form and runs
-        MaxSim reranking with a fused Triton kernel.  Reduces memory by
-        ~8x (at 4-bit) compared to FP32 with minimal recall loss.
-
-        Args:
-            bits: Quantization bit width (default 4).
-            device: PyTorch device string (default ``'cuda'``).
-        """
-        self._kwargs["roq_rerank"] = True
-        self._kwargs["roq_bits"] = bits
-        self._kwargs["rerank_device"] = device
-        return self
-
-    def build(self) -> Index:
-        return Index(
-            self._path,
-            self._dim,
-            engine=self._engine,
-            **self._kwargs,
-        )
