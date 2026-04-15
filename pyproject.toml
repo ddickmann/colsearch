@@ -79,10 +79,10 @@ hnswlib-engine = [
   "hnswlib>=0.8,<1",
 ]
 native-build = [
-  "maturin>=1.5,<2.0",
+  "maturin>=1.13.1,<2.0",
 ]
 native-solver-build = [
-  "maturin>=1.5,<2.0",
+  "maturin>=1.13.1,<2.0",
 ]
 multimodal = [
   "httpx>=0.27,<1",
