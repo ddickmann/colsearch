@@ -53,7 +53,7 @@ rand_chacha = "0.3"
 wide = "0.7"
 
 # CUDA backend (optional)
-cudarc = { version = "0.12", optional = true, features = ["cuda-12040"] }
+cudarc = { version = "0.19", optional = true, features = ["cuda-12040"] }
 half = { version = "2.4", features = ["std"], optional = true }
 
 # Memory management
