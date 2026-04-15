@@ -27,7 +27,7 @@ wgpu = { version = "0.20", optional = true }
 pollster = { version = "0.3", optional = true }
 
 # Parallelism
-rayon = "1.10"
+rayon = "1.12"
 
 # Python bindings
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
