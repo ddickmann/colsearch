@@ -134,11 +134,19 @@ class GraphPolicyMetadata(_DictLikeModel):
     reason: Optional[str] = Field(default=None, description="Why the graph lane was applied or skipped.")
     mode: Optional[str] = Field(default=None, description="Resolved graph mode after policy evaluation.")
     entity_count: Optional[int] = Field(default=None, description="Number of entity cues detected in the request.")
-    relation_cue_count: Optional[int] = Field(default=None, description="Number of relation cues detected in the request.")
-    low_agreement: Optional[bool] = Field(default=None, description="Whether first-stage dense and sparse routes disagreed.")
+    relation_cue_count: Optional[int] = Field(
+        default=None, description="Number of relation cues detected in the request."
+    )
+    low_agreement: Optional[bool] = Field(
+        default=None, description="Whether first-stage dense and sparse routes disagreed."
+    )
     low_confidence: Optional[bool] = Field(default=None, description="Whether first-stage confidence was too low.")
-    graph_available: Optional[bool] = Field(default=None, description="Whether the graph sidecar was healthy and available.")
-    query_class: Optional[str] = Field(default=None, description="Policy classification such as ordinary, relation, or graph_native.")
+    graph_available: Optional[bool] = Field(
+        default=None, description="Whether the graph sidecar was healthy and available."
+    )
+    query_class: Optional[str] = Field(
+        default=None, description="Policy classification such as ordinary, relation, or graph_native."
+    )
     trigger_reasons: List[str] = Field(default_factory=list, description="Triggers that caused graph activation.")
     mandatory_reason: Optional[str] = Field(default=None, description="Mandatory workflow override, when present.")
 
@@ -147,11 +155,17 @@ class GraphProvenanceRecord(_DictLikeModel):
     """Typed graph provenance record for a rescued or graph-scored target."""
 
     reason: Optional[str] = Field(default=None, description="Primary graph reason for this target.")
-    lanes: List[str] = Field(default_factory=list, description="Graph lanes contributing to this target, e.g. graph_local.")
+    lanes: List[str] = Field(
+        default_factory=list, description="Graph lanes contributing to this target, e.g. graph_local."
+    )
     graph_score: Optional[float] = Field(default=None, description="Merged graph score for this target.")
-    community_ids: List[str] = Field(default_factory=list, description="Community identifiers contributing to this target.")
+    community_ids: List[str] = Field(
+        default_factory=list, description="Community identifiers contributing to this target."
+    )
     support_count: Optional[float] = Field(default=None, description="Support count or neighborhood support strength.")
-    path: Optional[List[str]] = Field(default=None, description="Optional explain path labels when graph_explain is enabled.")
+    path: Optional[List[str]] = Field(
+        default=None, description="Optional explain path labels when graph_explain is enabled."
+    )
 
 
 class GraphSearchSummary(_DictLikeModel):
@@ -160,18 +174,36 @@ class GraphSearchSummary(_DictLikeModel):
     model_config = ConfigDict(extra="allow")
 
     reason: Optional[str] = Field(default=None, description="Summary reason emitted by the graph sidecar or policy.")
-    graph_available: Optional[bool] = Field(default=None, description="Whether the graph sidecar was healthy for this request.")
+    graph_available: Optional[bool] = Field(
+        default=None, description="Whether the graph sidecar was healthy for this request."
+    )
     graph_applied: Optional[bool] = Field(default=None, description="Whether graph augmentation actually ran.")
-    graph_result_count: Optional[int] = Field(default=None, description="Total graph-scored candidates returned by the sidecar.")
-    added_candidate_count: Optional[int] = Field(default=None, description="How many candidates were added additively beyond the base order.")
-    merge_mode: Optional[str] = Field(default=None, description="Merge behavior for graph candidates. The shipped mode is additive.")
-    invoked_after_first_stage: Optional[bool] = Field(default=None, description="Whether graph augmentation ran only after first-stage retrieval.")
-    base_order_preserved: Optional[bool] = Field(default=None, description="Whether the base retrieval order was preserved ahead of graph rescues.")
+    graph_result_count: Optional[int] = Field(
+        default=None, description="Total graph-scored candidates returned by the sidecar."
+    )
+    added_candidate_count: Optional[int] = Field(
+        default=None, description="How many candidates were added additively beyond the base order."
+    )
+    merge_mode: Optional[str] = Field(
+        default=None, description="Merge behavior for graph candidates. The shipped mode is additive."
+    )
+    invoked_after_first_stage: Optional[bool] = Field(
+        default=None, description="Whether graph augmentation ran only after first-stage retrieval."
+    )
+    base_order_preserved: Optional[bool] = Field(
+        default=None, description="Whether the base retrieval order was preserved ahead of graph rescues."
+    )
     local_budget: Optional[int] = Field(default=None, description="Configured local rescue budget for this request.")
-    community_budget: Optional[int] = Field(default=None, description="Configured community rescue budget for this request.")
-    evidence_budget: Optional[int] = Field(default=None, description="Configured linked-evidence rescue budget for this request.")
+    community_budget: Optional[int] = Field(
+        default=None, description="Configured community rescue budget for this request."
+    )
+    evidence_budget: Optional[int] = Field(
+        default=None, description="Configured linked-evidence rescue budget for this request."
+    )
     max_hops: Optional[int] = Field(default=None, description="Configured graph hop limit for this request.")
-    rescued_ids: List[int] = Field(default_factory=list, description="Document ids appended by graph rescue when available.")
+    rescued_ids: List[int] = Field(
+        default_factory=list, description="Document ids appended by graph rescue when available."
+    )
 
 
 class GraphSearchMetadata(_DictLikeModel):
@@ -182,7 +214,9 @@ class GraphSearchMetadata(_DictLikeModel):
     graph_applied: Optional[bool] = Field(default=None, description="Whether the optional graph lane was applied.")
     reason: Optional[str] = Field(default=None, description="Top-level graph reason for this request.")
     policy: Optional[GraphPolicyMetadata] = Field(default=None, description="Resolved graph policy decision.")
-    summary: Optional[GraphSearchSummary] = Field(default=None, description="Post-retrieval graph augmentation summary.")
+    summary: Optional[GraphSearchSummary] = Field(
+        default=None, description="Post-retrieval graph augmentation summary."
+    )
     provenance: Dict[str, GraphProvenanceRecord] = Field(
         default_factory=dict,
         description="Optional graph provenance keyed by external or logical target id.",
@@ -886,17 +920,29 @@ class CollectionInfo(BaseModel):
         default=None,
         description="Additive shard/runtime capability metadata including active fallbacks.",
     )
-    graph_health: Optional[str] = Field(default=None, description="Optional Latence graph sidecar health for this collection.")
-    graph_dataset_id: Optional[str] = Field(default=None, description="Latence dataset identifier backing the optional graph lane.")
-    graph_contract_version: Optional[str] = Field(default=None, description="Version of the stored graph contract bundle.")
-    graph_sync_status: Optional[str] = Field(default=None, description="Most recent graph Dataset Intelligence sync status.")
-    graph_sync_reason: Optional[str] = Field(default=None, description="Reason associated with the latest graph sync status.")
+    graph_health: Optional[str] = Field(
+        default=None, description="Optional Latence graph sidecar health for this collection."
+    )
+    graph_dataset_id: Optional[str] = Field(
+        default=None, description="Latence dataset identifier backing the optional graph lane."
+    )
+    graph_contract_version: Optional[str] = Field(
+        default=None, description="Version of the stored graph contract bundle."
+    )
+    graph_sync_status: Optional[str] = Field(
+        default=None, description="Most recent graph Dataset Intelligence sync status."
+    )
+    graph_sync_reason: Optional[str] = Field(
+        default=None, description="Reason associated with the latest graph sync status."
+    )
     graph_last_sync_at: Optional[str] = Field(default=None, description="Timestamp of the latest graph sync attempt.")
     graph_last_successful_sync_at: Optional[str] = Field(
         default=None,
         description="Timestamp of the latest successful graph sync.",
     )
-    graph_sync_job_id: Optional[str] = Field(default=None, description="Dataset Intelligence job id when the latest sync created one.")
+    graph_sync_job_id: Optional[str] = Field(
+        default=None, description="Dataset Intelligence job id when the latest sync created one."
+    )
 
 
 class CollectionListResponse(BaseModel):

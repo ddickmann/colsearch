@@ -31,10 +31,10 @@ from voyager_index._internal.inference.config import IndexConfig
 from voyager_index._internal.inference.engines.colpali import ColPaliConfig, ColPaliEngine
 from voyager_index._internal.inference.index_core.graph_policy import LatenceGraphPolicy
 from voyager_index._internal.inference.index_core.hybrid_manager import HybridSearchManager
-from voyager_index._internal.inference.index_core.latence_graph_sidecar import LatenceGraphSidecar
 from voyager_index._internal.inference.index_core.index import ColbertIndex
-from voyager_index._internal.inference.shard_engine.capabilities import detect_runtime_capabilities
+from voyager_index._internal.inference.index_core.latence_graph_sidecar import LatenceGraphSidecar
 from voyager_index._internal.inference.shard_engine import ShardSegmentManager
+from voyager_index._internal.inference.shard_engine.capabilities import detect_runtime_capabilities
 from voyager_index._internal.inference.shard_engine.config import Compression, TransferMode
 from voyager_index._internal.inference.shard_engine.manager import ShardEngineConfig
 from voyager_index.transport import decode_payload
@@ -312,7 +312,14 @@ class SearchService:
         if not target_ids:
             return
         if runtime.kind == CollectionKind.DENSE and hasattr(runtime.engine, "delete_graph_records"):
-            runtime.engine.delete_graph_records([int(runtime.meta["records"][str(target_id)]["internal_id"]) for target_id in target_ids if str(target_id) in runtime.meta["records"]], external_ids=[str(target_id) for target_id in target_ids if str(target_id) in runtime.meta["records"]])
+            runtime.engine.delete_graph_records(
+                [
+                    int(runtime.meta["records"][str(target_id)]["internal_id"])
+                    for target_id in target_ids
+                    if str(target_id) in runtime.meta["records"]
+                ],
+                external_ids=[str(target_id) for target_id in target_ids if str(target_id) in runtime.meta["records"]],
+            )
             runtime.graph_sidecar = getattr(runtime.engine, "graph_sidecar", None)
             return
         sidecar = self._graph_sidecar_for_runtime(runtime)
@@ -2102,9 +2109,7 @@ class SearchService:
             return base_ranked[:top_k]
         base_ids = {int(doc_id) for doc_id, _score in base_ranked}
         rescued_pairs = [
-            (int(doc_id), float(score))
-            for doc_id, score in list(graph_results or [])
-            if int(doc_id) not in base_ids
+            (int(doc_id), float(score)) for doc_id, score in list(graph_results or []) if int(doc_id) not in base_ids
         ]
         if not base_ranked:
             return rescued_pairs[:top_k]

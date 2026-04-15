@@ -19,6 +19,8 @@ from voyager_index._internal.public_index.builder import IndexBuilder
 from voyager_index._internal.public_index.factory import create_index_manager
 from voyager_index._internal.public_index.models import IndexStats, ScrollPage, SearchResult
 
+__all__ = ["Index", "IndexBuilder", "SearchResult", "ScrollPage", "IndexStats"]
+
 logger = logging.getLogger(__name__)
 
 
@@ -563,5 +565,3 @@ class Index:
     @property
     def engine(self) -> str:
         return self._engine
-
-

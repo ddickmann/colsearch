@@ -1,4 +1,5 @@
 """Runtime capability probes and summaries for the shard engine."""
+
 from __future__ import annotations
 
 import importlib.util

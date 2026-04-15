@@ -1,4 +1,5 @@
 """Engine selection and manager construction for the public `Index` facade."""
+
 from __future__ import annotations
 
 from pathlib import Path

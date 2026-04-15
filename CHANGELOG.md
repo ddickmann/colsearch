@@ -6,6 +6,21 @@ reads in release order again.
 
 ## Unreleased
 
+## 0.1.5 — Release Gate Hotfix
+
+This release republishes the shard-engine decomposition work on a clean CI line
+after fixing the small lint regressions that slipped through the initial `0.1.4`
+cut.
+
+### Release integrity
+
+- fixed the shard refactor parity script bootstrap so the release lint lane
+  accepts the repo-local import setup
+- normalized import ordering and explicit public exports in the refactor-touching
+  files that failed the hosted Ruff gate
+- bumped the root package and supported native packages onto the `0.1.5` line
+  so the hotfix release cleanly supersedes the drafted `0.1.4` cut
+
 ## 0.1.4 — Shard Engine Decomposition And Release Evidence
 
 This release keeps the shard product surface stable while decomposing the large

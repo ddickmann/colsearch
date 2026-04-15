@@ -1,4 +1,5 @@
 """Fluent builder helpers for the public `Index` facade."""
+
 from __future__ import annotations
 
 from typing import Any, Dict

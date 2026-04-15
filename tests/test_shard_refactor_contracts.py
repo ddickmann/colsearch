@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 from voyager_index._internal.inference.shard_engine import (
     BuildConfig,
     SearchConfig,
+)
+from voyager_index._internal.inference.shard_engine import (
     ShardSegmentManager as PackageShardSegmentManager,
 )
 from voyager_index._internal.inference.shard_engine.builder import _index_dir
@@ -104,7 +106,9 @@ def test_query_trace_contract_survives_reload(tmp_path: Path) -> None:
     finally:
         mgr.close()
 
-    reopened = ShardSegmentManager(shard_path, config=ShardEngineConfig(dim=16, ann_backend=AnnBackend.TORCH_EXACT_IP), device="cpu")
+    reopened = ShardSegmentManager(
+        shard_path, config=ShardEngineConfig(dim=16, ann_backend=AnnBackend.TORCH_EXACT_IP), device="cpu"
+    )
     try:
         trace_after = reopened.inspect_query_pipeline(query, k=3)
     finally:

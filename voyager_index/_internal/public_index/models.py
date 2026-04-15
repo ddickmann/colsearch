@@ -1,4 +1,5 @@
 """Shared public models for the `voyager_index.index` facade."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
