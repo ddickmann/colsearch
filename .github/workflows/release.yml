@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install twine
           python -m twine check dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-python
           path: dist/
@@ -93,7 +93,7 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --strip --interpreter 3.10 3.11 3.12
           before-script-linux: yum install -y clang-devel
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.crate }}-${{ matrix.os }}-${{ matrix.target }}
           path: src/kernels/${{ matrix.crate }}/target/wheels/*.whl
@@ -117,7 +117,7 @@ jobs:
         run: |
           mkdir -p dist/native-sdists/${{ matrix.crate }}
           (cd src/kernels/${{ matrix.crate }} && maturin sdist -o ../../../dist/native-sdists/${{ matrix.crate }})
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist-${{ matrix.crate }}
           path: dist/native-sdists/${{ matrix.crate }}/*.tar.gz
@@ -179,7 +179,7 @@ jobs:
             --artifact dist/voyager_index-*.whl \
             --artifact dist/voyager_index-*.tar.gz
       - name: Upload package validation bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: package-build-report
           path: validation-reports/package-build-${{ github.run_id }}
@@ -248,7 +248,7 @@ jobs:
               encoding="utf-8",
           )
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packaged-install-validation-report
           path: validation-reports/packaged-install-${{ github.run_id }}
@@ -295,7 +295,7 @@ jobs:
             --output-dir validation-reports/oss-test-${{ matrix.python-version }}-${{ github.run_id }} \
             --benchmark-json benchmark.json
       - name: Upload OSS validation bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oss-test-${{ matrix.python-version }}-report
           path: validation-reports/oss-test-${{ matrix.python-version }}-${{ github.run_id }}
@@ -358,7 +358,7 @@ jobs:
             --output-dir validation-reports/graph-route-${{ github.run_id }}/bundle \
             --benchmark-json validation-reports/graph-route-${{ github.run_id }}/graph-benchmark.json \
             --artifact validation-reports/graph-route-${{ github.run_id }}/graph-ablation.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: graph-route-validation-report
           path: validation-reports/graph-route-${{ github.run_id }}
@@ -407,7 +407,7 @@ jobs:
       - name: Assert solver validation status
         run: |
           python -c "import json, pathlib; report = json.loads(pathlib.Path('validation-reports/solver-validation-${{ github.run_id }}/report.json').read_text(encoding='utf-8')); summary = report['lanes']['solver']['summary']; assert set(report['native_packages']) == {'latence_shard_engine', 'latence_solver'}; assert 'native_hnsw' not in report['lanes']; assert 'gem_router' not in report['lanes']; assert report['native_packages']['latence_shard_engine']['status'] == 'installed_and_importable'; assert report['native_packages']['latence_solver']['status'] == 'installed_and_importable'; assert report['lanes']['solver']['status'] == 'passed'; assert summary['backend_probe_cpu']['constraints_satisfied'] is True; assert summary['accelerated'].get('parity_with_cpu', {}).get('status', 'passed') == 'passed'"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: solver-validation-report
           path: validation-reports/solver-validation-${{ github.run_id }}
