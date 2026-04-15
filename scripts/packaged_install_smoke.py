@@ -5,11 +5,11 @@ import json
 import tempfile
 from pathlib import Path
 
-from fastapi.testclient import TestClient
 import numpy as np
+from fastapi.testclient import TestClient
 
-from voyager_index import __version__ as package_version
 from voyager_index import SearchPipeline
+from voyager_index import __version__ as package_version
 from voyager_index.server import create_app
 
 

@@ -6,7 +6,26 @@ on:
 
 permissions: {}
 
+env:
+  VOYAGER_INDEX_PATH: ${{ github.workspace }}/.ci-data/voyager-index
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff check
+        run: ruff check scripts/packaged_install_smoke.py tests/test_oss_release_hygiene.py tests/test_release_polish_surface.py tests/test_full_feature_validation_native.py
+      - name: Ruff format check
+        run: ruff format --check scripts/packaged_install_smoke.py tests/test_oss_release_hygiene.py tests/test_release_polish_surface.py tests/test_full_feature_validation_native.py
+
   build-python:
     runs-on: ubuntu-latest
     permissions:
@@ -410,7 +429,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install -e ".[server,dev,shard]"
+          python -m pip install -e ".[server,dev,shard,multimodal]"
       - name: Run shard engine unit tests
         run: |
           pytest tests/test_shard_engine.py tests/test_shard_engine_api.py \
@@ -446,6 +465,7 @@ jobs:
       [
         build-native-wheels,
         build-native-sdists,
+        lint,
         package-build,
         packaged-install-validation,
         oss-test,

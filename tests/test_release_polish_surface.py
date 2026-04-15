@@ -9,7 +9,6 @@ from examples.reference_api_feature_tour import run_feature_tour, write_report
 from examples.reference_api_happy_path import run_happy_path
 from voyager_index.server import create_app
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 

@@ -8,7 +8,6 @@ import pytest
 
 from voyager_index._internal.inference.index_core.feature_bridge import FeatureBridge
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     "release_validation_report",
@@ -64,10 +63,10 @@ def test_feature_bridge_error_is_portable() -> None:
 def test_root_pyproject_no_longer_packages_from_compat_src() -> None:
     payload = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert "compat/src" not in payload
-    assert "\"src\"" not in payload
-    assert "\"src.server\"" not in payload
-    assert "\"src.inference\"" not in payload
-    assert "\"src.kernels\"" not in payload
+    assert '"src"' not in payload
+    assert '"src.server"' not in payload
+    assert '"src.inference"' not in payload
+    assert '"src.kernels"' not in payload
     assert "voyager_index._internal.inference.index_gpu" not in payload
     assert "voyager_index._internal.inference.gym" not in payload
     assert "voyager_index._internal.inference.control" not in payload
@@ -100,7 +99,7 @@ def test_reference_api_dockerfile_uses_root_src_tree() -> None:
 
 def test_install_docs_agree_on_pypi_distribution() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "pip install \"voyager-index" in readme or "pip install voyager-index" in readme
+    assert 'pip install "voyager-index' in readme or "pip install voyager-index" in readme
     assert "voyager-index[full]" in readme
 
     for doc_name in ["reference_api_tutorial.md", "full_feature_cookbook.md"]:
@@ -116,8 +115,12 @@ def test_no_stale_github_org_urls_in_docs() -> None:
         REPO_ROOT / "CONTRIBUTING.md",
         REPO_ROOT / "RELEASING.md",
     ]
-    for extra in ["docs/README.md", "docs/reference_api_tutorial.md",
-                   "docs/full_feature_cookbook.md", "examples/README.md"]:
+    for extra in [
+        "docs/README.md",
+        "docs/reference_api_tutorial.md",
+        "docs/full_feature_cookbook.md",
+        "examples/README.md",
+    ]:
         p = REPO_ROOT / extra
         if p.exists():
             doc_files.append(p)
@@ -178,12 +181,8 @@ def test_pyproject_install_contract_matches_public_release_story() -> None:
 def test_changelog_covers_current_version() -> None:
     import tomllib
 
-    pyproject = tomllib.loads(
-        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    )
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     current_version = pyproject["project"]["version"]
 
     changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert current_version in changelog, (
-        f"CHANGELOG.md missing entry for current version {current_version}"
-    )
+    assert current_version in changelog, f"CHANGELOG.md missing entry for current version {current_version}"

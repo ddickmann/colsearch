@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import gc
 import importlib.util
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
-
 
 SPEC = importlib.util.spec_from_file_location(
     "full_feature_validation",
@@ -212,11 +211,91 @@ def test_build_value_summary_exposes_key_deltas():
     summary = ffv.build_value_summary(
         {
             "lanes": {
-                "maxsim": {"summary": {"fast_colbert_cpu": {"elapsed_ms": 10.0}, "triton_cuda": {"status": "passed", "elapsed_ms": 5.0, "parity": True}}},
-                "quantization": {"summary": {"roq_1bit": {"recall_at_k": 0.1}, "roq_4bit": {"recall_at_k": 0.3, "top_1_agreement": 0.9, "rank_metrics": {"ndcg": 0.8}, "ndcg_delta_vs_full_precision": -0.02, "speedup_vs_full_precision": 1.6, "compression_vs_fp16": 3.2, "candidate_sweep": {"crossover_candidate_count": 128, "counts": [{"candidate_count": 32, "speedup_vs_full_precision": 0.7}, {"candidate_count": 64, "speedup_vs_full_precision": 0.95}, {"candidate_count": 128, "speedup_vs_full_precision": 1.1}]}}, "prototype_sidecar_screening": {"fallback_rate": 0.125, "direct_gather_rate": 0.875, "bootstrap_calibration_passed": True, "candidate_pool_retention": [{"candidate_count": 128, "top1_retention": 0.8, "topk_retention": 0.9}]}, "centroid_screening": {"recall_at_k": 0.88, "speedup_vs_full_precision": 1.9, "top_1_agreement": 0.92, "full_recovery_candidate_count": 64, "fallback_rate": 0.25, "direct_gather_rate": 0.75, "bootstrap_calibration_passed": True, "candidate_pool_retention": [{"candidate_count": 128, "top1_retention": 0.7, "topk_retention": 0.85}]}, "centroid_screening_scale_harness": {"speedup_vs_full_precision": 8.5}, "centroid_screening_decision_gate": {"promotion_recommendation": "promote_to_optimized"}, "multimodal_int8": {"recall_at_k": 0.8, "elapsed_ms_full_precision": 20.0, "elapsed_ms_quantized": 5.0}}},
-                "solver": {"summary": {"bm25": {"avg_rank_metrics": {"ndcg": 0.2}}, "dense_only": {"avg_rank_metrics": {"ndcg": 0.4}}, "hybrid_rrf": {"avg_rank_metrics": {"ndcg": 0.5}}, "solver_refined": {"avg_rank_metrics": {"ndcg": 0.7}, "avg_latency_ms": 12.0}, "comparison": {"hybrid_rrf_delta": {"ndcg": 0.01}, "solver_refined_delta": {"ndcg": 0.08}, "solver_avg_latency_delta_ms": 1.5, "solver_avg_objective_delta": 0.4, "solver_avg_total_tokens_delta": -24.0}}},
-                "ontology_variant": {"summary": {"hybrid_rrf_delta": {"ndcg": 0.05}, "solver_refined_delta": {"ndcg": 0.02}}},
-                "api_crud": {"summary": {"search": {"dense_vector_ms": 1.0, "dense_text_ms": 2.0, "dense_hybrid_ms": 3.0, "dense_optimized_ms": 4.0, "late_interaction_ms": 5.0, "multimodal_ms": 6.0}, "restart": {"cold_start_ms": 7.0}}},
+                "maxsim": {
+                    "summary": {
+                        "fast_colbert_cpu": {"elapsed_ms": 10.0},
+                        "triton_cuda": {"status": "passed", "elapsed_ms": 5.0, "parity": True},
+                    }
+                },
+                "quantization": {
+                    "summary": {
+                        "roq_1bit": {"recall_at_k": 0.1},
+                        "roq_4bit": {
+                            "recall_at_k": 0.3,
+                            "top_1_agreement": 0.9,
+                            "rank_metrics": {"ndcg": 0.8},
+                            "ndcg_delta_vs_full_precision": -0.02,
+                            "speedup_vs_full_precision": 1.6,
+                            "compression_vs_fp16": 3.2,
+                            "candidate_sweep": {
+                                "crossover_candidate_count": 128,
+                                "counts": [
+                                    {"candidate_count": 32, "speedup_vs_full_precision": 0.7},
+                                    {"candidate_count": 64, "speedup_vs_full_precision": 0.95},
+                                    {"candidate_count": 128, "speedup_vs_full_precision": 1.1},
+                                ],
+                            },
+                        },
+                        "prototype_sidecar_screening": {
+                            "fallback_rate": 0.125,
+                            "direct_gather_rate": 0.875,
+                            "bootstrap_calibration_passed": True,
+                            "candidate_pool_retention": [
+                                {"candidate_count": 128, "top1_retention": 0.8, "topk_retention": 0.9}
+                            ],
+                        },
+                        "centroid_screening": {
+                            "recall_at_k": 0.88,
+                            "speedup_vs_full_precision": 1.9,
+                            "top_1_agreement": 0.92,
+                            "full_recovery_candidate_count": 64,
+                            "fallback_rate": 0.25,
+                            "direct_gather_rate": 0.75,
+                            "bootstrap_calibration_passed": True,
+                            "candidate_pool_retention": [
+                                {"candidate_count": 128, "top1_retention": 0.7, "topk_retention": 0.85}
+                            ],
+                        },
+                        "centroid_screening_scale_harness": {"speedup_vs_full_precision": 8.5},
+                        "centroid_screening_decision_gate": {"promotion_recommendation": "promote_to_optimized"},
+                        "multimodal_int8": {
+                            "recall_at_k": 0.8,
+                            "elapsed_ms_full_precision": 20.0,
+                            "elapsed_ms_quantized": 5.0,
+                        },
+                    }
+                },
+                "solver": {
+                    "summary": {
+                        "bm25": {"avg_rank_metrics": {"ndcg": 0.2}},
+                        "dense_only": {"avg_rank_metrics": {"ndcg": 0.4}},
+                        "hybrid_rrf": {"avg_rank_metrics": {"ndcg": 0.5}},
+                        "solver_refined": {"avg_rank_metrics": {"ndcg": 0.7}, "avg_latency_ms": 12.0},
+                        "comparison": {
+                            "hybrid_rrf_delta": {"ndcg": 0.01},
+                            "solver_refined_delta": {"ndcg": 0.08},
+                            "solver_avg_latency_delta_ms": 1.5,
+                            "solver_avg_objective_delta": 0.4,
+                            "solver_avg_total_tokens_delta": -24.0,
+                        },
+                    }
+                },
+                "ontology_variant": {
+                    "summary": {"hybrid_rrf_delta": {"ndcg": 0.05}, "solver_refined_delta": {"ndcg": 0.02}}
+                },
+                "api_crud": {
+                    "summary": {
+                        "search": {
+                            "dense_vector_ms": 1.0,
+                            "dense_text_ms": 2.0,
+                            "dense_hybrid_ms": 3.0,
+                            "dense_optimized_ms": 4.0,
+                            "late_interaction_ms": 5.0,
+                            "multimodal_ms": 6.0,
+                        },
+                        "restart": {"cold_start_ms": 7.0},
+                    }
+                },
             }
         }
     )
