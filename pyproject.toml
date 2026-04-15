@@ -120,7 +120,7 @@ full = [
   "latence>=0.1.1",
 ]
 dev = [
-  "pytest>=8,<9",
+  "pytest>=9.0.3,<10",
   "pytest-cov>=5,<6",
   "tomli>=2,<3; python_version<'3.11'",
 ]
