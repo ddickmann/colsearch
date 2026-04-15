@@ -20,7 +20,7 @@ path = "src/bin/cli.rs"
 
 [dependencies]
 # CPU Tensor Operations (ndarray is more stable than burn)
-ndarray = "0.16"
+ndarray = "0.17"
 
 # GPU Compute (optional)
 wgpu = { version = "0.20", optional = true }
