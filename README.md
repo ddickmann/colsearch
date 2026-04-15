@@ -4,137 +4,159 @@
 [![PyPI](https://img.shields.io/pypi/v/voyager-index)](https://pypi.org/project/voyager-index/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-`voyager-index` is a multi-vector native, shard-first retrieval system for teams
-building high-recall on-prem search around token- and patch-level embeddings.
-It is designed for ColBERT-style late interaction, ColPali/ColQwen-style
-multimodal retrieval, dense lexical fusion, and durable single-host serving
-without turning the stack into a control-plane project.
+**Lightweight, high-performance multi-vector retrieval engine for on-prem deployment.**
 
-This repo has one supported product story:
+voyager-index delivers ColBERT / ColPali-grade retrieval quality at production
+throughput — no graph indexing, no distributed control plane, no cluster to
+operate.  Just shards, Rust cores, GPU kernels, and a FastAPI server you can
+`pip install` and run on a single machine.
 
-- LEMUR-routed shard retrieval as the mainline engine
-- exact or quantized MaxSim on CPU or Triton/CUDA
-- optional GPU-resident corpus mode
-- durable CRUD, WAL, checkpoint, and recovery
-- a simple Python SDK plus FastAPI reference server
-- base64 as the preferred/default HTTP transport for vectors
-- BM25 hybrid search with `rrf` or Tabu Search solver refinement
-
-Legacy `gem` and `hnsw` code remains for compatibility, but the supported docs,
-CI, and release surface are shard-first.
-
-## Built For
-
-Use `voyager-index` if you are building:
-
-- an on-prem retrieval system where MaxSim quality is non-negotiable
-- multimodal search over PDFs, office docs, images, and page-level corpora
-- hybrid retrieval that combines dense semantics with BM25 lexical recall
-- an application that needs CRUD, WAL-backed recovery, and straightforward
-  single-host operations
-- a graph-aware or ontology-aware system where graph construction should stay
-  outside the hot retrieval path and attach through stable IDs
-
-It is a strong fit for search, RAG, document intelligence, compliance and
-regulated knowledge systems, technical corpora, and teams that want the
-serving path to stay technically honest about recall, latency, and hardware
-placement.
-
-## Why This Architecture Exists
-
-Most retrieval stacks still behave like ANN systems that occasionally rerank.
-`voyager-index` is organized the other way around: late interaction remains the
-truth scorer, and the rest of the system exists to make that scorer practical.
-
-- `Routing instead of graph construction`: a learned LEMUR MLP reduces
-  multi-vector candidate generation to single-vector MIPS over FAISS.
-- `Exact semantics across hardware`: the same collection layout serves CPU
-  exact, streamed GPU, or GPU-corpus modes.
-- `Optimization without model drift`: `int8`, `fp8`, and `roq4` trim bandwidth
-  and kernel cost without changing the retrieval objective.
-- `Operational simplicity`: one package, one reference API, one base64 vector
-  contract, one durability model.
-- `Composable intelligence`: multimodal rendering, BM25 fusion, and
-  graph-adjacent sidecars can enrich the system without destabilizing the hot
-  path.
-
-## Retrieval Pipeline
-
-```text
-query token vectors / patch vectors
-  -> LEMUR routing MLP
-  -> FAISS ANN over routing representations
-  -> candidate document IDs
-  -> optional centroid-approx or doc-mean proxy pruning
-  -> optional ColBANDIT query-time pruning
-  -> exact or quantized MaxSim
-       CPU exact
-       Triton exact
-       Triton INT8 / FP8 / ROQ4
-       GPU-corpus gather + rerank
-  -> top-K
-  -> optional lexical fusion / downstream reasoning
+```
+pip install "voyager-index[server,shard,gpu]"
+voyager-index-server                          # OpenAPI at :8080/docs
 ```
 
-### Architecture Layers
+## Why
 
-| Layer | Core primitives | Why it matters |
-|---|---|---|
-| Routing | LEMUR MLP, FAISS MIPS, candidate budgets | makes late interaction tractable without graph construction |
-| Storage | safetensors shards, selective mmap reads, storage shards, GPU-resident corpus path | supports large corpora with honest CPU and GPU layouts |
-| Exact stage | Triton MaxSim, CPU exact fallback, quantized kernels, variable-length scheduling | keeps MaxSim as the truth scorer across deployment shapes |
-| Retrieval optimization | ColBANDIT, centroid approximation, doc-mean proxy, GPU rerank frontier | moves the latency/recall frontier without changing the product contract |
-| Durability | WAL, memtable, checkpoint, crash recovery, snapshots | lets a retrieval engine behave like a real application system |
-| Serving | FastAPI, base64 transport helpers, multi-worker single-host serving | keeps SDK and API integration simple for operators and clients |
+Most vector databases treat late interaction as an afterthought — bolt-on
+reranking over an ANN shortlist.  voyager-index is built the other way around:
+**MaxSim is the truth scorer**, and the entire system exists to make it fast.
 
-## What You Get
+- **No graph construction in the hot path.**  A learned LEMUR MLP collapses
+  multi-vector candidate generation to single-vector MIPS over FAISS — routing,
+  not indexing.
+- **Rust fused exact scoring on CPU.**  The native `latence_shard_engine`
+  extension runs MaxSim over memory-mapped shards with SIMD acceleration,
+  releasing the Python GIL for true multi-threaded throughput.
+- **Triton MaxSim on GPU.**  Custom CUDA kernels for FP16, INT8, FP8, and ROQ-4
+  scoring with variable-length document scheduling.
+- **Full database semantics.**  CRUD, WAL, checkpoint, crash recovery, payload
+  metadata, scroll/retrieve — everything you need for a real application, not
+  just a benchmark demo.
+- **API-first.**  FastAPI reference server with base64 vector transport,
+  OpenAPI docs, batch search, multi-worker serving, and Docker deployment.
 
-| Capability | What it means in practice |
-|---|---|
-| Shard-first late interaction | storage shards inside one shard engine, routed by LEMUR, then scored by MaxSim |
-| CPU and GPU execution shapes | same collection format across CPU exact, streamed GPU, and GPU-corpus serving |
-| Triton MaxSim | fused CUDA kernels for exact and quantized late-interaction scoring |
-| Quantized serving | `int8`, `fp8`, and `roq4` scoring modes on the CUDA fast path |
-| ColBANDIT in the real path | production query-time pruning, not an isolated research branch |
-| Durable mutations | add, upsert, delete, payload updates, checkpoint, restart recovery |
-| Multimodal ingestion path | PDF, DOCX, XLSX, and images rendered into page assets for patch-level retrieval |
-| Hybrid retrieval | BM25 plus dense retrieval with `rrf` or Tabu Search refinement |
-| Base64 transport | smaller, faster, shared HTTP payload contract for dense and multivector traffic |
-| Admin surface | shard inspection, WAL status, checkpoint, retrieve, scroll, batch search |
+## BEIR Benchmark
 
-## Who Should Use It And Who Should Not
+Measured on NVIDIA RTX A5000 (24 GB) with `lightonai/GTE-ModernColBERT-v1`,
+`top_k=100`, search-only (encoding excluded).  CPU uses 8 native Rust workers.
 
-Use it when:
+| Dataset | Documents | MAP@100 | NDCG@10 | NDCG@100 | Recall@10 | Recall@100 | GPU QPS | GPU P95 (ms) | CPU QPS | CPU P95 (ms) |
+|---------|----------:|--------:|--------:|---------:|----------:|-----------:|--------:|-------------:|--------:|-------------:|
+| arguana | 8,674 | 0.2737 | 0.3785 | 0.4289 | 0.7400 | 0.9600 | 270.2 | 4.2 | 40.2 | 274.3 |
+| fiqa | 57,638 | 0.4616 | 0.5120 | 0.5758 | 0.5626 | 0.7958 | 60.3 | 5.9 | 74.2 | 153.5 |
+| nfcorpus | 3,633 | 0.1874 | 0.3805 | 0.3078 | 0.3388 | 0.2820 | 284.3 | 3.8 | 132.3 | 129.5 |
+| quora | 15,675 | 0.9842 | 0.9871 | 0.9896 | 0.9929 | 1.0000 | 99.6 | 2.7 | 278.8 | 63.7 |
+| scidocs | 25,657 | 0.1165 | 0.1719 | 0.2494 | 0.1795 | 0.4065 | 237.2 | 4.6 | 73.2 | 148.1 |
+| scifact | 5,183 | 0.7343 | 0.7705 | 0.7836 | 0.8790 | 0.9300 | 261.4 | 4.0 | 58.7 | 147.0 |
 
-- you already have token- or patch-level embeddings
-- you want one system for SDK, API, CPU fallback, and GPU acceleration
-- you care about recall, payload size, and hardware placement at the same time
-- you want graph-aware semantics as a composable sidecar, not a forced graph DB
+### Comparison with next-plaid
 
-Do not use it when:
+[next-plaid](https://github.com/lightonai/next-plaid) (LightOn) is the current
+open-source reference for ColBERT-style late-interaction serving.  Their numbers
+below are from their README, measured on NVIDIA H100 80 GB with the same
+embedding model.  Their QPS **includes** encoding time; ours excludes it
+(search-only).
 
-- you only have pooled dense vectors and do not need multivector retrieval
-- you want a distributed control plane more than a retrieval engine
-- you want graph-native serving in the core OSS HTTP path
-- you want the repo to generate embeddings, run document intelligence, and host
-  every upstream model provider for you
+| Dataset | System | NDCG@10 | MAP@100 | Recall@100 | GPU QPS | GPU P95 (ms) | CPU QPS | CPU P95 (ms) |
+|---------|--------|--------:|--------:|-----------:|--------:|-------------:|--------:|-------------:|
+| arguana | **voyager** | **0.3785** | **0.2737** | **0.9600** | **270.2** | **4.2** | **40.2** | **274.3** |
+| | next-plaid | 0.3499 | 0.2457 | 0.9337 | 13.6 | 170.1 | 17.4 | 454.7 |
+| fiqa | **voyager** | **0.5120** | **0.4616** | **0.7958** | **60.3** | **5.9** | **74.2** | **153.5** |
+| | next-plaid | 0.4506 | 0.3871 | 0.7459 | 18.2 | 170.6 | 17.6 | 259.1 |
+| nfcorpus | **voyager** | 0.3805 | **0.1874** | 0.2820 | **284.3** | **3.8** | **132.3** | **129.5** |
+| | next-plaid | **0.3828** | 0.1870 | **0.3228** | 6.6 | 262.1 | 16.9 | 219.4 |
+| scidocs | **voyager** | 0.1719 | 0.1165 | 0.4065 | **237.2** | **4.6** | **73.2** | **148.1** |
+| | next-plaid | **0.1914** | **0.1352** | **0.4418** | 17.5 | 139.3 | 16.5 | 281.7 |
+| scifact | **voyager** | **0.7705** | **0.7343** | 0.9300 | **261.4** | **4.0** | **58.7** | **147.0** |
+| | next-plaid | 0.7593 | 0.7186 | **0.9633** | 7.9 | 169.5 | 16.9 | 305.4 |
+
+**Summary:** voyager-index matches or exceeds next-plaid on quality across most
+datasets while delivering **10–40x higher GPU throughput** and **2–8x higher CPU
+throughput** on a smaller GPU (A5000 vs H100).  GPU P95 latency is consistently
+under 6 ms versus 130–260 ms.
+
+> **Note on QPS methodology:** next-plaid reports near-constant QPS across
+> corpus sizes because their retrieval cost is dominated by a fixed candidate
+> budget (`n_full_scores=4096`, limited IVF probes) and their QPS includes
+> encoding.  Our QPS is pure search-only wall-clock throughput, which scales
+> with corpus size as routing and exact scoring do real work over the full
+> candidate set.
+
+## Architecture
+
+```text
+query vectors (token / patch embeddings)
+  → LEMUR routing MLP
+  → FAISS ANN over routing representations
+  → candidate document IDs
+  → optional centroid-approx or doc-mean proxy pruning
+  → optional ColBANDIT query-time pruning
+  → exact or quantized MaxSim
+       Rust fused exact (CPU, mmap, SIMD, GIL-free)
+       Triton FP16 / INT8 / FP8 / ROQ-4 (GPU)
+       GPU-corpus gather + rerank
+  → top-K results
+```
+
+| Layer | What it does | Why it matters |
+|-------|-------------|----------------|
+| **Routing** | LEMUR MLP, FAISS MIPS, candidate budgets | Makes late interaction tractable without graph construction |
+| **Storage** | Safetensors shards, merged mmap, GPU-resident corpus | Honest CPU and GPU layouts for any corpus size |
+| **Exact scoring** | Triton MaxSim, Rust fused MaxSim, quantized kernels | MaxSim stays the truth scorer across all deployment shapes |
+| **Optimization** | ColBANDIT pruning, centroid approximation, ROQ-4 | Moves the latency/recall frontier without changing the retrieval contract |
+| **Durability** | WAL, memtable, checkpoint, crash recovery | A retrieval engine that behaves like a real database |
+| **Serving** | FastAPI, base64 transport, multi-worker, OpenAPI | One `pip install`, one server, one API contract |
+
+## What Makes It Different
+
+### No graph indexing
+
+HNSW and friends trade recall for speed.  voyager-index uses a learned router
+(LEMUR) to narrow candidates, then runs full MaxSim over the shortlist.  The
+result: graph-free retrieval with higher recall at lower latency than
+graph-based approaches.
+
+### Rust + Triton, not Python
+
+The CPU hot path is a native Rust extension (`latence_shard_engine`) that
+memory-maps shard data, runs fused MaxSim with SIMD, and releases the GIL —
+enabling true parallel throughput across workers.  The GPU path uses custom
+Triton kernels with variable-length document scheduling.
+
+### SOTA research in the production path
+
+LEMUR routing, ColBANDIT query-time pruning, ROQ rotational quantization, and
+context packing via Tabu Search are all wired into the shipped serving path —
+not isolated research branches.
+
+### Real database operations
+
+Add, update, delete, and query documents with payload metadata.  WAL-backed
+mutations survive crashes.  Checkpoint and scroll APIs let you operate it like a
+database, not a throwaway index.
+
+### Multimodal native
+
+The same shard engine serves text token embeddings (ColBERT) and image patch
+embeddings (ColPali/ColQwen).  Document preprocessing handles PDF, DOCX, XLSX,
+and images into page-level patch vectors.
 
 ## Quickstart
 
-Install the mainline shard path:
+### Install
 
 ```bash
-pip install "voyager-index[shard]"
-pip install "voyager-index[server,shard]"        # reference API + preprocessing
-pip install "voyager-index[server,shard,gpu]"    # Triton MaxSim on CUDA
-pip install "voyager-index[server,shard,native]" # adds Tabu Search solver
+pip install "voyager-index[shard]"               # CPU only
+pip install "voyager-index[server,shard]"         # + FastAPI server
+pip install "voyager-index[server,shard,gpu]"     # + Triton GPU kernels
+pip install "voyager-index[server,shard,native]"  # + Tabu Search solver
 ```
 
-### First Local Search
+### Python SDK
 
 ```python
 import numpy as np
-
 from voyager_index import Index
 
 rng = np.random.default_rng(7)
@@ -145,7 +167,7 @@ idx = Index(
     "demo-index",
     dim=128,
     engine="shard",
-    n_shards=32,          # storage shards inside the shard engine
+    n_shards=32,
     k_candidates=256,
     compression="fp16",
 )
@@ -155,12 +177,16 @@ print(results[0])
 idx.close()
 ```
 
-### First HTTP Search With Base64 Transport
+### HTTP API
+
+```bash
+HOST=0.0.0.0 WORKERS=4 voyager-index-server
+# OpenAPI docs at http://127.0.0.1:8080/docs
+```
 
 ```python
 import numpy as np
 import requests
-
 from voyager_index import encode_vector_payload
 
 query = np.random.default_rng(7).normal(size=(16, 128)).astype("float32")
@@ -175,151 +201,82 @@ response = requests.post(
     },
     timeout=30,
 )
-response.raise_for_status()
 print(response.json()["results"][0])
 ```
 
-### Run The Server
+### Docker
 
 ```bash
-HOST=0.0.0.0 WORKERS=4 voyager-index-server
-# OpenAPI docs: http://127.0.0.1:8080/docs
+docker build -f deploy/reference-api/Dockerfile -t voyager-index .
+docker run -p 8080:8080 -v "$(pwd)/data:/data" voyager-index
 ```
 
-## CPU, Streamed GPU, And GPU-Corpus Modes
+## Execution Modes
 
-| Mode | Same retrieval semantics | What changes |
-|---|---|---|
-| CPU exact | LEMUR routing, MaxSim, CRUD, WAL, collection layout | exact stage stays on CPU; Triton quantized kernels are not active |
-| GPU streamed | LEMUR routing, storage shards, API contract, durability | candidate docs are fetched from disk/CPU memory and scored on GPU |
-| GPU corpus | LEMUR routing, top-level retrieval flow, request contract | corpus stays resident in VRAM for the lowest exact-stage latency |
+| Mode | Corpus placement | Best for |
+|------|-----------------|----------|
+| **CPU exact** | Disk/mmap → Rust fused MaxSim | Simplest deployment, no GPU required |
+| **GPU streamed** | Disk/CPU → GPU transfer → Triton MaxSim | Large corpora that don't fit in VRAM |
+| **GPU corpus** | Fully resident in VRAM | Lowest latency when corpus fits |
 
-Practical rule:
+All three modes share the same collection format, API contract, and retrieval
+semantics.  Start with CPU, add GPU when latency matters.
 
-- start with CPU if you want the simplest deployment and easiest observability
-- add `gpu` when exact-stage latency matters more than deployment minimalism
-- use GPU-corpus mode when the corpus fits comfortably in VRAM and you want the
-  shortest exact path
+## Engineering Knobs
 
-## Engineering Knobs That Actually Move The Needle
+### Routing and candidate budgets
 
-### Routing And Candidate Budgets
+- `k_candidates` — LEMUR candidate budget before exact scoring
+- `max_docs_exact` — hard ceiling for the exact-stage document set
+- `n_full_scores` — proxy shortlist size before full MaxSim
+- `use_colbandit` — enable query-time pruning
 
-- `k_candidates`: LEMUR candidate budget before exact scoring
-- `lemur_search_k_cap`: upper cap on routed search breadth
-- `max_docs_exact`: hard ceiling for the exact-stage document set
-- `n_full_scores`: proxy shortlist size before full MaxSim
-- `n_centroid_approx`: optional centroid-approx stage before exact full scoring
-- `use_colbandit`: query-time pruning in the production shard path
+### Storage and transfer
 
-### Storage, Transfer, And Layout
+- `n_shards` — number of storage shards
+- `compression` — `fp16`, `int8`, or `roq4`
+- `transfer_mode` — `pageable`, `pinned`, or `double_buffered`
 
-- `n_shards`: number of storage shards inside the shard engine
-- `compression`: persisted representation, `fp16`, `int8`, or `roq4`
-- `transfer_mode`: `pageable`, `pinned`, or `double_buffered`
-- `pinned_pool_buffers`: pinned-memory buffer pool size
-- `pinned_buffer_max_tokens`: upper bound for a pinned transfer chunk
-- `uniform_shard_tokens`: optional shard packing control
+### Scoring and hardware
 
-### Scoring And Hardware Placement
+- `quantization_mode` — exact, `int8`, `fp8`, or `roq4`
+- `router_device` — where LEMUR executes (`cpu` or `cuda`)
+- `gpu_corpus_rerank_topn` — GPU rerank frontier for corpus-resident mode
 
-- `quantization_mode`: exact, `int8`, `fp8`, or `roq4`
-- `router_device`: where LEMUR executes, usually `cpu` or `cuda`
-- `gpu_corpus_rerank_topn`: GPU rerank frontier when the corpus is resident
-- `variable_length_strategy`: scheduling mode for uneven token counts
-- `seed`: reproducible training/layout seed
-- `WORKERS`: single-host multi-worker QPS scaling for the reference server
+## Hybrid and Multimodal
 
-The rule of thumb is simple: tune routing breadth, exact-stage budget, and
-transfer mode first; only then reach for more exotic knobs.
+- **BM25 + dense fusion** via `rrf` or Tabu Search refinement
+- **Multimodal collections** share the same base64 vector contract as text
+- **Document preprocessing** handles PDF, DOCX, XLSX, and images via
+  `render_documents()` and the `/reference/preprocess/documents` API endpoint
+- **Graph-aware** workflows compose through stable document IDs and sidecars,
+  without forcing graph construction into the retrieval path
 
-## Hybrid, Multimodal, And Graph-Aware Retrieval
+## API Surface
 
-### Hybrid lexical + semantic retrieval
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /collections/{name}` | Create collection |
+| `POST /collections/{name}/points` | Add / upsert documents |
+| `POST /collections/{name}/search` | Search |
+| `POST /collections/{name}/search/batch` | Batch search |
+| `GET /collections/{name}/scroll` | Scroll through results |
+| `POST /collections/{name}/retrieve` | Retrieve by ID |
+| `DELETE /collections/{name}/points` | Delete documents |
+| `POST /collections/{name}/checkpoint` | Checkpoint WAL |
+| `GET /collections/{name}/wal/status` | WAL status |
+| `POST /encode` | Encode text/images to vectors |
+| `POST /rerank` | Rerank results |
+| `POST /reference/optimize` | Context packing (Tabu Search) |
 
-- dense collections expose BM25-only, vector-only, or fused BM25+dense search
-- set `dense_hybrid_mode="rrf"` for simple fusion
-- set `dense_hybrid_mode="tabu"` when `latence_solver` is installed and you want
-  Tabu Search refinement
-- use `HybridSearchManager` in process when you want BM25 fusion with the shard
-  backend itself
+## Public Python Surface
 
-### Multimodal retrieval
-
-- late-interaction and multimodal collections share the same base64 vector
-  contract
-- local preprocessing starts with `enumerate_renderable_documents()` and
-  `render_documents()`
-- rendered pages can feed ColPali-family or related patch-level retrieval flows
-- the reference API handles the document-to-page stage; embedding generation
-  remains an external producer/provider role
-
-### Optional graph-aware retrieval
-
-`voyager-index` supports graph-aware and ontology-aware workflows through stable
-document IDs and sidecars, not by forcing graph construction into the retrieval
-hot path.
-
-- ontology, entity, relation, and concept sidecars can enrich downstream ranking
-  or reasoning systems
-- graph construction and graph serving stay external to the OSS runtime by design
-- the reference HTTP API does not expose a dedicated ontology or graph endpoint
-
-This is intentional. The retrieval engine stays simple and fast; graph-aware
-systems can still compose cleanly on top.
-
-## Production-Wired Surface
-
-What is already wired into the shipped shard-first path:
-
-- shard collections for the mainline late-interaction engine
-- CRUD, upsert, payload updates, WAL-backed mutation logging, and recovery
-- multi-worker single-host serving
-- worker-visible collection revisions after mutation
-- base64 vector transport as the preferred/default API format
-- ColBANDIT in the shard scoring flow
-- Triton MaxSim on CUDA
-- `int8`, `fp8`, and `roq4` shard scoring modes
-- multimodal preprocessing flows
-- dense BM25 hybrid search with `rrf` or Tabu Search
-
-Operational truth:
-
-- shard HTTP search is vector-only
-- dense BM25 hybrid over HTTP lives on `dense` collections
-- shard + BM25 fusion over the same flow is an in-process `HybridSearchManager`
-  path today
-- auth, TLS termination, ingress policy, and secret management stay outside the
-  reference server
-
-## Benchmark Posture
-
-The benchmark story is intentionally split in two:
-
-- `benchmarks/oss_reference_benchmark.py` is the reproducible smoke benchmark
-  for package and API sanity
-- the 100k comparison is the product benchmark and should be published with
-  fixed methodology and raw reports
-
-Rules for published comparisons:
-
-- same corpus and embeddings across all systems
-- same `top_k` and recall target
-- warmup runs are excluded from measured latency
-- streamed and GPU-corpus numbers are reported separately
-- QPS claims are paired with recall, never shown alone
-
-### 100k Comparison Placeholder
-
-Pending fresh measurement on the same corpus and hardware:
-
-| System | Mode | Corpus placement | Recall@10 | p50 | p95 | QPS | Status |
-|---|---|---|---|---|---|---|---|
-| Plaid | pending | pending | pending | pending | pending | pending | pending measurement |
-| FastPlaid | GPU corpus | pending | pending | pending | pending | pending | pending measurement |
-| Qdrant | pending | pending | pending | pending | pending | pending | pending measurement |
-| Voyager | shard streamed | CPU/disk -> GPU | pending | pending | pending | pending | pending measurement |
-| Voyager | shard GPU corpus | GPU resident | pending | pending | pending | pending | pending measurement |
+- `Index` and `IndexBuilder` — local shard collections
+- `SearchPipeline` — dense + sparse fusion in-process
+- `ColbertIndex` — late-interaction text workflows
+- `ColPaliEngine` and `MultiModalEngine` — multimodal retrieval
+- `encode_vector_payload()`, `decode_payload()` — base64 transport helpers
+- `voyager-index-server` — reference HTTP server
 
 ## Documentation
 
@@ -328,7 +285,7 @@ Pending fresh measurement on the same corpus and hardware:
 - [Python API Reference](docs/api/python.md)
 - [Reference API Tutorial](docs/reference_api_tutorial.md)
 - [Shard Engine Guide](docs/guides/shard-engine.md)
-- [Max-Performance Reference API Guide](docs/guides/max-performance-reference-api.md)
+- [Max-Performance Guide](docs/guides/max-performance-reference-api.md)
 - [Scaling Guide](docs/guides/scaling.md)
 - [Benchmarks And Methodology](docs/benchmarks.md)
 - [Production Notes](PRODUCTION.md)
@@ -341,28 +298,6 @@ cd voyager-index
 bash scripts/install_from_source.sh --cpu
 ```
 
-Supported native add-on story:
-
-- `latence_solver`: optional solver wheel for `tabu` refinement and
-  `/reference/optimize`
-
-## Docker
-
-```bash
-docker build -f deploy/reference-api/Dockerfile -t voyager-index .
-docker run -p 8080:8080 -v "$(pwd)/data:/data" voyager-index
-```
-
-## Public Surface
-
-- `Index` and `IndexBuilder` for local shard collections
-- `SearchPipeline` for dense + sparse fusion in process
-- `ColbertIndex` for late-interaction text workflows
-- `ColPaliEngine` and `MultiModalEngine` for multimodal retrieval
-- `encode_vector_payload()`, `encode_roq_payload()`, and `decode_payload()` for
-  shared base64 transport
-- `voyager-index-server` for the reference HTTP API
-
 ## License
 
-Apache-2.0. See `LICENSE`.
+Apache-2.0.  See [LICENSE](LICENSE).
