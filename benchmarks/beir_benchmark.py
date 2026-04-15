@@ -675,6 +675,18 @@ def _merge_gpu_cpu(all_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(by_ds.values(), key=lambda x: x["dataset"])
 
 
+def _fmt_optional(value: Optional[float], *, digits: int = 1) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.{digits}f}"
+
+
+def _fmt_ratio(numerator: Optional[float], denominator: Optional[float]) -> str:
+    if numerator is None or denominator is None or denominator <= 0:
+        return "n/a"
+    return f"{(numerator / denominator):.1f}x"
+
+
 def format_results_table(all_results: List[Dict[str, Any]]) -> str:
     lines = []
     hdr = (
@@ -690,8 +702,8 @@ def format_results_table(all_results: List[Dict[str, Any]]) -> str:
             f"{row['dataset']:<12} {row['n_docs']:>8} "
             f"{row.get('MAP@100', 0):>8.4f} {row.get('NDCG@10', 0):>8.4f} {row.get('NDCG@100', 0):>9.4f} "
             f"{row.get('recall@10', 0):>7.4f} {row.get('recall@100', 0):>7.4f} "
-            f"{row.get('gpu_qps', 0):>9.1f} {row.get('gpu_p95', 0):>9.1f} "
-            f"{row.get('cpu_qps', 0):>9.1f} {row.get('cpu_p95', 0):>9.1f}"
+            f"{_fmt_optional(row.get('gpu_qps')):>9} {_fmt_optional(row.get('gpu_p95')):>9} "
+            f"{_fmt_optional(row.get('cpu_qps')):>9} {_fmt_optional(row.get('cpu_p95')):>9}"
         )
 
     return "\n".join(lines)
@@ -713,8 +725,8 @@ def format_markdown_table(all_results: List[Dict[str, Any]]) -> str:
             f"| {row['dataset']} | {row['n_docs']:,} "
             f"| {row.get('MAP@100', 0):.4f} | {row.get('NDCG@10', 0):.4f} | {row.get('NDCG@100', 0):.4f} "
             f"| {row.get('recall@10', 0):.4f} | {row.get('recall@100', 0):.4f} "
-            f"| {row.get('gpu_qps', 0):.1f} | {row.get('gpu_p95', 0):.1f} "
-            f"| {row.get('cpu_qps', 0):.1f} | {row.get('cpu_p95', 0):.1f} |"
+            f"| {_fmt_optional(row.get('gpu_qps'))} | {_fmt_optional(row.get('gpu_p95'))} "
+            f"| {_fmt_optional(row.get('cpu_qps'))} | {_fmt_optional(row.get('cpu_p95'))} |"
         )
 
     return "\n".join(lines)
@@ -727,15 +739,13 @@ def format_comparison_table(all_results: List[Dict[str, Any]]) -> str:
     lines.append("|---------|--------:|--------:|--------:|-------------:|-------------:|--------------:|")
 
     for row in _merge_gpu_cpu(all_results):
-        gpu_q = row.get("gpu_qps", 0)
-        cpu_q = row.get("cpu_qps", 0)
-        gpu_p = row.get("gpu_p95", 0)
-        cpu_p = row.get("cpu_p95", 0)
-        speedup = gpu_q / cpu_q if cpu_q > 0 else float("inf")
-        lat_ratio = cpu_p / gpu_p if gpu_p > 0 else float("inf")
+        gpu_q = row.get("gpu_qps")
+        cpu_q = row.get("cpu_qps")
+        gpu_p = row.get("gpu_p95")
+        cpu_p = row.get("cpu_p95")
         lines.append(
-            f"| {row['dataset']} | {gpu_q:.1f} | {cpu_q:.1f} | {speedup:.1f}x "
-            f"| {gpu_p:.1f} | {cpu_p:.1f} | {lat_ratio:.1f}x |"
+            f"| {row['dataset']} | {_fmt_optional(gpu_q)} | {_fmt_optional(cpu_q)} | {_fmt_ratio(gpu_q, cpu_q)} "
+            f"| {_fmt_optional(gpu_p)} | {_fmt_optional(cpu_p)} | {_fmt_ratio(cpu_p, gpu_p)} |"
         )
 
     return "\n".join(lines)
