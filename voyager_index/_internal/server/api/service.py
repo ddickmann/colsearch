@@ -62,6 +62,7 @@ from .models import (
 from .groundedness import (
     SupportUnitInput,
     encode_texts,
+    partition_support_units,
     provider_token_limit,
     score_groundedness,
     score_groundedness_chunked,
@@ -72,6 +73,26 @@ from .groundedness import (
 logger = logging.getLogger(__name__)
 _TASK_MAX_AGE_S = 3600
 _TASK_MAX_ENTRIES = 10_000
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 class ServiceError(Exception):
@@ -3002,6 +3023,47 @@ class SearchService:
         *,
         model_name: Optional[str] = None,
     ) -> Any:
+        vllm_endpoint = os.environ.get("VOYAGER_GROUNDEDNESS_VLLM_ENDPOINT")
+        if vllm_endpoint:
+            resolved_model_name = (
+                model_name
+                or os.environ.get("VOYAGER_GROUNDEDNESS_VLLM_MODEL")
+                or os.environ.get("VOYAGER_GROUNDEDNESS_MODEL")
+                or os.environ.get("VOYAGER_ENCODE_MODEL")
+            )
+            if not resolved_model_name:
+                raise ValidationError(
+                    "VOYAGER_GROUNDEDNESS_VLLM_ENDPOINT is set but no model id was provided. "
+                    "Set VOYAGER_GROUNDEDNESS_VLLM_MODEL, VOYAGER_GROUNDEDNESS_MODEL, "
+                    "VOYAGER_ENCODE_MODEL, or pass request.model."
+                )
+            cache_key = f"vllm_factory:{vllm_endpoint}:{resolved_model_name}"
+            cached = self._cached_groundedness_providers.get(cache_key)
+            if cached is not None:
+                return cached
+            try:
+                from voyager_index.multimodal import VllmFactoryModernColBERTProvider
+            except ImportError as exc:
+                raise ValidationError(
+                    "Groundedness vLLM integration requires the multimodal/http dependencies to be installed."
+                ) from exc
+            try:
+                provider = VllmFactoryModernColBERTProvider(
+                    endpoint=vllm_endpoint,
+                    model=resolved_model_name,
+                    timeout=_env_float("VOYAGER_GROUNDEDNESS_VLLM_TIMEOUT", 60.0),
+                    health_timeout=_env_float("VOYAGER_GROUNDEDNESS_VLLM_HEALTH_TIMEOUT", 10.0),
+                    batch_size=_env_int("VOYAGER_GROUNDEDNESS_VLLM_BATCH_SIZE", 16),
+                    max_concurrency=_env_int("VOYAGER_GROUNDEDNESS_VLLM_MAX_CONCURRENCY", 8),
+                )
+                provider.healthcheck()
+            except Exception as exc:
+                raise ValidationError(
+                    f"Failed to initialize groundedness vLLM provider '{resolved_model_name}' at '{vllm_endpoint}': {exc}"
+                ) from exc
+            self._cached_groundedness_providers[cache_key] = provider
+            return provider
+
         if model_name:
             cached = self._cached_groundedness_providers.get(model_name)
             if cached is not None:
@@ -3023,12 +3085,12 @@ class SearchService:
             self._cached_groundedness_providers[model_name] = provider
             return provider
 
-        if runtime.kind == CollectionKind.MULTIMODAL and hasattr(runtime.engine, "model"):
-            return runtime.engine.model
-
         env_model = os.environ.get("VOYAGER_GROUNDEDNESS_MODEL")
         if env_model:
             return self._get_groundedness_provider(runtime, model_name=env_model)
+
+        if runtime.kind == CollectionKind.MULTIMODAL and hasattr(runtime.engine, "model"):
+            return runtime.engine.model
 
         return self._get_encode_provider()
 
@@ -3064,7 +3126,12 @@ class SearchService:
                     if not text:
                         warnings.append(f"chunk_id '{chunk_id}' has no text/content payload; placeholder tokens will be used")
                     tensor = torch.as_tensor(vector, dtype=torch.float32)
-                    tokens = tokenize_text(provider, text or "", expected_len=int(tensor.shape[0]))
+                    tokens = tokenize_text(
+                        provider,
+                        text or "",
+                        expected_len=int(tensor.shape[0]),
+                        is_query=False,
+                    )
                     support_units.append(
                         SupportUnitInput(
                             support_id=str(chunk_id),
@@ -3077,7 +3144,7 @@ class SearchService:
                         )
                     )
             else:
-                encoder_token_limit = provider_token_limit(provider)
+                encoder_token_limit = provider_token_limit(provider, is_query=False)
                 if (
                     request.segmentation_mode.value == "sentence_packed"
                     and encoder_token_limit is not None
@@ -3106,7 +3173,12 @@ class SearchService:
                     prompt_name=request.document_prompt_name,
                 )
                 for idx, (segment, tensor) in enumerate(zip(segments, segment_embeddings)):
-                    tokens = tokenize_text(provider, segment["text"], expected_len=int(tensor.shape[0]))
+                    tokens = tokenize_text(
+                        provider,
+                        segment["text"],
+                        expected_len=int(tensor.shape[0]),
+                        is_query=False,
+                    )
                     support_units.append(
                         SupportUnitInput(
                             support_id=f"raw-{idx}",
@@ -3130,6 +3202,7 @@ class SearchService:
                 provider,
                 request.response_text,
                 expected_len=int(response_embeddings.shape[0]),
+                is_query=False,
             )
 
             include_triangular = bool(request.include_triangular_diagnostics and (request.query_text or "").strip())
@@ -3149,6 +3222,7 @@ class SearchService:
                     provider,
                     request.query_text,
                     expected_len=int(query_embeddings.shape[0]),
+                    is_query=True,
                 )
 
             if request.chunk_ids:
@@ -3163,8 +3237,12 @@ class SearchService:
                     debug_dense_matrices=request.debug_dense_matrices,
                 )
             else:
+                support_batches = partition_support_units(
+                    support_units,
+                    batch_size=_env_int("VOYAGER_GROUNDEDNESS_SCORE_BATCH_UNITS", 64),
+                )
                 scored = score_groundedness_chunked(
-                    support_batches=[[unit] for unit in support_units],
+                    support_batches=support_batches,
                     response_embeddings=response_embeddings,
                     response_tokens=response_tokens,
                     query_embeddings=query_embeddings,
@@ -3300,6 +3378,10 @@ class SearchService:
             runtimes = list(self.collections.values())
             self.collections = {}
             self._collection_locks = {}
+            groundedness_providers = list(self._cached_groundedness_providers.values())
+            self._cached_groundedness_providers = {}
+            encode_provider = self._cached_encode_provider
+            self._cached_encode_provider = None
         for runtime in runtimes:
             graph_sidecar = self._graph_sidecar_for_runtime(runtime)
             if graph_sidecar is not None and hasattr(graph_sidecar, "close"):
@@ -3313,6 +3395,20 @@ class SearchService:
                     close_method()
                 except Exception as exc:
                     logger.warning("Failed to close engine for collection '%s': %s", runtime.name, exc)
+        for provider in groundedness_providers:
+            close_method = getattr(provider, "close", None)
+            if callable(close_method):
+                try:
+                    close_method()
+                except Exception as exc:
+                    logger.warning("Failed to close groundedness provider: %s", exc)
+        if encode_provider is not None:
+            close_method = getattr(encode_provider, "close", None)
+            if callable(close_method):
+                try:
+                    close_method()
+                except Exception as exc:
+                    logger.warning("Failed to close encode provider: %s", exc)
 
     def _collection_readiness_issues(self, runtime: CollectionRuntime) -> List[Dict[str, str]]:
         issues: List[Dict[str, str]] = []

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,7 @@ from research.triangular_maxsim.groundedness_long_ambiguous_cases import LONG_AM
 from voyager_index._internal.server.api.groundedness import (  # noqa: E402
     SupportUnitInput,
     encode_texts,
+    partition_support_units,
     provider_token_limit,
     score_groundedness,
     score_groundedness_chunked,
@@ -43,8 +45,20 @@ GO_NO_GO = {
     "max_p95_latency_ms": 25.0,
 }
 CASE_BY_ID = {case.id: case for case in CASES}
-DEFAULT_RAW_CONTEXT_CHUNK_TOKENS = 1024
+DEFAULT_RAW_CONTEXT_CHUNK_TOKENS = 256
 PREVIOUS_LONG_AMBIGUOUS_REPORT = _HERE / "groundedness_service_validation__long_ambiguous_beta.json"
+
+
+def _score_batch_units() -> int:
+    return max(1, int(os.environ.get("VOYAGER_GROUNDEDNESS_SCORE_BATCH_UNITS", "64")))
+
+
+def _latency_repeats() -> int:
+    return max(1, int(os.environ.get("VOYAGER_GROUNDEDNESS_LATENCY_REPEATS", "3")))
+
+
+def _verification_batch_units() -> int:
+    return max(1, int(os.environ.get("VOYAGER_GROUNDEDNESS_VERIFY_BATCH_UNITS", "16")))
 
 
 def auroc(scores: Sequence[float], labels: Sequence[int]) -> float:
@@ -79,6 +93,21 @@ def _maybe_auroc(scores: Sequence[float], labels: Sequence[int]) -> Optional[flo
 
 
 def _load_provider(model_name: str, use_prompts: bool):
+    vllm_endpoint = os.environ.get("VOYAGER_GROUNDEDNESS_VLLM_ENDPOINT")
+    if vllm_endpoint:
+        from voyager_index.multimodal import VllmFactoryModernColBERTProvider
+
+        provider = VllmFactoryModernColBERTProvider(
+            endpoint=vllm_endpoint,
+            model=model_name,
+            timeout=float(os.environ.get("VOYAGER_GROUNDEDNESS_VLLM_TIMEOUT", "60.0")),
+            health_timeout=float(os.environ.get("VOYAGER_GROUNDEDNESS_VLLM_HEALTH_TIMEOUT", "10.0")),
+            batch_size=int(os.environ.get("VOYAGER_GROUNDEDNESS_VLLM_BATCH_SIZE", "16")),
+            max_concurrency=int(os.environ.get("VOYAGER_GROUNDEDNESS_VLLM_MAX_CONCURRENCY", "8")),
+        )
+        provider.healthcheck()
+        return provider, None, None
+
     from pylate import models
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -166,7 +195,7 @@ def _build_packed_support_units(
             source_mode="raw_context",
             text=segment["text"],
             embeddings=embedding,
-            tokens=tokenize_text(provider, segment["text"], expected_len=int(embedding.shape[0])),
+            tokens=tokenize_text(provider, segment["text"], expected_len=int(embedding.shape[0]), is_query=False),
             offset_start=int(segment["offset_start"]),
             offset_end=int(segment["offset_end"]),
         )
@@ -201,8 +230,9 @@ def _verify_chunked_merge(
     query_embeddings: Optional[torch.Tensor],
     query_tokens: Optional[Sequence[str]],
 ) -> Dict[str, Any]:
+    support_batches = partition_support_units(support_units, batch_size=_verification_batch_units())
     chunked = score_groundedness_chunked(
-        support_batches=[[unit] for unit in support_units],
+        support_batches=support_batches,
         response_embeddings=response_embeddings,
         response_tokens=response_tokens,
         query_embeddings=query_embeddings,
@@ -226,16 +256,30 @@ def _verify_chunked_merge(
         abs(chunked_row["reverse_context"] - reference_row["reverse_context"])
         for chunked_row, reference_row in zip(chunked["response_tokens"], reference["response_tokens"])
     ]
+    consensus_token_diffs = [
+        abs(chunked_row["consensus_hardened"] - reference_row["consensus_hardened"])
+        for chunked_row, reference_row in zip(chunked["response_tokens"], reference["response_tokens"])
+    ]
+    effective_unit_diffs = [
+        abs(chunked_row["effective_support_units"] - reference_row["effective_support_units"])
+        for chunked_row, reference_row in zip(chunked["response_tokens"], reference["response_tokens"])
+    ]
     evidence_matches = all(
         chunked_row["support_unit_index"] == reference_row["support_unit_index"]
         and chunked_row["support_token_index"] == reference_row["support_token_index"]
         for chunked_row, reference_row in zip(chunked["response_tokens"], reference["response_tokens"])
     )
     return {
+        "score_batch_units": _verification_batch_units(),
         "per_token_max_abs_diff": float(max(token_diffs) if token_diffs else 0.0),
         "scalar_abs_diff": float(
             abs(chunked["scores"]["reverse_context"] - reference["scores"]["reverse_context"])
         ),
+        "consensus_per_token_max_abs_diff": float(max(consensus_token_diffs) if consensus_token_diffs else 0.0),
+        "consensus_scalar_abs_diff": float(
+            abs(chunked["scores"]["consensus_hardened"] - reference["scores"]["consensus_hardened"])
+        ),
+        "effective_support_units_max_abs_diff": float(max(effective_unit_diffs) if effective_unit_diffs else 0.0),
         "evidence_mappings_match": evidence_matches,
         "top_evidence_matches": [
             (
@@ -325,12 +369,12 @@ def _score_packed_long_context_case(
         is_query=False,
         prompt_name=document_prompt_name,
     )[0]
-    query_tokens = tokenize_text(provider, case_spec.query, expected_len=int(query_embeddings.shape[0]))
-    response_tokens = tokenize_text(provider, case_spec.response, expected_len=int(response_embeddings.shape[0]))
+    query_tokens = tokenize_text(provider, case_spec.query, expected_len=int(query_embeddings.shape[0]), is_query=True)
+    response_tokens = tokenize_text(provider, case_spec.response, expected_len=int(response_embeddings.shape[0]), is_query=False)
 
-    start = time.perf_counter()
+    support_batches = partition_support_units(support_units, batch_size=_score_batch_units())
     result = score_groundedness_chunked(
-        support_batches=[[unit] for unit in support_units],
+        support_batches=support_batches,
         response_embeddings=response_embeddings,
         response_tokens=response_tokens,
         query_embeddings=query_embeddings,
@@ -339,7 +383,21 @@ def _score_packed_long_context_case(
         primary_metric="reverse_context",
         debug_dense_matrices=False,
     )
-    latency_ms = (time.perf_counter() - start) * 1000.0
+    latency_samples_ms: List[float] = []
+    for _ in range(_latency_repeats()):
+        start = time.perf_counter()
+        result = score_groundedness_chunked(
+            support_batches=support_batches,
+            response_embeddings=response_embeddings,
+            response_tokens=response_tokens,
+            query_embeddings=query_embeddings,
+            query_tokens=query_tokens,
+            evidence_limit=3,
+            primary_metric="reverse_context",
+            debug_dense_matrices=False,
+        )
+        latency_samples_ms.append((time.perf_counter() - start) * 1000.0)
+    latency_ms = float(np.median(latency_samples_ms))
     row = {
         "id": case_spec.id,
         "source": ", ".join(CASE_BY_ID[case_id].source for case_id in case_spec.core_case_ids),
@@ -351,6 +409,7 @@ def _score_packed_long_context_case(
         "top_evidence": result["top_evidence"],
         "warnings": result["warnings"],
         "latency_ms": latency_ms,
+        "latency_samples_ms": latency_samples_ms,
         "notes": case_spec.notes,
         "context_token_count": context_token_count,
         "support_unit_count": len(support_units),
@@ -387,17 +446,26 @@ def score_long_context_case(
 def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     anchors = [row for row in rows if row["label"] in {"grounded", "ungrounded"}]
     labels = [1 if row["label"] == "grounded" else 0 for row in anchors]
+    latency_samples = [
+        float(sample)
+        for row in rows
+        for sample in (row.get("latency_samples_ms") or [row["latency_ms"]])
+    ]
 
     metrics = {
         "anchor_count": len(anchors),
         "AUROC_reverse_context": _maybe_auroc([row["scores"]["reverse_context"] for row in anchors], labels),
+        "AUROC_consensus_hardened": _maybe_auroc(
+            [row["scores"]["consensus_hardened"] for row in anchors],
+            labels,
+        ),
         "AUROC_reverse_query_context": _maybe_auroc(
             [row["scores"]["reverse_query_context"] for row in anchors],
             labels,
         ),
         "AUROC_triangular": _maybe_auroc([row["scores"]["triangular"] for row in anchors], labels),
-        "latency_p50_ms": float(np.percentile([row["latency_ms"] for row in rows], 50)),
-        "latency_p95_ms": float(np.percentile([row["latency_ms"] for row in rows], 95)),
+        "latency_p50_ms": float(np.percentile(latency_samples, 50)),
+        "latency_p95_ms": float(np.percentile(latency_samples, 95)),
         "mean_context_tokens": float(np.mean([row["context_token_count"] for row in rows])),
         "max_context_tokens": int(max(row["context_token_count"] for row in rows)),
         "mean_support_units": float(np.mean([row["support_unit_count"] for row in rows])),
@@ -417,6 +485,7 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             {
                 "count": 0,
                 "mean_reverse_context": 0.0,
+                "mean_consensus_hardened": 0.0,
                 "mean_triangular": 0.0,
                 "mean_context_tokens": 0.0,
                 "examples": [],
@@ -424,6 +493,7 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
         bucket["count"] += 1
         bucket["mean_reverse_context"] += float(row["scores"]["reverse_context"])
+        bucket["mean_consensus_hardened"] += float(row["scores"]["consensus_hardened"])
         bucket["mean_triangular"] += float(row["scores"]["triangular"] or 0.0)
         bucket["mean_context_tokens"] += float(row["context_token_count"])
         if len(bucket["examples"]) < 2:
@@ -437,6 +507,7 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             )
     for bucket in by_subcategory.values():
         bucket["mean_reverse_context"] /= max(bucket["count"], 1)
+        bucket["mean_consensus_hardened"] /= max(bucket["count"], 1)
         bucket["mean_triangular"] /= max(bucket["count"], 1)
         bucket["mean_context_tokens"] /= max(bucket["count"], 1)
 
@@ -472,9 +543,11 @@ def render_markdown(
         f"- model: `{model_name}`",
         f"- prompts: `{use_prompts}`",
         f"- packed raw_context chunk tokens: `{raw_context_chunk_tokens}`",
+        f"- latency repeats per case: `{_latency_repeats()}`",
         f"- encoder token limit: `{encoder_token_limit}`",
         f"- anchor count: `{metrics['anchor_count']}`",
         f"- anchor AUROC (reverse_context): `{_fmt_metric(metrics['AUROC_reverse_context'])}`",
+        f"- anchor AUROC (consensus_hardened): `{_fmt_metric(metrics['AUROC_consensus_hardened'])}`",
         f"- anchor AUROC (reverse_query_context): `{_fmt_metric(metrics['AUROC_reverse_query_context'])}`",
         f"- anchor AUROC (triangular): `{_fmt_metric(metrics['AUROC_triangular'])}`",
         f"- latency p50/p95 ms: `{metrics['latency_p50_ms']:.2f}` / `{metrics['latency_p95_ms']:.2f}`",
@@ -484,12 +557,12 @@ def render_markdown(
         "",
         "## Difficulty Summary",
         "",
-        "| bucket | count | mean reverse_context | mean triangular | mean context tokens |",
-        "|---|---:|---:|---:|---:|",
+        "| bucket | count | mean reverse_context | mean consensus_hardened | mean triangular | mean context tokens |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
     for name, bucket in sorted(summary["by_subcategory"].items()):
         lines.append(
-            f"| {name} | {bucket['count']} | {bucket['mean_reverse_context']:.4f} | {bucket['mean_triangular']:.4f} | {bucket['mean_context_tokens']:.0f} |"
+            f"| {name} | {bucket['count']} | {bucket['mean_reverse_context']:.4f} | {bucket['mean_consensus_hardened']:.4f} | {bucket['mean_triangular']:.4f} | {bucket['mean_context_tokens']:.0f} |"
         )
     lines.extend(
         [
@@ -516,10 +589,14 @@ def render_markdown(
             [
                 f"- selected case: `{previous_row['id']}` ({previous_row['label']})",
                 f"- rationale: highest previous non-grounded reverse_context score (`{previous_row['scores']['reverse_context']:.4f}`) in the earlier long-context report",
-                f"- before: reverse_context `{previous_row['scores']['reverse_context']:.4f}`, support_units `{previous_row['support_unit_count']}`",
-                f"- after packed-{raw_context_chunk_tokens}: reverse_context `{rerun_row['scores']['reverse_context']:.4f}`, support_units `{rerun_row['support_unit_count']}`",
+                f"- before: reverse_context `{previous_row['scores']['reverse_context']:.4f}`, consensus_hardened `{previous_row['scores'].get('consensus_hardened', 0.0):.4f}`, support_units `{previous_row['support_unit_count']}`",
+                f"- after packed-{raw_context_chunk_tokens}: reverse_context `{rerun_row['scores']['reverse_context']:.4f}`, consensus_hardened `{rerun_row['scores']['consensus_hardened']:.4f}`, support_units `{rerun_row['support_unit_count']}`",
                 f"- verification per-token max abs diff: `{verification['per_token_max_abs_diff']:.8f}`",
                 f"- verification scalar abs diff: `{verification['scalar_abs_diff']:.8f}`",
+                f"- verification consensus per-token max abs diff: `{verification['consensus_per_token_max_abs_diff']:.8f}`",
+                f"- verification consensus scalar abs diff: `{verification['consensus_scalar_abs_diff']:.8f}`",
+                f"- verification effective-support-units max abs diff: `{verification['effective_support_units_max_abs_diff']:.8f}`",
+                f"- grouped score batch units: `{verification['score_batch_units']}`",
                 f"- evidence mapping exact match: `{verification['evidence_mappings_match']}`",
                 f"- top-evidence exact match: `{verification['top_evidence_matches']}`",
                 "",
@@ -547,19 +624,20 @@ def render_markdown(
         [
             "## Per-Case Scores",
             "",
-            "| id | label | subcategory | context_tokens | support_units | reverse_context | reverse_query_context | triangular | latency_ms |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|",
+            "| id | label | subcategory | context_tokens | support_units | reverse_context | consensus_hardened | reverse_query_context | triangular | latency_ms |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in rows:
         lines.append(
-            "| {id} | {label} | {subcategory} | {context_tokens} | {support_units} | {rc:.4f} | {qc:.4f} | {tri:.4f} | {latency:.2f} |".format(
+            "| {id} | {label} | {subcategory} | {context_tokens} | {support_units} | {rc:.4f} | {consensus:.4f} | {qc:.4f} | {tri:.4f} | {latency:.2f} |".format(
                 id=row["id"],
                 label=row["label"],
                 subcategory=row["subcategory"] or "-",
                 context_tokens=row["context_token_count"],
                 support_units=row["support_unit_count"],
                 rc=row["scores"]["reverse_context"],
+                consensus=row["scores"]["consensus_hardened"],
                 qc=row["scores"]["reverse_query_context"],
                 tri=row["scores"]["triangular"],
                 latency=row["latency_ms"],
@@ -586,7 +664,7 @@ def run(
         rows = [score_embedded_case(case) for case in embedded]
     elif profile == "long_ambiguous":
         provider, query_prompt_name, document_prompt_name = _load_provider(model_name, use_prompts)
-        encoder_token_limit = provider_token_limit(provider)
+        encoder_token_limit = provider_token_limit(provider, is_query=False)
         if LONG_AMBIGUOUS_CASES:
             score_long_context_case(
                 LONG_AMBIGUOUS_CASES[0],
@@ -637,6 +715,8 @@ def run(
         "model": model_name,
         "use_prompts": use_prompts,
         "raw_context_chunk_tokens": raw_context_chunk_tokens,
+        "score_batch_units": _score_batch_units(),
+        "latency_repeats": _latency_repeats(),
         "encoder_token_limit": encoder_token_limit,
         "summary": summary,
         "rows": rows,

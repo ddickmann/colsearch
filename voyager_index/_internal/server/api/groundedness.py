@@ -54,6 +54,11 @@ _STOPWORDS = {
     "with",
 }
 _MAX_DEBUG_MATRIX_ELEMENTS = 32_768
+_DEFAULT_CHUNK_TOKEN_BUDGET = 256
+_CONSENSUS_THRESHOLD = 0.85
+_CONSENSUS_ALPHA = 20.0
+_CONSENSUS_PENALTY_SCALE = 0.03
+_CONSENSUS_UNIT_SCALE = 4.0
 
 
 @dataclass
@@ -143,13 +148,24 @@ def align_tokens(tokens: Sequence[str], expected_len: int) -> List[str]:
     return base
 
 
-def tokenize_text(provider: Any, text: str, *, expected_len: Optional[int] = None) -> List[str]:
+def tokenize_text(
+    provider: Any,
+    text: str,
+    *,
+    expected_len: Optional[int] = None,
+    is_query: bool = False,
+) -> List[str]:
     tokens: List[str] = []
 
     tokenize_method = getattr(provider, "tokenize", None)
     if callable(tokenize_method):
         try:
-            tokens = _tokens_from_provider_tokenize(tokenize_method(text))
+            tokens = _tokens_from_provider_tokenize(tokenize_method(text, is_query=is_query))
+        except TypeError:
+            try:
+                tokens = _tokens_from_provider_tokenize(tokenize_method(text))
+            except Exception:
+                tokens = []
         except Exception:
             tokens = []
 
@@ -194,17 +210,25 @@ def count_text_tokens(provider: Any, text: str) -> int:
     tokenize_method = getattr(provider, "tokenize", None)
     if callable(tokenize_method):
         try:
-            tokens = _tokens_from_provider_tokenize(tokenize_method(text))
+            tokens = _tokens_from_provider_tokenize(tokenize_method(text, is_query=False))
             if tokens:
                 return len(tokens)
+        except TypeError:
+            try:
+                tokens = _tokens_from_provider_tokenize(tokenize_method(text))
+                if tokens:
+                    return len(tokens)
+            except Exception:
+                pass
         except Exception:
             pass
 
     return len(_fallback_tokens(text))
 
 
-def provider_token_limit(provider: Any) -> Optional[int]:
-    for attr in ("doc_maxlen", "max_length", "model_max_length"):
+def provider_token_limit(provider: Any, *, is_query: bool = False) -> Optional[int]:
+    role_attrs = ("query_maxlen", "query_length") if is_query else ("doc_maxlen", "document_length")
+    for attr in (*role_attrs, "max_length", "model_max_length"):
         value = getattr(provider, attr, None)
         if isinstance(value, int) and 0 < value < 1_000_000:
             return value
@@ -216,6 +240,15 @@ def provider_token_limit(provider: Any) -> Optional[int]:
     if isinstance(value, int) and 0 < value < 1_000_000:
         return value
     return None
+
+
+def partition_support_units(
+    support_units: Sequence[SupportUnitInput],
+    *,
+    batch_size: int,
+) -> List[List[SupportUnitInput]]:
+    size = max(1, int(batch_size))
+    return [list(support_units[idx : idx + size]) for idx in range(0, len(support_units), size)]
 
 
 def _to_tensor_list(output: Any, *, expected_items: int) -> List[torch.Tensor]:
@@ -408,7 +441,7 @@ def segment_text(
     mode: str,
     *,
     provider: Any | None = None,
-    chunk_token_budget: int = 1024,
+    chunk_token_budget: int = _DEFAULT_CHUNK_TOKEN_BUDGET,
 ) -> List[Dict[str, Any]]:
     if not text.strip():
         return []
@@ -423,6 +456,73 @@ def segment_text(
             chunk_token_budget=chunk_token_budget,
         )
     return _sentence_spans(text)
+
+
+def _support_unit_maxima(
+    similarity: torch.Tensor,
+    support_tokens_nested: Sequence[Sequence[str]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    unit_values: List[torch.Tensor] = []
+    unit_indices: List[torch.Tensor] = []
+    offset = 0
+    for tokens in support_tokens_nested:
+        token_count = len(tokens)
+        if token_count <= 0:
+            unit_values.append(torch.full((similarity.shape[0],), float("-inf"), dtype=similarity.dtype, device=similarity.device))
+            unit_indices.append(torch.full((similarity.shape[0],), -1, dtype=torch.long, device=similarity.device))
+            continue
+        unit_slice = similarity[:, offset : offset + token_count]
+        values, indices = unit_slice.max(dim=1)
+        unit_values.append(values)
+        unit_indices.append(indices.to(torch.long))
+        offset += token_count
+
+    if not unit_values:
+        empty = torch.empty((similarity.shape[0], 0), dtype=similarity.dtype, device=similarity.device)
+        empty_idx = torch.empty((similarity.shape[0], 0), dtype=torch.long, device=similarity.device)
+        return empty, empty_idx
+    return torch.stack(unit_values, dim=1), torch.stack(unit_indices, dim=1)
+
+
+def _consensus_statistics(
+    unit_maxima: torch.Tensor,
+    reverse_context_values: torch.Tensor,
+    weights: torch.Tensor,
+) -> Dict[str, torch.Tensor | float]:
+    if unit_maxima.numel() == 0:
+        zeros = torch.zeros_like(reverse_context_values)
+        return {
+            "hits": zeros.to(torch.long),
+            "soft_breadth": zeros,
+            "effective_support_units": zeros,
+            "consensus_values": reverse_context_values,
+            "consensus_score": float(weighted_groundedness(reverse_context_values, weights)),
+        }
+
+    positive_mass = torch.clamp(unit_maxima - _CONSENSUS_THRESHOLD, min=0.0)
+    hits = (unit_maxima >= _CONSENSUS_THRESHOLD).sum(dim=1).to(torch.long)
+    soft_breadth = torch.sigmoid((unit_maxima - _CONSENSUS_THRESHOLD) * _CONSENSUS_ALPHA).sum(dim=1)
+    mass_sum = positive_mass.sum(dim=1)
+    mass_sq_sum = (positive_mass**2).sum(dim=1)
+    effective_support_units = torch.where(
+        mass_sq_sum > 0,
+        (mass_sum**2) / torch.clamp(mass_sq_sum, min=1e-9),
+        torch.zeros_like(mass_sum),
+    )
+    breadth_factor = 1.0 - torch.exp(
+        -torch.clamp(effective_support_units - 1.0, min=0.0) / _CONSENSUS_UNIT_SCALE
+    )
+    consensus_values = torch.clamp(
+        reverse_context_values * (1.0 - (_CONSENSUS_PENALTY_SCALE * (1.0 - breadth_factor))),
+        min=0.0,
+    )
+    return {
+        "hits": hits,
+        "soft_breadth": soft_breadth,
+        "effective_support_units": effective_support_units,
+        "consensus_values": consensus_values,
+        "consensus_score": float(weighted_groundedness(consensus_values, weights)),
+    }
 
 
 def score_groundedness(
@@ -457,6 +557,16 @@ def score_groundedness(
 
     weights = token_weights(response_tokens_aligned).to(rc_values.device, dtype=rc_values.dtype)
     reverse_context_score = weighted_groundedness(rc_values, weights)
+    reverse_context_unit_values, _reverse_context_unit_token_indices = _support_unit_maxima(
+        sim_rc,
+        support_tokens_nested,
+    )
+    consensus = _consensus_statistics(reverse_context_unit_values, rc_values, weights)
+    consensus_values = consensus["consensus_values"]
+    consensus_hardened_score = float(consensus["consensus_score"])
+    support_unit_hits = consensus["hits"]
+    support_unit_soft_breadth = consensus["soft_breadth"]
+    effective_support_units = consensus["effective_support_units"]
 
     reverse_query_context_score: Optional[float] = None
     reverse_query_context_values: Optional[torch.Tensor] = None
@@ -583,6 +693,10 @@ def score_groundedness(
                 "token": token,
                 "weight": float(weights[idx].item()),
                 "reverse_context": float(rc_values[idx].item()),
+                "consensus_hardened": float(consensus_values[idx].item()),
+                "support_unit_hits_above_threshold": int(support_unit_hits[idx].item()),
+                "support_unit_soft_breadth": float(support_unit_soft_breadth[idx].item()),
+                "effective_support_units": float(effective_support_units[idx].item()),
                 "reverse_query_context": (
                     float(reverse_query_context_values[idx].item())
                     if reverse_query_context_values is not None
@@ -637,6 +751,7 @@ def score_groundedness(
         "primary_name": metric_name,
         "primary_score": float(triangular_score if metric_name == "triangular" else reverse_context_score),
         "reverse_context": float(reverse_context_score),
+        "consensus_hardened": consensus_hardened_score,
         "reverse_query_context": (
             float(reverse_query_context_score) if reverse_query_context_score is not None else None
         ),
@@ -653,6 +768,9 @@ def score_groundedness(
         "query_tokens": query_token_rows,
         "debug": debug_payload,
         "warnings": warnings,
+        "_internals": {
+            "reverse_context_unit_values": reverse_context_unit_values,
+        },
     }
 
 
@@ -677,6 +795,17 @@ def score_groundedness_chunked(
     batches = [list(batch) for batch in support_batches if batch]
     if not batches:
         raise ValueError("At least one non-empty support batch is required")
+    if len(batches) == 1:
+        return score_groundedness(
+            support_units=batches[0],
+            response_embeddings=response_embeddings,
+            response_tokens=response_tokens,
+            query_embeddings=query_embeddings,
+            query_tokens=query_tokens,
+            evidence_limit=evidence_limit,
+            primary_metric=primary_metric,
+            debug_dense_matrices=debug_dense_matrices,
+        )
 
     flat_support_units = [unit for batch in batches for unit in batch]
     response_tokens_aligned = align_tokens(response_tokens, int(response_embeddings.shape[0]))
@@ -710,6 +839,7 @@ def score_groundedness_chunked(
     response_to_support_parts: List[np.ndarray] = []
     triangular_gated_parts: List[np.ndarray] = []
     response_to_query_matrix: Optional[List[List[float]]] = None
+    reverse_context_unit_value_parts: List[torch.Tensor] = []
 
     support_offset = 0
     for batch in batches:
@@ -727,6 +857,9 @@ def score_groundedness_chunked(
         )
         batch_results.append(batch_result)
         warnings.extend(batch_result.get("warnings", []))
+        batch_internals = batch_result.get("_internals") or {}
+        if batch_internals.get("reverse_context_unit_values") is not None:
+            reverse_context_unit_value_parts.append(batch_internals["reverse_context_unit_values"])
         if debug_dense_matrices:
             debug_payload = batch_result.get("debug") or {}
             if debug_payload.get("response_to_support") is not None:
@@ -812,6 +945,17 @@ def score_groundedness_chunked(
 
     reverse_context_values = torch.tensor(merged_reverse_context, dtype=torch.float32)
     reverse_context_score = weighted_groundedness(reverse_context_values, weights)
+    reverse_context_unit_values = (
+        torch.cat(reverse_context_unit_value_parts, dim=1)
+        if reverse_context_unit_value_parts
+        else torch.empty((token_count, 0), dtype=torch.float32)
+    )
+    consensus = _consensus_statistics(reverse_context_unit_values, reverse_context_values, weights)
+    consensus_values = consensus["consensus_values"]
+    consensus_hardened_score = float(consensus["consensus_score"])
+    support_unit_hits = consensus["hits"]
+    support_unit_soft_breadth = consensus["soft_breadth"]
+    effective_support_units = consensus["effective_support_units"]
 
     reverse_query_context_score: Optional[float] = None
     reverse_query_context_values: Optional[torch.Tensor] = None
@@ -888,6 +1032,10 @@ def score_groundedness_chunked(
                 "token": token,
                 "weight": float(weights[token_idx].item()),
                 "reverse_context": float(reverse_context_values[token_idx].item()),
+                "consensus_hardened": float(consensus_values[token_idx].item()),
+                "support_unit_hits_above_threshold": int(support_unit_hits[token_idx].item()),
+                "support_unit_soft_breadth": float(support_unit_soft_breadth[token_idx].item()),
+                "effective_support_units": float(effective_support_units[token_idx].item()),
                 "reverse_query_context": (
                     float(reverse_query_context_values[token_idx].item())
                     if reverse_query_context_values is not None
@@ -938,6 +1086,7 @@ def score_groundedness_chunked(
         "primary_name": metric_name,
         "primary_score": float(triangular_score if metric_name == "triangular" else reverse_context_score),
         "reverse_context": float(reverse_context_score),
+        "consensus_hardened": consensus_hardened_score,
         "reverse_query_context": (
             float(reverse_query_context_score) if reverse_query_context_score is not None else None
         ),
@@ -954,5 +1103,8 @@ def score_groundedness_chunked(
         "query_tokens": query_token_rows,
         "debug": debug_payload,
         "warnings": list(dict.fromkeys(warnings)),
+        "_internals": {
+            "reverse_context_unit_values": reverse_context_unit_values,
+        },
     }
 

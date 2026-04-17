@@ -41,7 +41,7 @@ with the results, skips, and boundary checks.
 | Late-interaction retrieval | reference HTTP API | runnable |
 | Multimodal retrieval | reference HTTP API | runnable |
 | Shard collection routing + ColBANDIT + quantized scoring | reference HTTP API | runnable |
-| Groundedness / hallucination detection (Beta) | reference HTTP API | runnable, with boundaries |
+| Groundedness Tracker (Beta) | reference HTTP API | runnable, with boundaries |
 | Multimodal `strategy="optimized"` screening | reference HTTP API | runnable, with backend selection limits explained |
 | Health, readiness, metrics, persistence | reference HTTP API | runnable |
 | Multimodal precision profiles (`INT8`, `FP8`, `RoQ`) | OSS guidance + library / validation surface | documented with boundaries |
@@ -644,7 +644,7 @@ Where to explore them:
 - benchmark posture: `docs/benchmarks.md`
 - validation evidence: `internal/validation/README.md`
 
-## Step 9A. Groundedness / Hallucination Detection (Beta)
+## Step 9A. Groundedness Tracker (Beta)
 
 The reference HTTP API now exposes a **Beta** post-generation groundedness
 endpoint:
@@ -658,7 +658,8 @@ What it is for:
 - score a final answer against the exact `chunk_ids` passed to the LLM
 - fall back to `raw_context` when chunk IDs are unavailable, using packed
   sentence-aware support windows by default
-- return heatmap-ready token scores and top evidence links
+- return heatmap-ready token scores, top evidence links, and a secondary
+  support-breadth signal
 
 What it is not:
 
@@ -671,9 +672,28 @@ Preferred production path:
 - use `chunk_ids[]` when your generation layer tracks the final support set
 - treat `raw_context` as a compatibility fallback
 - on `raw_context`, the default fallback is `segmentation_mode="sentence_packed"`
-  with `raw_context_chunk_tokens=1024`
+  with `raw_context_chunk_tokens=256`
+- there is no explicit overlap field; overflow sentences move to the next packed
+  support unit
 - keep the packed budget at or below the active encoder's usable document length
 - use the naive reverse-context score as the product headline
+- read `consensus_hardened` as a conservative secondary robustness score, not a
+  replacement headline
+
+Remote production setup:
+
+```bash
+VOYAGER_GROUNDEDNESS_VLLM_ENDPOINT=http://127.0.0.1:8000 \
+VOYAGER_GROUNDEDNESS_VLLM_MODEL=VAGOsolutions/SauerkrautLM-Multi-Reason-ModernColBERT \
+voyager-index-server
+```
+
+Useful tuning knobs:
+
+- `VOYAGER_GROUNDEDNESS_SCORE_BATCH_UNITS` (default `64`)
+- `VOYAGER_GROUNDEDNESS_VLLM_BATCH_SIZE`
+- `VOYAGER_GROUNDEDNESS_VLLM_MAX_CONCURRENCY`
+- `VOYAGER_GROUNDEDNESS_VLLM_TIMEOUT`
 
 Minimal example:
 
@@ -694,6 +714,9 @@ Truth-in-advertising note:
 - `multimodal` and `shard` are supported only when vectors can be scored in
   faithful float precision after materialization or dequantization
 - `roq4` without an FP16 sidecar is outside the user-facing trust boundary
+- in the current long-context audit (`lightonai/GTE-ModernColBERT-v1`,
+  `256`-token windows), anchor separation stayed strong but score-only latency
+  was still about `90.9 ms` p50 / `97.2 ms` p95
 
 ## Step 10. Persistence, Restart Safety, And Readiness
 

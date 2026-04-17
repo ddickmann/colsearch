@@ -1161,7 +1161,7 @@ class GroundednessRequest(BaseModel):
                 "response_text": "Teardrops was released in the United States on 20 July 1981.",
                 "evidence_limit": 5,
                 "primary_metric": "reverse_context",
-                "raw_context_chunk_tokens": 1024,
+                "raw_context_chunk_tokens": 256,
             }
         }
     )
@@ -1191,7 +1191,7 @@ class GroundednessRequest(BaseModel):
         ),
     )
     raw_context_chunk_tokens: int = Field(
-        default=1024,
+        default=256,
         ge=1,
         le=8192,
         description=(
@@ -1248,6 +1248,7 @@ class GroundednessScores(BaseModel):
     primary_name: str
     primary_score: float
     reverse_context: float
+    consensus_hardened: Optional[float] = None
     reverse_query_context: Optional[float] = None
     triangular: Optional[float] = None
     echo_mean: Optional[float] = None
@@ -1269,6 +1270,10 @@ class GroundednessResponseToken(BaseModel):
     token: str
     weight: float
     reverse_context: float
+    consensus_hardened: Optional[float] = None
+    support_unit_hits_above_threshold: Optional[int] = None
+    support_unit_soft_breadth: Optional[float] = None
+    effective_support_units: Optional[float] = None
     reverse_query_context: Optional[float] = None
     triangular: Optional[float] = None
     echo: Optional[float] = None
@@ -1342,6 +1347,7 @@ class GroundednessResponse(BaseModel):
                     "primary_name": "reverse_context",
                     "primary_score": 0.97,
                     "reverse_context": 0.97,
+                    "consensus_hardened": 0.96,
                     "reverse_query_context": 0.98,
                     "triangular": 0.82,
                 },
@@ -1351,6 +1357,10 @@ class GroundednessResponse(BaseModel):
                         "token": "Teardrops",
                         "weight": 1.0,
                         "reverse_context": 0.99,
+                        "consensus_hardened": 0.98,
+                        "support_unit_hits_above_threshold": 2,
+                        "support_unit_soft_breadth": 1.7,
+                        "effective_support_units": 1.8,
                         "heatmap_score": 0.99,
                         "support_unit_index": 0,
                         "support_token_index": 3,

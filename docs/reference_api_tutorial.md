@@ -362,19 +362,28 @@ Important truth-in-advertising note:
 - shard collections can still use the optional graph lane after first-stage retrieval
 - on shard HTTP search, use `query_payload` rather than `query_text` to steer graph policy
 
-## 7. Groundedness (Beta)
+## 7. Groundedness Tracker (Beta)
 
 Use groundedness after generation, not as a replacement for retrieval:
 
 - fast path: score a final answer against the exact `chunk_ids` passed to the LLM
 - fallback path: score against `raw_context` when chunk IDs are unavailable,
   using sentence-aware packed windows by default
-- output: scalar groundedness, response-token heatmaps, and top evidence links
+- output: headline `reverse_context`, secondary `consensus_hardened`,
+  response-token heatmaps, and top evidence links
 
 For text collections, start the server with a groundedness-capable encoder:
 
 ```bash
 VOYAGER_GROUNDEDNESS_MODEL=lightonai/GTE-ModernColBERT-v1 voyager-index-server
+```
+
+Or point groundedness at a remote `vllm-factory` ModernColBERT deployment:
+
+```bash
+VOYAGER_GROUNDEDNESS_VLLM_ENDPOINT=http://127.0.0.1:8000 \
+VOYAGER_GROUNDEDNESS_VLLM_MODEL=VAGOsolutions/SauerkrautLM-Multi-Reason-ModernColBERT \
+voyager-index-server
 ```
 
 Chunk-ID mode:
@@ -398,18 +407,18 @@ curl -X POST http://127.0.0.1:8080/collections/tutorial-li/groundedness \
   -d '{
     "raw_context": "Invoice total due. Payment due on receipt.",
     "query_text": "invoice total due",
-    "response_text": "The invoice total is due.",
-    "segmentation_mode": "sentence_packed",
-    "raw_context_chunk_tokens": 1024
+    "response_text": "The invoice total is due."
   }'
 ```
 
 The `raw_context` path now defaults to `segmentation_mode="sentence_packed"`
-with a `raw_context_chunk_tokens` budget of `1024`, so you only need to pass
-those fields when you want a non-default budget or another segmentation mode.
-Keep the packed budget at or below the active encoder's real document-length
-limit; the API returns a warning when the requested packed window is larger than
-the encoder can reliably process.
+with a `raw_context_chunk_tokens` budget of `256`, so you only need to pass
+those fields when you want a different budget or another segmentation mode.
+There is no explicit overlap field: if the next sentence would cross the budget,
+it is carried into the next support unit intact. Keep the packed budget at or
+below the active encoder's real document-length limit; the API returns a
+warning when the requested packed window is larger than the encoder can
+reliably process.
 
 Look for these response fields:
 
@@ -419,14 +428,22 @@ Look for these response fields:
 - `top_evidence`
 - `eligibility`
 
+`scores.reverse_context` remains the product headline. `scores.consensus_hardened`
+is a conservative secondary score that should be read alongside per-token
+`support_unit_hits_above_threshold`, `support_unit_soft_breadth`, and
+`effective_support_units`.
+
 Truth-in-advertising note:
 
-- this is a **Beta** groundedness / hallucination detection signal
+- this is a **Beta** groundedness tracker signal
 - it is useful for evidence views and QA
 - it is **not** a final truth oracle, especially on negation, entity swaps,
   dates, or exact numeric claims
 - very long raw-context packing is only as good as the encoder's effective
   document length
+- on the current long-context audit (`lightonai/GTE-ModernColBERT-v1`,
+  `256`-token windows), quality separation stayed strong but score-only latency
+  was still about `90.9 ms` p50 / `97.2 ms` p95
 
 ## 8. Persistence And Inspection
 

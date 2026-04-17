@@ -379,7 +379,7 @@ Production note:
 | `DELETE /collections/{name}/points` | Delete documents |
 | `POST /collections/{name}/checkpoint` | Checkpoint WAL |
 | `GET /collections/{name}/wal/status` | WAL status |
-| `POST /collections/{name}/groundedness` | Post-generation groundedness / hallucination detection (Beta) |
+| `POST /collections/{name}/groundedness` | Post-generation Groundedness Tracker (Beta) |
 | `POST /encode` | Encode text/images to vectors |
 | `POST /rerank` | Rerank results |
 | `POST /reference/optimize` | Context packing (Tabu Search) |
@@ -408,7 +408,7 @@ Graph-aware search uses the same search endpoint and adds:
 - [Installation](docs/getting-started/installation.md)
 - [Python API Reference](docs/api/python.md)
 - [Reference API Tutorial](docs/reference_api_tutorial.md)
-- [Groundedness Beta Guide](docs/guides/groundedness-beta.md)
+- [Groundedness Tracker Beta Guide](docs/guides/groundedness-beta.md)
 - [Shard Engine Guide](docs/guides/shard-engine.md)
 - [Latence Graph Sidecar Guide](docs/guides/latence-graph-sidecar.md)
 - [Enterprise Control Plane Boundary](docs/guides/control-plane.md)
@@ -436,19 +436,19 @@ bash scripts/install_from_source.sh --cpu
 - Security: see [SECURITY.md](SECURITY.md)
 - Release process: see [RELEASING.md](RELEASING.md)
 
-## Hallucination Detection (Beta)
+## Groundedness Tracker (Beta)
 
-`voyager-index` now ships a **Beta** groundedness / hallucination detection
-endpoint for post-generation answers:
+`voyager-index` now ships a **Beta** groundedness tracker for
+post-generation answers:
 
 - fast path: score a final answer against the exact `chunk_ids` that were passed
   to the LLM, without re-encoding support context
 - fallback path: score against `raw_context` when chunk IDs are unavailable,
   using sentence-aware packed support windows by default
-- output: scalar groundedness, response-token heatmaps, top evidence links, and
-  optional dense debug matrices
+- output: headline `reverse_context`, secondary `consensus_hardened`,
+  response-token heatmaps, top evidence links, and optional dense debug matrices
 
-This is designed as a **support signal and evidence trace**, not a final
+This is already a **useful support signal and evidence trace**, not a final
 factuality oracle. It is useful for product debugging, QA, and user-facing
 evidence views, but dense similarity can still be overconfident on negation,
 entity swaps, dates, numbers, and other semantically close factual errors.
@@ -457,16 +457,43 @@ than short anchored answers, so keep product wording conservative on ambiguous
 long-context responses.
 
 The default `raw_context` fallback packs adjacent sentences into roughly
-`1024`-token windows via `segmentation_mode="sentence_packed"` with
-`raw_context_chunk_tokens` as the user override. Keep that budget at or below
-your encoder's real document-length limit; shorter-window models will warn when
-the requested packed budget is too large and may truncate support windows.
+`256`-token windows via `segmentation_mode="sentence_packed"` with no explicit
+overlap. When a sentence would cross the target budget, it is carried into the
+next support unit. `raw_context_chunk_tokens` remains the user override. Keep
+that budget at or below your encoder's real document-length limit; shorter-
+window models will warn when the requested packed budget is too large and may
+truncate support windows.
 
-The production headline score uses **naive reverse-context MaxSim**. Optional
+For a remote production encoder, point groundedness at `vllm-factory`
+ModernColBERT:
+
+```bash
+VOYAGER_GROUNDEDNESS_VLLM_ENDPOINT=http://127.0.0.1:8000 \
+VOYAGER_GROUNDEDNESS_VLLM_MODEL=VAGOsolutions/SauerkrautLM-Multi-Reason-ModernColBERT \
+voyager-index-server
+```
+
+The raw-context production path groups scored support units in batches. Tune it
+with `VOYAGER_GROUNDEDNESS_SCORE_BATCH_UNITS` (default `64`) plus the remote
+HTTP knobs `VOYAGER_GROUNDEDNESS_VLLM_BATCH_SIZE`,
+`VOYAGER_GROUNDEDNESS_VLLM_MAX_CONCURRENCY`, and
+`VOYAGER_GROUNDEDNESS_VLLM_TIMEOUT`.
+
+The production headline score uses **naive reverse-context MaxSim**.
+`consensus_hardened` is a conservative secondary score that lightly discounts
+narrow single-unit support and pairs with per-token breadth diagnostics such as
+`support_unit_hits_above_threshold` and `effective_support_units`. It is a
+calibrated robustness signal, not an IID significance test. Optional
 query-conditioned channels remain diagnostic-only and are not the recommended
 product path.
 
-Start with the [Groundedness Beta Guide](docs/guides/groundedness-beta.md), the
+Current audit boundary: on the hardest long-context suite (about `7.8k` tokens,
+`lightonai/GTE-ModernColBERT-v1`, `256`-token packed windows), anchor AUROC
+stayed at `1.0`, but score-only latency still measured about `90.9 ms` p50 /
+`97.2 ms` p95. Treat this Beta as strong evidence tracing and QA support, not a
+hard real-time truth gate on long noisy contexts.
+
+Start with the [Groundedness Tracker Beta Guide](docs/guides/groundedness-beta.md), the
 [Reference API Tutorial](docs/reference_api_tutorial.md), or the interactive
 OpenAPI docs at `http://127.0.0.1:8080/docs`.
 

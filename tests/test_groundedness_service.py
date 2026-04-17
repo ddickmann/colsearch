@@ -13,6 +13,7 @@ from voyager_index._internal.server.api.groundedness import (
     SupportUnitInput,
     count_text_tokens,
     encode_texts,
+    partition_support_units,
     score_groundedness,
     score_groundedness_chunked,
     segment_text,
@@ -21,6 +22,7 @@ from voyager_index._internal.server.api.groundedness import (
 from voyager_index._internal.server.api.models import CreateCollectionRequest, GroundednessRequest, PointVector
 from voyager_index._internal.server.api.service import SearchService, ValidationError
 from voyager_index._internal.server.main import create_app
+from voyager_index.multimodal import VllmFactoryModernColBERTProvider
 
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
@@ -93,12 +95,20 @@ def _assert_heatmap_shape(payload: dict) -> None:
         payload
     )
     assert payload["scores"]["primary_name"] in {"reverse_context", "triangular"}
+    assert "consensus_hardened" in payload["scores"]
     assert payload["response_tokens"]
     assert payload["support_units"]
     for token in payload["response_tokens"]:
         assert {"index", "token", "weight", "reverse_context", "heatmap_score"} <= set(token)
+        assert "consensus_hardened" in token
     for unit in payload["support_units"]:
         assert unit["token_count"] == len(unit["tokens"]) == len(unit["token_scores"])
+
+
+def test_groundedness_request_defaults_to_256_chunk_budget() -> None:
+    request = GroundednessRequest(raw_context="alpha supports claim", response_text="alpha supports claim")
+    assert request.segmentation_mode.value == "sentence_packed"
+    assert request.raw_context_chunk_tokens == 256
 
 
 def test_groundedness_chunk_id_mode_late_interaction_is_heatmap_ready(tmp_path: Path) -> None:
@@ -209,6 +219,24 @@ def test_groundedness_raw_context_chunk_budget_is_user_configurable(tmp_path: Pa
     assert [unit["offset_start"] for unit in payload["support_units"]] == [0, 22, 42]
 
 
+def test_groundedness_sentence_packing_carries_whole_sentence_forward() -> None:
+    provider = DummyGroundednessProvider()
+    text = "alpha supports claim. beta supports note. gamma supports proof."
+
+    segments = segment_text(
+        text,
+        "sentence_packed",
+        provider=provider,
+        chunk_token_budget=7,
+    )
+
+    assert [segment["text"] for segment in segments] == [
+        "alpha supports claim.",
+        "beta supports note.",
+        "gamma supports proof.",
+    ]
+
+
 def test_groundedness_packed_window_merge_matches_direct_reference() -> None:
     provider = DummyGroundednessProvider()
     raw_context = "alpha supports claim. beta unrelated note. gamma supports proof."
@@ -240,7 +268,7 @@ def test_groundedness_packed_window_merge_matches_direct_reference() -> None:
     response_tokens = tokenize_text(provider, response_text, expected_len=int(response_embeddings.shape[0]))
 
     merged = score_groundedness_chunked(
-        support_batches=[[unit] for unit in support_units],
+        support_batches=partition_support_units(support_units, batch_size=2),
         response_embeddings=response_embeddings,
         response_tokens=response_tokens,
         evidence_limit=4,
@@ -256,9 +284,13 @@ def test_groundedness_packed_window_merge_matches_direct_reference() -> None:
 
     assert merged["scores"]["reverse_context"] == pytest.approx(reference["scores"]["reverse_context"], abs=1e-6)
     assert merged["scores"]["primary_score"] == pytest.approx(reference["scores"]["primary_score"], abs=1e-6)
+    assert merged["scores"]["consensus_hardened"] == pytest.approx(reference["scores"]["consensus_hardened"], abs=1e-6)
     assert len(merged["response_tokens"]) == len(reference["response_tokens"])
     for merged_row, reference_row in zip(merged["response_tokens"], reference["response_tokens"]):
         assert merged_row["reverse_context"] == pytest.approx(reference_row["reverse_context"], abs=1e-6)
+        assert merged_row["consensus_hardened"] == pytest.approx(reference_row["consensus_hardened"], abs=1e-6)
+        assert merged_row["support_unit_hits_above_threshold"] == reference_row["support_unit_hits_above_threshold"]
+        assert merged_row["effective_support_units"] == pytest.approx(reference_row["effective_support_units"], abs=1e-6)
         assert merged_row["support_unit_index"] == reference_row["support_unit_index"]
         assert merged_row["support_token_index"] == reference_row["support_token_index"]
         assert merged_row["support_token"] == reference_row["support_token"]
@@ -306,6 +338,81 @@ def test_groundedness_token_helpers_ignore_mapping_tokenize_outputs() -> None:
 
     assert count_text_tokens(provider, text) == len(_TOKEN_RE.findall(text))
     assert tokenize_text(provider, text) == [f"tok_{idx}" for idx in range(len(_TOKEN_RE.findall(text)))]
+
+
+def test_vllm_factory_moderncolbert_provider_uses_plugin_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests_seen: list[dict] = []
+
+    class DummyTokenizer:
+        model_max_length = 8192
+
+        def __call__(
+            self,
+            text: str,
+            add_special_tokens: bool = True,
+            truncation: bool = True,
+            max_length: int | None = None,
+            padding: bool = False,
+            return_tensors=None,
+        ):
+            token_count = len(_TOKEN_RE.findall(text))
+            return {"input_ids": [101, *range(200, 200 + token_count), 102]}
+
+        def convert_ids_to_tokens(self, input_ids):
+            return [f"tok_{token_id}" for token_id in input_ids]
+
+    class DummyConfig:
+        colbert_dim = 4
+        query_length = 256
+        document_length = 8192
+
+    class DummyResponse:
+        text = "ok"
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class DummyClient:
+        def get(self, path: str, timeout=None):
+            assert path == "/health"
+            return DummyResponse({"status": "ok"})
+
+        def post(self, path: str, json=None):
+            assert path == "/pooling"
+            requests_seen.append(json)
+            return DummyResponse({"data": [float(idx) for idx in range(8)]})
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: DummyTokenizer())
+    monkeypatch.setattr("transformers.AutoConfig.from_pretrained", lambda *args, **kwargs: DummyConfig())
+
+    provider = VllmFactoryModernColBERTProvider(
+        endpoint="http://localhost:8000",
+        model="dummy-moderncolbert",
+        batch_size=2,
+        max_concurrency=2,
+    )
+    monkeypatch.setattr(provider, "_get_http_client", lambda: DummyClient())
+
+    assert provider.healthcheck() == {"status": "ok"}
+    embeddings = provider.encode(["alpha supports claim", "beta supports note"], is_query=False)
+
+    assert len(embeddings) == 2
+    assert all(embedding.shape == (2, 4) for embedding in embeddings)
+    assert all(request["task"] == "plugin" for request in requests_seen)
+    assert all(request["data"]["is_query"] is False for request in requests_seen)
+    assert {request["data"]["text"] for request in requests_seen} == {
+        "alpha supports claim",
+        "beta supports note",
+    }
 
 
 def test_groundedness_warns_when_packed_budget_exceeds_encoder_limit(tmp_path: Path) -> None:
