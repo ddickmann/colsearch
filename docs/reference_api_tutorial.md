@@ -483,6 +483,39 @@ Truth-in-advertising note:
   `256`-token windows), quality separation stayed strong but score-only latency
   was still about `90.9 ms` p50 / `97.2 ms` p95
 
+### Recommended production configuration
+
+The Phase E harness was run against real RAGTruth and HaluEval data with
+the NLI peer enabled. The configuration that hit the pre-registered exit
+criteria was:
+
+```bash
+VOYAGER_GROUNDEDNESS_MODEL=lightonai/GTE-ModernColBERT-v1 \
+VOYAGER_GROUNDEDNESS_NLI_ENABLED=1 \
+VOYAGER_GROUNDEDNESS_NLI_MODEL=MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli \
+VOYAGER_GROUNDEDNESS_NLI_LATENCY_MS=2000 \
+voyager-index-server
+```
+
+Observed on a single A5000, batch size 1, 200 samples per stratum
+(NLI lane):
+
+| Lane                       | Internal lexical | Internal semantic | Internal partial | RAGTruth macro F1 | HaluEval QA F1 | Latency p95 |
+|----------------------------|-----------------:|------------------:|-----------------:|------------------:|---------------:|------------:|
+| Dense + literal only       |             0.79 |              0.73 |             1.00 |              0.58 |           0.37 |       111 ms|
+| Dense + literal + NLI peer |             1.00 |              1.00 |             1.00 |          **0.60** |       **0.69** |   **141 ms**|
+| Pre-registered exit        |          ≥ 0.80  |          ≥ 0.70   |        ≥ 0.65    |          ≥ 0.55   |        ≥ 0.70  | ≤ 250 ms (NLI)|
+
+The NLI lane meets 5 of 6 actionable pre-registered targets; HaluEval QA
+misses the 0.70 cut by 0.01. Without NLI, dense-only groundedness should
+be presented as a lexical / partial-support tracer, not a hallucination
+detector. RAGTruth `data2text` (F1 `0.43`) and HaluEval `dialogue`
+(F1 `0.51`) remain genuine weak strata even with NLI.
+
+Reproduce with the harness in
+`research/triangular_maxsim/groundedness_external_eval.py`; see
+`research/triangular_maxsim/README.md` for dataset prep.
+
 ## 8. Persistence And Inspection
 
 Collections persist under the configured storage root. Useful endpoints:

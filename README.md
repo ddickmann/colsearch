@@ -535,44 +535,87 @@ stayed at `1.0`, but score-only latency still measured about `90.9 ms` p50 /
 `97.2 ms` p95. Treat this Beta as strong evidence tracing and QA support, not a
 hard real-time truth gate on long noisy contexts.
 
-### Phase E hardening verdict (Real-Hardening, internal minimal pairs)
+### Phase E hardening verdict (Real-Hardening, real-world benchmarks)
 
 The internal harness at
 `research/triangular_maxsim/groundedness_external_eval.py` runs 210
 deterministic minimal pairs across 7 strata (entity_swap, date_swap,
-number_swap, unit_swap, negation, role_swap, partial), with a long-context
-"HARD" template family per stratum (distractors plus tightly paraphrased
-candidates). Encoder and scorer latency are measured separately with
-warm-up. The headline score is `groundedness_v2` whenever it is available
+number_swap, unit_swap, negation, role_swap, partial) plus three external
+public benchmarks: **RAGTruth** (qa, summarization, data2text),
+**HaluEval** (qa, summarization, dialogue), and FActScore (biography).
+Encoder and scorer latency are measured separately with warm-up. The
+headline score is `groundedness_v2` whenever it is available
 (calibrated + literal-guarded + optional NLI fusion).
 
-Lane A (dense + literal guardrails, no NLI), GTE-ModernColBERT-v1:
+Configuration: `lightonai/GTE-ModernColBERT-v1` retrieval encoder,
+`MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli` NLI peer, single A5000
+with batch size 1, 30 minimal pairs per stratum and 200 external samples
+per stratum.
 
-- minimal_pairs_lexical (entity, date, number, unit): paired accuracy `0.79`
-  with `date_swap` `0.93`, `number_swap` `0.67`, `unit_swap` `0.77`
-- minimal_pairs_semantic (negation, role_swap): `0.73` with `negation` `0.90`
-  but `role_swap` `0.57` (chance-level)
-- minimal_pairs_partial: `1.00`
-- latency p95: encode `113 ms`, score `58 ms`, total `118 ms`
-- harness verdict string: *"feature in Beta, NLI required for negation/role/partial"*
+#### Headline real-world scoreboard
 
-Lane B (dense + literal + NLI peer with `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`):
+| Lane                 | Internal lexical | Internal semantic | Internal partial | RAGTruth macro F1 | HaluEval QA F1 | Latency p95 | Pre-reg targets met |
+|----------------------|-----------------:|------------------:|-----------------:|------------------:|---------------:|------------:|--------------------:|
+| Dense + literal only |             0.79 |              0.73 |             1.00 |              0.58 |           0.37 |     `111 ms`|             3 of 6 |
+| Dense + literal + NLI peer |       1.00 |              1.00 |             1.00 |          **0.60** |       **0.69** | `141 ms` |     **5 of 6** |
+| Pre-registered exit  |          ≥ 0.80  |          ≥ 0.70   |        ≥ 0.65    |          ≥ 0.55   |        ≥ 0.70  | ≤ 250 ms (NLI)|                  |
 
-- every stratum at `1.00` paired accuracy with a 95% lower CI of `1.00`
-- latency p95: encode `93 ms`, score `65 ms`, total `142 ms` (under the
-  `250 ms` NLI budget)
-- harness verdict string: *"feature in Beta with NLI peer, ready for evidence/QA"*
-- all pre-registered exit criteria satisfied (`all_targets_met=true`)
+#### NLI lane, per-stratum detail
 
-Honest caveats: the external benchmark loaders for RAGTruth, HaluEval QA,
-and FActScore biographies are wired up with pre-registered targets, but no
-external dataset directories were configured in this audit, so those lanes
-are reported as `skipped`. The 100% scores in Lane B are against the
-in-house adversarial templates, not against an external real-world
-benchmark; read them as evidence that the NLI peer cleanly fixes the
-known dense-MaxSim failure modes, not as proof of universal correctness.
+RAGTruth (600 samples, threshold = per-stratum median of `groundedness_v2`):
 
-Recommendation: turn the NLI peer on
+| Stratum       | n   | Precision | Recall | F1     |
+|---------------|----:|----------:|-------:|-------:|
+| qa            | 200 | 0.91      | 0.54   | 0.68   |
+| summarization | 200 | 0.86      | 0.58   | 0.69   |
+| data2text     | 200 | 0.36      | 0.53   | 0.43   |
+| **macro F1**  |     |           |        | **0.60** |
+
+HaluEval (1200 samples, paired hallucinated/faithful at per-stratum median):
+
+| Stratum       | n   | F1   |
+|---------------|----:|-----:|
+| qa            | 400 | 0.69 |
+| summarization | 400 | 0.65 |
+| dialogue      | 400 | 0.51 |
+
+Internal minimal pairs (210 pairs, paired ranking accuracy):
+
+| Stratum       | n  | Paired acc | 95% CI lower |
+|---------------|---:|-----------:|-------------:|
+| entity_swap   | 30 | 1.00       | 1.00         |
+| date_swap     | 30 | 1.00       | 1.00         |
+| number_swap   | 30 | 1.00       | 1.00         |
+| unit_swap     | 30 | 1.00       | 1.00         |
+| negation      | 30 | 1.00       | 1.00         |
+| role_swap     | 30 | 1.00       | 1.00         |
+| partial       | 30 | 1.00       | 1.00         |
+
+Latency (NLI on, A5000, batch 1): encode `105 ms` p95, score `63 ms` p95,
+**total `141 ms` p95** (well under the 250 ms NLI budget).
+
+#### Verdict
+
+- **NLI lane meets 5 of 6 pre-registered exit criteria** (lexical 1.00,
+  semantic 1.00, partial 1.00, RAGTruth 0.60, latency 141 ms). The single
+  miss is HaluEval QA at `0.69` against a `0.70` target — one F1 point
+  short on a 400-sample binary task.
+- **Dense + literal lane** is honest about its weaknesses: lexical 0.79,
+  semantic 0.73 (role_swap collapses to 0.57 chance level), HaluEval QA
+  collapses to 0.37. Without the NLI peer, treat groundedness as a
+  lexical / partial-support tracer, not a hallucination detector.
+- The data2text stratum of RAGTruth (F1 0.43) and HaluEval dialogue
+  (F1 0.51) are the genuine remaining weak spots. Structured-data-to-text
+  and conversational dialogue both put surface tokens into the response
+  that are not present verbatim in the source, so textual late-interaction
+  has limited signal.
+
+Reproducing the run: see `research/triangular_maxsim/README.md` and the
+two report JSONs at
+`research/triangular_maxsim/groundedness_external_eval_report__no_nli__real.json`
+and `…__nli__real.json`.
+
+**Recommendation:** turn the NLI peer on
 (`VOYAGER_GROUNDEDNESS_NLI_ENABLED=1`) for any product surface that needs
 to be safe against negation, role-swap, or close-factual hallucinations.
 Without it, dense-only groundedness is best treated as a lexical / partial

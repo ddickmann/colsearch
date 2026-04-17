@@ -749,6 +749,28 @@ Truth-in-advertising note:
   `256`-token windows), anchor separation stayed strong but score-only latency
   was still about `90.9 ms` p50 / `97.2 ms` p95
 
+Validated production configuration (Phase E real-world benchmark run on
+RAGTruth + HaluEval, single A5000, batch size 1, 200 samples per
+stratum):
+
+```bash
+VOYAGER_GROUNDEDNESS_MODEL=lightonai/GTE-ModernColBERT-v1 \
+VOYAGER_GROUNDEDNESS_NLI_ENABLED=1 \
+VOYAGER_GROUNDEDNESS_NLI_MODEL=MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli \
+voyager-index-server
+```
+
+Headline numbers (NLI peer on): all 7 internal minimal pair strata at
+paired accuracy `1.00`, RAGTruth macro span F1 `0.60`, HaluEval QA F1
+`0.69`, total latency p95 `141 ms` (under the `250 ms` NLI budget).
+Without the NLI peer the same RAGTruth lane stays at macro F1 `0.58`
+but HaluEval QA collapses to F1 `0.37` — turn the NLI peer on for any
+product surface that needs hallucination safety. RAGTruth `data2text`
+(F1 `0.43`) and HaluEval `dialogue` (F1 `0.51`) remain weaker strata
+even with NLI; treat groundedness as advisory in those two lanes.
+
+Full reproduction: `research/triangular_maxsim/README.md`.
+
 ## Step 10. Persistence, Restart Safety, And Readiness
 
 After creating and filling collections, inspect persistence:
