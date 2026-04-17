@@ -160,5 +160,5 @@ When testing a new profile, capture at least:
 - QPS at the target worker count
 - CPU RAM and GPU VRAM use
 
-The shard engine is the supported scaling path. Historical GEM/HNSW material has
-been moved to `research/legacy/`.
+The shard engine is the supported scaling path. Historical GEM/HNSW research
+material is no longer published with this repository.

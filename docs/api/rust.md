@@ -44,8 +44,6 @@ solver-backed dense hybrid flow.
 
 ## Legacy native crates
 
-Historical GEM, GEM-router, and HNSW-native material is still archived in-repo
-for research and archaeology, but it is not part of the supported public Rust
-crate surface.
-
-See `research/legacy/README.md` if you need that older material.
+Historical GEM, GEM-router, and HNSW-native material is no longer published
+with this repository. The supported public Rust crate surface is the shard
+engine listed above.

@@ -1,6 +1,0 @@
-pub mod appendable_dense_vector_storage;
-pub mod memmap_dense_vector_storage;
-pub mod mmap_dense_vectors;
-#[cfg(feature = "rocksdb")]
-pub mod simple_dense_vector_storage;
-pub mod volatile_dense_vector_storage;

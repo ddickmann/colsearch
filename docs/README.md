@@ -49,7 +49,6 @@ Install:
 - `CONTRIBUTING.md`: setup, validation, and contribution workflow
 - `SECURITY.md`: supported surface and disclosure instructions
 - `tools/README.md`: contributor-only scripts moved out of the repo landing zone
-- `research/legacy/README.md`: archived GEM/HNSW research, tests, and benchmarks
 
 ## Legal And Vendor
 

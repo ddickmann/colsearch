@@ -39,8 +39,11 @@ src/kernels/hnsw_indexer/target/
 src/kernels/gem_router/target/
 src/kernels/gem_index/target/
 src/kernels/shard_engine/target/
-research/gem_index/target/
 *.whl
+
+# Historical research, vendored qdrant, prototype diffs, GEM benchmarks.
+# Kept on disk locally for reference; not part of the published OSS surface.
+research/
 
 # IDE
 .vscode/

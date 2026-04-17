@@ -9,5 +9,5 @@ Public entrypoints:
 - `centroid_approx_bench.py`: centroid-approximation experiment harness
 - `shard_bench/`: shard benchmark helpers and reports
 
-Historical GEM/HNSW benchmark suites and result bundles now live under
-`research/legacy/benchmarks/`.
+Historical GEM/HNSW benchmark suites and result bundles are no longer
+published with this repository.

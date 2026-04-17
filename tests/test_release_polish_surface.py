@@ -72,7 +72,6 @@ def test_curated_top_level_layout_hides_root_clutter() -> None:
         "PRODUCTION.md",
         "SECURITY.md",
         "internal/README.md",
-        "research/legacy/README.md",
     }
     for entry in expected_release_paths:
         assert (REPO_ROOT / entry).exists(), entry
