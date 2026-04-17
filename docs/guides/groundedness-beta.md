@@ -292,3 +292,43 @@ misses the current `25 ms` production gate on this model.
 
 If you need stronger protection on high-risk tokens, combine the groundedness
 score with simple lexical checks for entities, dates, numbers, and units.
+
+### Real-Hardening Phase E: minimal-pair verdict
+
+The repo ships a deterministic minimal-pair harness at
+`research/triangular_maxsim/groundedness_external_eval.py`. It generates
+210 pairs across 7 strata (entity_swap, date_swap, number_swap, unit_swap,
+negation, role_swap, partial), with a long-context "HARD" template family
+per stratum that uses distractors and tightly paraphrased candidates. The
+harness measures encode and score latency separately, runs warm-up passes,
+and uses `groundedness_v2` as the headline whenever it is available.
+
+Two production lanes are pre-registered:
+
+- **Dense + literal guardrails (no NLI)**, GTE-ModernColBERT-v1
+  - lexical strata (entity, date, number, unit): paired accuracy `0.79`
+  - semantic strata (negation, role_swap): paired accuracy `0.73`
+    (negation `0.90`, role_swap `0.57`)
+  - partial: `1.00`
+  - latency p95 = encode `113` + score `58` = `118 ms`
+  - harness verdict: *"feature in Beta, NLI required for negation/role/partial"*
+- **Dense + literal + NLI peer** with `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`
+  - all 7 strata at `1.00` paired accuracy with 95% lower CI of `1.00`
+  - latency p95 = encode `93` + score `65` = `142 ms`
+    (under the `250 ms` NLI budget)
+  - harness verdict: *"feature in Beta with NLI peer, ready for evidence/QA"*
+  - all pre-registered exit criteria satisfied (`all_targets_met=true`)
+
+Honest caveats: the external benchmark loaders for RAGTruth, HaluEval QA,
+and FActScore biographies are wired up with pre-registered targets, but
+those datasets were not configured in this audit so those lanes report
+`skipped`. The 100% scores in the NLI lane are against the in-house
+adversarial templates, not against an external real-world benchmark; read
+them as evidence that the NLI peer cleanly fixes the patterns dense MaxSim
+is known to miss, not as proof of universal correctness.
+
+Practical recommendation: enable the NLI peer
+(`VOYAGER_GROUNDEDNESS_NLI_ENABLED=1`) for any product surface that has
+to be safe against negation, role-swap, or close-factual hallucinations.
+Without it, treat dense-only groundedness as a lexical / partial-support
+tracer.

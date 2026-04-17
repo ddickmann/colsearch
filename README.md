@@ -535,6 +535,49 @@ stayed at `1.0`, but score-only latency still measured about `90.9 ms` p50 /
 `97.2 ms` p95. Treat this Beta as strong evidence tracing and QA support, not a
 hard real-time truth gate on long noisy contexts.
 
+### Phase E hardening verdict (Real-Hardening, internal minimal pairs)
+
+The internal harness at
+`research/triangular_maxsim/groundedness_external_eval.py` runs 210
+deterministic minimal pairs across 7 strata (entity_swap, date_swap,
+number_swap, unit_swap, negation, role_swap, partial), with a long-context
+"HARD" template family per stratum (distractors plus tightly paraphrased
+candidates). Encoder and scorer latency are measured separately with
+warm-up. The headline score is `groundedness_v2` whenever it is available
+(calibrated + literal-guarded + optional NLI fusion).
+
+Lane A (dense + literal guardrails, no NLI), GTE-ModernColBERT-v1:
+
+- minimal_pairs_lexical (entity, date, number, unit): paired accuracy `0.79`
+  with `date_swap` `0.93`, `number_swap` `0.67`, `unit_swap` `0.77`
+- minimal_pairs_semantic (negation, role_swap): `0.73` with `negation` `0.90`
+  but `role_swap` `0.57` (chance-level)
+- minimal_pairs_partial: `1.00`
+- latency p95: encode `113 ms`, score `58 ms`, total `118 ms`
+- harness verdict string: *"feature in Beta, NLI required for negation/role/partial"*
+
+Lane B (dense + literal + NLI peer with `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`):
+
+- every stratum at `1.00` paired accuracy with a 95% lower CI of `1.00`
+- latency p95: encode `93 ms`, score `65 ms`, total `142 ms` (under the
+  `250 ms` NLI budget)
+- harness verdict string: *"feature in Beta with NLI peer, ready for evidence/QA"*
+- all pre-registered exit criteria satisfied (`all_targets_met=true`)
+
+Honest caveats: the external benchmark loaders for RAGTruth, HaluEval QA,
+and FActScore biographies are wired up with pre-registered targets, but no
+external dataset directories were configured in this audit, so those lanes
+are reported as `skipped`. The 100% scores in Lane B are against the
+in-house adversarial templates, not against an external real-world
+benchmark; read them as evidence that the NLI peer cleanly fixes the
+known dense-MaxSim failure modes, not as proof of universal correctness.
+
+Recommendation: turn the NLI peer on
+(`VOYAGER_GROUNDEDNESS_NLI_ENABLED=1`) for any product surface that needs
+to be safe against negation, role-swap, or close-factual hallucinations.
+Without it, dense-only groundedness is best treated as a lexical / partial
+support tracer.
+
 Start with the [Groundedness Tracker Beta Guide](docs/guides/groundedness-beta.md), the
 [Reference API Tutorial](docs/reference_api_tutorial.md), or the interactive
 OpenAPI docs at `http://127.0.0.1:8080/docs`.

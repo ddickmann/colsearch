@@ -203,6 +203,165 @@ _PARTIAL_TEMPLATES = [
 ]
 
 
+# ----------------------------------------------------------------------
+# Hard family: long contexts with distractor sentences, tightly paraphrased
+# positives and negatives that share most surface tokens. These targets are
+# specifically designed to be hard for dense MaxSim and require either
+# literal guardrails or NLI/claim verification to separate the positive from
+# the negative. Each note is suffixed with ``[HARD]`` for the harness test.
+# ----------------------------------------------------------------------
+
+
+_HARD_ENTITY_TEMPLATES = [
+    (
+        "Background notes from the {project} historical archive list several alumni from the program. "
+        "Among them, {name} graduated from {university} in {year} and joined {company} the following spring. "
+        "Other alumni went on to {fake_university}, but {name} did not. "
+        "The archive also records earlier cohorts from the same decade.",
+        "{name} graduated from {university} in {year} and joined {company}.",
+        "{name} graduated from {fake_university} in {year} and joined {company}.",
+        "Distractor sentence mentions the fake university; only {name}'s line states the true institution. [HARD]",
+    ),
+    (
+        "The {company} corporate history documents three branch openings. "
+        "The {city} office was opened by {name} in autumn of {year}. "
+        "A neighbouring branch was opened the prior year by {fake_name} in a different city. "
+        "Several smaller offices opened later in the decade.",
+        "{name} opened the {city} branch of {company} in {year}.",
+        "{fake_name} opened the {city} branch of {company} in {year}.",
+        "{fake_name} appears in the context but with a different city. [HARD]",
+    ),
+]
+
+_HARD_DATE_TEMPLATES = [
+    (
+        "Diplomatic records list every treaty between {country_a} and {country_b} during the {year}s. "
+        "The principal accord was signed on {month} {day}, {year}. "
+        "An earlier draft was initialled on {month} {alt_day}, {year} but was never ratified. "
+        "Subsequent amendments followed in later years.",
+        "The treaty between {country_a} and {country_b} was signed on {month} {day}, {year}.",
+        "The treaty between {country_a} and {country_b} was signed on {month} {alt_day}, {year}.",
+        "{alt_day} appears as a distractor (initialled draft date) inside the context. [HARD]",
+    ),
+    (
+        "Construction notes for {bridge} include several milestone dates. "
+        "Ground was broken on {month} {day}, {year} and the deck was poured four years later. "
+        "Planning had begun in {alt_year} but funding was delayed. "
+        "The opening ceremony was held a year after the deck pour.",
+        "Construction on {bridge} began on {month} {day}, {year}.",
+        "Construction on {bridge} began on {month} {day}, {alt_year}.",
+        "{alt_year} appears as a distractor (planning year) inside the context. [HARD]",
+    ),
+]
+
+_HARD_NUMBER_TEMPLATES = [
+    (
+        "Annual reports for the {project} reactor list output figures for the first decade. "
+        "Year one delivered {value} megawatts, year two delivered {alt_value} megawatts after a turbine upgrade, "
+        "and later years stabilised in between. Maintenance windows reduced output every fifth year.",
+        "The {project} reactor produced {value} megawatts in its first year.",
+        "The {project} reactor produced {alt_value} megawatts in its first year.",
+        "Both values appear in the context but only {value} is attributed to year one. [HARD]",
+    ),
+    (
+        "The {company} fleet log shows year-end vessel counts. "
+        "By the end of the {year} season the count stood at {value} vessels, after a winter refit programme. "
+        "By the following season the count had risen to {alt_value} vessels.",
+        "The {company} fleet had {value} vessels by the end of the {year} season.",
+        "The {company} fleet had {alt_value} vessels by the end of the {year} season.",
+        "Both values appear, attached to different seasons. [HARD]",
+    ),
+]
+
+_HARD_UNIT_TEMPLATES = [
+    (
+        "Engineering specifications for the {city} water main describe both metric and imperial measurements in different sections. "
+        "The metric section gives the rated flow as {value} liters per second. "
+        "The imperial conversion table separately notes the equivalent in gallons per second.",
+        "The {city} water main delivers {value} liters per second.",
+        "The {city} water main delivers {value} gallons per second.",
+        "Both units appear in the context; only liters/second is the rated metric flow. [HARD]",
+    ),
+    (
+        "Climate observations from the {valley} plateau in two different scales were tabulated for the August summary. "
+        "The Celsius column peaked at {value} degrees. The Fahrenheit conversion column listed the same data in degrees Fahrenheit. "
+        "Either scale can be quoted depending on the audience.",
+        "Average temperature on the {valley} plateau peaked at {value} degrees Celsius.",
+        "Average temperature on the {valley} plateau peaked at {value} degrees Fahrenheit.",
+        "Both Celsius and Fahrenheit appear; only Celsius matches the {value} number. [HARD]",
+    ),
+]
+
+_HARD_NEGATION_TEMPLATES = [
+    (
+        "The {study} clinical trial included three arms with different dosing protocols. "
+        "In the primary endpoint analysis, {drug} reduced hospitalisations in elderly patients by a clinically meaningful margin. "
+        "In a secondary subgroup of younger patients, the same drug showed no statistically significant effect. "
+        "Adverse events were comparable across arms.",
+        "{drug} reduced hospitalisations in elderly patients in the {study} trial.",
+        "{drug} did not reduce hospitalisations in elderly patients in the {study} trial.",
+        "Negative claim contradicts the primary endpoint while echoing the surface form. [HARD]",
+    ),
+    (
+        "The {report} review evaluated {policy} across coastal and riverine deployments. "
+        "On coastal flood mitigation, the policy is effective and the panel recommends scaling it up. "
+        "On riverine flood mitigation, the panel found the policy is not effective in isolation. "
+        "Cost-benefit analyses are reported separately.",
+        "{policy} is effective for coastal flood mitigation in the {report} review.",
+        "{policy} is not effective for coastal flood mitigation in the {report} review.",
+        "Negation flips a polarity that the context places in a different deployment. [HARD]",
+    ),
+]
+
+_HARD_ROLE_TEMPLATES = [
+    (
+        "The {project} program biography records two principal figures. "
+        "After two seasons of close mentorship, {a} guided {b} through the program. "
+        "{b} subsequently took over the {city} office while {a} returned to research. "
+        "Records list both names in many places, often in passive voice.",
+        "{b} was mentored by {a} during the {project} program.",
+        "{a} was mentored by {b} during the {project} program.",
+        "Passive voice keeps tokens identical; only argument order distinguishes positive vs negative. [HARD]",
+    ),
+    (
+        "The patent dispute file lists the parties to the {device} sensor case. "
+        "{a} filed suit against {b} over alleged infringement. "
+        "{b} counterclaimed in a separate filing later that year, which was dismissed.",
+        "{a} sued {b} over the patent for the {device} sensor.",
+        "{b} sued {a} over the patent for the {device} sensor.",
+        "Both names appear in adjacent sentences; only the suit direction matters. [HARD]",
+    ),
+]
+
+_HARD_PARTIAL_TEMPLATES = [
+    (
+        "The {publisher} catalogue shows {book} appearing in {year_a} as a hardback first edition. "
+        "The follow-up volume, {sequel}, came out in {year_b}, with the box-set reissue arriving five years later. "
+        "A separately licensed paperback of {book} was distributed in {year_b} as well.",
+        "The {publisher} catalogue shows {book} in {year_a} and {sequel} in {year_b}.",
+        "The {publisher} catalogue shows {book} in {year_a} and {fake_sequel} in {year_b}.",
+        "Distractor mentions an additional title in {year_b}, the negative substitutes the sequel name. [HARD]",
+    ),
+    (
+        "{name} held two roles at the {institution}. "
+        "Between {year_a} and {year_b} they served as both the {role_a} and the {role_b}. "
+        "Earlier in their career they had also been {fake_role} at a different organisation.",
+        "{name} served as the {role_a} and the {role_b} of the {institution}.",
+        "{name} served as the {role_a} of the {institution} and then became {fake_role}.",
+        "{fake_role} appears in the context but at a different organisation. [HARD]",
+    ),
+]
+
+
+_ENTITY_TEMPLATES = _ENTITY_TEMPLATES + _HARD_ENTITY_TEMPLATES
+_DATE_TEMPLATES = _DATE_TEMPLATES + _HARD_DATE_TEMPLATES
+_NUMBER_TEMPLATES = _NUMBER_TEMPLATES + _HARD_NUMBER_TEMPLATES
+_UNIT_TEMPLATES = _UNIT_TEMPLATES + _HARD_UNIT_TEMPLATES
+_NEGATION_TEMPLATES = _NEGATION_TEMPLATES + _HARD_NEGATION_TEMPLATES
+_ROLE_TEMPLATES = _ROLE_TEMPLATES + _HARD_ROLE_TEMPLATES
+_PARTIAL_TEMPLATES = _PARTIAL_TEMPLATES + _HARD_PARTIAL_TEMPLATES
+
+
 _NAMES = [
     "Alexandra Morton", "Benedikt Hauser", "Camille Okafor", "Dilan Petrov",
     "Eira Nakamura", "Felipe Villaverde", "Gisele Toussaint", "Hiro Tanaka",
@@ -458,8 +617,19 @@ def stratum_summary(pairs: Sequence[MinimalPair]) -> dict:
     return counts
 
 
+def hard_family_summary(pairs: Sequence[MinimalPair]) -> dict:
+    """Per-stratum count of pairs sourced from the ``[HARD]`` template family."""
+
+    counts: dict = {}
+    for pair in pairs:
+        if "[HARD]" in pair.notes:
+            counts[pair.stratum] = counts.get(pair.stratum, 0) + 1
+    return counts
+
+
 __all__ = [
     "MinimalPair",
     "build_minimal_pairs",
     "stratum_summary",
+    "hard_family_summary",
 ]

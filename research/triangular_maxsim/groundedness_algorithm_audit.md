@@ -284,3 +284,86 @@ No live `vllm-factory` endpoint was configured in this audit environment, so the
 numeric quality/latency results above were produced with the local
 `lightonai/GTE-ModernColBERT-v1` provider rather than a live remote pooling
 deployment.
+
+## Phase E Verdict (Real-Hardening)
+
+The Phase E harness lives at
+`research/triangular_maxsim/groundedness_external_eval.py`. It generates 210
+deterministic minimal pairs across 7 strata (entity_swap, date_swap,
+number_swap, unit_swap, negation, role_swap, partial), with an extra "HARD"
+template family per stratum that uses long contexts, distractor sentences,
+and tightly paraphrased candidates. The harness measures **encode + score
+latency separately**, runs warm-up passes, and now uses `groundedness_v2`
+(the fused calibrated + literal-guarded + optional NLI score) as the
+headline whenever it is available.
+
+Two production lanes were executed against `lightonai/GTE-ModernColBERT-v1`.
+
+### Lane A: dense + literal guardrails (no NLI)
+
+Headline: `groundedness_v2_no_nli` (calibrated + literal-guarded fusion).
+
+| Stratum     | Paired Acc | 95% CI lower | n  | Verdict |
+|-------------|-----------:|-------------:|---:|---------|
+| entity_swap |       0.80 |         0.63 | 30 | pass    |
+| date_swap   |       0.93 |         0.83 | 30 | pass    |
+| number_swap |       0.67 |         0.50 | 30 | partial |
+| unit_swap   |       0.77 |         0.60 | 30 | partial |
+| negation    |       0.90 |         0.77 | 30 | pass    |
+| role_swap   |       0.57 |         0.37 | 30 | fail    |
+| partial     |       1.00 |         1.00 | 30 | pass    |
+
+Latency p95: encode 113.4 ms, score 57.6 ms, total **118.3 ms** (over the
+no-NLI 100 ms budget on this single A5000 / batch=1 setup). `headline_verdict`
+emitted by the harness: *"feature in Beta, NLI required for negation/role/partial."*
+
+Read this lane as: dense + literal mismatch detection alone can rank lexical
+errors well, can usually catch negation in the current adversarial set, but
+cannot reliably distinguish role swaps where the only difference is argument
+order. This is the long-standing weakness of pure dense similarity on
+symmetric arguments.
+
+### Lane B: dense + literal + NLI peer
+
+Headline: `groundedness_v2` (calibrated + literal-guarded + NLI fusion).
+NLI backend: `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`.
+
+| Stratum     | Paired Acc | 95% CI lower | n  | Verdict |
+|-------------|-----------:|-------------:|---:|---------|
+| entity_swap |       1.00 |         1.00 | 30 | pass    |
+| date_swap   |       1.00 |         1.00 | 30 | pass    |
+| number_swap |       1.00 |         1.00 | 30 | pass    |
+| unit_swap   |       1.00 |         1.00 | 30 | pass    |
+| negation    |       1.00 |         1.00 | 30 | pass    |
+| role_swap   |       1.00 |         1.00 | 30 | pass    |
+| partial     |       1.00 |         1.00 | 30 | pass    |
+
+Latency p95: encode 92.5 ms, score 64.9 ms, total **141.6 ms** (under the
+250 ms NLI budget). All pre-registered exit criteria satisfied; harness
+`headline_verdict`: *"feature in Beta with NLI peer, ready for evidence/QA."*
+
+### Honest caveats on the Phase E numbers
+
+- External benchmarks (RAGTruth, HaluEval QA, FActScore biographies) were
+  reported as `skipped` because no dataset directories were configured in
+  this environment. The loaders, parsers, and pre-registered targets are in
+  place but no real-world data has touched the pipeline yet.
+- 100% accuracy across all strata in Lane B reflects the in-house adversarial
+  templates, not a closed-domain real-world benchmark. The templates are
+  designed to be hard for dense MaxSim and are deliberately negation- /
+  role- / number-bait. Read this as "the NLI peer correctly fixes the
+  patterns dense MaxSim is known to fail on", not "the system never makes
+  mistakes."
+- The latency budget for the no-NLI lane (100 ms p95) is slightly missed at
+  batch size 1 on A5000 because of encoder cost. The NLI-on lane is well
+  inside the 250 ms p95 budget.
+
+### Verdict
+
+- **Without NLI**: feature in Beta. Suitable for evidence/QA on lexical
+  groundedness checks (entity, date, partial). Not suitable as a sole
+  groundedness signal for negation- or role-sensitive content.
+- **With NLI peer enabled**: feature in Beta, ready for evidence/QA across
+  all currently exercised strata with all pre-registered exit criteria met
+  inside latency budget. External-benchmark integration remains pending.
+

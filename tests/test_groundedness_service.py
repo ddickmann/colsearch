@@ -1940,4 +1940,135 @@ def test_assemble_report_marks_skipped_when_external_data_missing() -> None:
     assert report["criteria"]["minimal_pairs_semantic"]["met"] is True
     assert report["criteria"]["minimal_pairs_partial"]["met"] is True
     assert report["criteria"]["latency_score_only"]["met"] is True
+    # NLI was disabled, so latency_with_nli is not applicable to this run.
+    assert report["criteria"]["latency_with_nli"]["status"] == "not_applicable"
+    assert "headline_verdict" in report
+    assert isinstance(report["headline_verdict"], str)
+
+
+def test_minimal_pair_hard_family_covers_every_stratum() -> None:
+    from research.triangular_maxsim.groundedness_minimal_pairs import (
+        build_minimal_pairs,
+        hard_family_summary,
+    )
+
+    pairs = build_minimal_pairs(pairs_per_stratum=30, seed=17)
+    hard = hard_family_summary(pairs)
+    expected = {
+        "entity_swap",
+        "date_swap",
+        "number_swap",
+        "unit_swap",
+        "negation",
+        "role_swap",
+        "partial",
+    }
+    assert set(hard.keys()) == expected
+    for stratum, count in hard.items():
+        assert count >= 5, "stratum {0} only has {1} HARD pairs".format(stratum, count)
+
+
+def test_evaluate_minimal_pairs_uses_calibrated_headline_when_null_bank_provided() -> None:
+    from research.triangular_maxsim.groundedness_external_eval import (
+        build_null_bank_embeddings,
+        evaluate_minimal_pairs,
+    )
+    from research.triangular_maxsim.groundedness_minimal_pairs import build_minimal_pairs
+
+    provider = DummyGroundednessProvider(dim=24)
+    pairs = build_minimal_pairs(pairs_per_stratum=2, seed=29)
+    null_bank = build_null_bank_embeddings(provider)
+    assert null_bank, "default null bank should produce embeddings"
+    results = evaluate_minimal_pairs(
+        pairs, provider, null_bank_embeddings=null_bank, warmup=1
+    )
+    # groundedness_v2 fuses calibrated + literal-guarded even without NLI
+    # so the harness should pick it up as the no-NLI headline.
+    assert results["headline_used"] == "groundedness_v2_no_nli"
+    assert results["nli_enabled"] is False
+
+
+def test_evaluate_minimal_pairs_reports_split_latency() -> None:
+    from research.triangular_maxsim.groundedness_external_eval import evaluate_minimal_pairs
+    from research.triangular_maxsim.groundedness_minimal_pairs import build_minimal_pairs
+
+    provider = DummyGroundednessProvider(dim=24)
+    pairs = build_minimal_pairs(pairs_per_stratum=2, seed=31)
+    results = evaluate_minimal_pairs(pairs, provider, warmup=1)
+    for key in ("encode_p50_ms", "encode_p95_ms", "score_p50_ms", "score_p95_ms"):
+        assert key in results
+        assert results[key] >= 0.0
+    assert results["latency_p95_ms"] >= results["score_p95_ms"]
+    assert results["latency_p95_ms"] >= results["encode_p95_ms"]
+
+
+def test_evaluate_minimal_pairs_routes_nli_provider_and_uses_v2_headline() -> None:
+    from research.triangular_maxsim.groundedness_external_eval import evaluate_minimal_pairs
+    from research.triangular_maxsim.groundedness_minimal_pairs import build_minimal_pairs
+
+    provider = DummyGroundednessProvider(dim=24)
+    pairs = build_minimal_pairs(pairs_per_stratum=2, seed=37)
+    nli = FakeNLIProvider()
+    results = evaluate_minimal_pairs(
+        pairs, provider, nli_provider=nli, warmup=1
+    )
+    assert results["nli_enabled"] is True
+    # Calibration requires null_bank_embeddings, so the calibrated headline
+    # is never selected here. With the FakeNLIProvider every pair produces a
+    # fused groundedness_v2 score, which becomes the dominant headline.
+    distribution = results["headline_distribution"]
+    assert "reverse_context_calibrated" not in distribution
+    assert distribution.get("groundedness_v2", 0) > 0
+
+
+def test_assemble_report_marks_latency_with_nli_applicable_when_enabled() -> None:
+    from research.triangular_maxsim.groundedness_external_eval import assemble_report
+
+    minimal_pair_results = {
+        "per_stratum": {
+            "entity_swap": {"n": 30, "paired_accuracy": 0.9, "ci_lower": 0.85, "ci_upper": 0.95},
+            "date_swap": {"n": 30, "paired_accuracy": 0.85, "ci_lower": 0.80, "ci_upper": 0.90},
+            "number_swap": {"n": 30, "paired_accuracy": 0.82, "ci_lower": 0.77, "ci_upper": 0.88},
+            "unit_swap": {"n": 30, "paired_accuracy": 0.84, "ci_lower": 0.78, "ci_upper": 0.89},
+            "negation": {"n": 30, "paired_accuracy": 0.72, "ci_lower": 0.66, "ci_upper": 0.78},
+            "role_swap": {"n": 30, "paired_accuracy": 0.74, "ci_lower": 0.68, "ci_upper": 0.80},
+            "partial": {"n": 30, "paired_accuracy": 0.66, "ci_lower": 0.61, "ci_upper": 0.72},
+        },
+        "latency_p95_ms": 200.0,
+        "nli_enabled": True,
+    }
+    report = assemble_report(
+        minimal_pair_results=minimal_pair_results,
+        external_results={"ragtruth": None, "halueval": None, "factscore": None},
+    )
+    assert report["criteria"]["latency_score_only"]["applicable"] is False
+    assert report["criteria"]["latency_with_nli"]["applicable"] is True
     assert report["criteria"]["latency_with_nli"]["met"] is True
+    assert "groundedness_v2" not in report["headline_verdict"] or "NLI" in report["headline_verdict"]
+
+
+def test_compute_headline_verdict_lexical_failure_blocks_pass() -> None:
+    from research.triangular_maxsim.groundedness_external_eval import (
+        assemble_report,
+        compute_headline_verdict,
+    )
+
+    minimal_pair_results = {
+        "per_stratum": {
+            "entity_swap": {"n": 30, "paired_accuracy": 0.5, "ci_lower": 0.4, "ci_upper": 0.6},
+            "date_swap": {"n": 30, "paired_accuracy": 0.6, "ci_lower": 0.5, "ci_upper": 0.7},
+            "number_swap": {"n": 30, "paired_accuracy": 0.6, "ci_lower": 0.5, "ci_upper": 0.7},
+            "unit_swap": {"n": 30, "paired_accuracy": 0.6, "ci_lower": 0.5, "ci_upper": 0.7},
+            "negation": {"n": 30, "paired_accuracy": 0.9, "ci_lower": 0.85, "ci_upper": 0.95},
+            "role_swap": {"n": 30, "paired_accuracy": 0.9, "ci_lower": 0.85, "ci_upper": 0.95},
+            "partial": {"n": 30, "paired_accuracy": 0.9, "ci_lower": 0.85, "ci_upper": 0.95},
+        },
+        "latency_p95_ms": 50.0,
+        "nli_enabled": False,
+    }
+    report = assemble_report(
+        minimal_pair_results=minimal_pair_results,
+        external_results={"ragtruth": None, "halueval": None, "factscore": None},
+    )
+    verdict = compute_headline_verdict(report)
+    assert "not a feature yet" in verdict
