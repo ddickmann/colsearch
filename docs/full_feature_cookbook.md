@@ -645,14 +645,13 @@ Where to explore them:
 
 ## Step 9A. Groundedness Tracker (sidecar)
 
-Post-generation groundedness scoring is shipped as the standalone
-[`latence-trace`](https://github.com/ddickmann/latence-trace) sidecar
-(commercial, not part of this OSS distribution). The sidecar exposes
-`POST /groundedness` and accepts the same `chunk_ids` / `raw_context`
-contract you would otherwise have called on `voyager-index`. The OSS
-retrieval surface and the commercial groundedness surface are kept on
-separate processes by design so they can scale and be licensed
-independently. See the
+Post-generation groundedness scoring is provided by the optional
+Latence Trace sidecar from [latence.ai](https://latence.ai). The
+sidecar runs next to `voyager-index` and exposes `POST /groundedness`,
+accepting the same `chunk_ids` / `raw_context` contract you would
+otherwise have called on `voyager-index`. Retrieval and groundedness
+scoring run in separate processes so each can be scaled, restarted,
+and operated independently. See the
 [Groundedness sidecar guide](guides/groundedness-sidecar.md) for the
 deployment story and the integration shape.
 

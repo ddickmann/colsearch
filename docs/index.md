@@ -12,7 +12,7 @@ The public story is:
 - base64 vector transport as the preferred HTTP contract
 - BM25 hybrid search with `rrf` or `tabu`
 - optional Latence graph augmentation as an additive premium lane
-- optional `latence-trace` groundedness sidecar as a separate post-generation hallucination tracker
+- optional Latence Trace groundedness sidecar as a separate post-generation hallucination tracker
 
 ## Start Here
 
@@ -20,7 +20,7 @@ The public story is:
 - [Installation](getting-started/installation.md): package extras and source install
 - [Python API Reference](api/python.md): `Index`, `IndexBuilder`, transport helpers, and public classes
 - [Reference API Tutorial](reference_api_tutorial.md): first HTTP collections and queries
-- [Groundedness Sidecar Guide](guides/groundedness-sidecar.md): the `latence-trace` post-generation hallucination tracker, its OSS / commercial boundary, and integration shape
+- [Groundedness Sidecar Guide](guides/groundedness-sidecar.md): the Latence Trace post-generation hallucination tracker and its integration shape
 - [Max-Performance Reference API Guide](guides/max-performance-reference-api.md): worker scaling, base64, GPU modes
 - [Shard Engine Guide](guides/shard-engine.md): routing, scoring, durability, and admin endpoints
 - [Latence Graph Sidecar](guides/latence-graph-sidecar.md): optional premium graph lane, policy, provenance, and health surfaces
@@ -88,7 +88,7 @@ XLSX, and image inputs.
 | `SearchPipeline` | In-process dense + BM25 fusion |
 | `latence_solver` | Optional Tabu Search solver for `tabu` refinement and `/reference/optimize` |
 | `LatenceGraphSidecar` | Optional premium graph plane for additive rescue, provenance, and freshness-aware graph metadata |
-| `latence-trace` sidecar | Commercial post-generation groundedness tracker (separate repository) reusing `chunk_ids` from this index |
+| Latence Trace sidecar | Optional post-generation groundedness tracker that reuses `chunk_ids` from this index |
 
 ## Design Principles
 

@@ -1,10 +1,14 @@
 # Groundedness Sidecar
 
-`voyager-index` keeps the OSS retrieval engine focused on getting the right
-chunks back fast. Post-generation hallucination scoring is shipped as a
-separate, commercial sidecar called
-[`latence-trace`](https://github.com/ddickmann/latence-trace) so the two
-products can scale, be licensed, and evolve independently.
+`voyager-index` is the OSS retrieval engine. Once retrieval has returned the
+right chunks and an LLM has produced an answer, you usually still need an
+auditable answer to the question *is this answer grounded in the context we
+gave it?* That post-generation lane is provided by the **Latence Trace**
+groundedness sidecar — a separate, commercially licensed service from
+[latence.ai](https://latence.ai) that you run next to `voyager-index`.
+
+The OSS retrieval core stays usable on its own. The groundedness sidecar is
+additive: it sits on the answer path, never on the retrieval path.
 
 ## Product Split
 
@@ -12,56 +16,48 @@ products can scale, be licensed, and evolve independently.
 | --- | --- |
 | OSS retrieval core (this repo) | multimodal preprocessing, embeddings/model-serving seams, late-interaction index, BM25S, quantization, fusion, and optional solver packing |
 | Optional Latence graph plane | `LatenceGraphSidecar`, graph-aware candidate rescue, graph-aware solver features, provenance, and Dataset Intelligence sync metadata |
-| Optional `latence-trace` groundedness sidecar | post-generation calibrated reverse MaxSim, literal guardrails, NLI / claim-level verifier, semantic-entropy peer, structured-source verification, and a calibrated risk band |
+| Optional Latence Trace groundedness sidecar | post-generation calibrated reverse MaxSim, literal guardrails, NLI / claim-level verifier, semantic-entropy peer, structured-source verification, and a calibrated risk band |
 
-The OSS engine stays fully usable without the groundedness sidecar
-installed - it is additive and post-generation, sitting on the answer
-path, not the retrieval path.
-
-## Why It Lives In A Separate Repo
-
-- **Different latency budget.** Retrieval is sub-10 ms p95 in voyager-index. The groundedness lane runs an NLI verifier and an optional semantic-entropy peer that legitimately consume 100-150 ms p95 even on an A5000.
-- **Different licensing posture.** Retrieval should remain commodity OSS. Calibrated hallucination scoring is the kind of feature customers expect a commercial guarantee on (calibration, peer fusion weights, drift monitoring), so it is shipped under a proprietary license.
-- **Different release cadence.** The sidecar evolves with NLI model updates, calibration sweeps, and dataset-specific risk bands without forcing voyager-index releases.
-- **Failure isolation.** A degraded NLI lane never breaks first-stage retrieval, and a retrieval restart never invalidates calibrated thresholds.
+This is the same architectural cut as the graph plane: a premium,
+failure-isolated lane that you can adopt incrementally.
 
 ## What The Sidecar Does
 
-`latence-trace` exposes a single endpoint:
+The groundedness sidecar exposes a single endpoint:
 
 ```text
 POST /groundedness
 ```
 
 It accepts the same dual-mode contract you would otherwise have called
-on voyager-index:
+on `voyager-index`:
 
-- **`chunk_ids[]` fast path** - your generation layer passes the exact
+- **`chunk_ids[]` fast path** — your generation layer passes the exact
   chunk IDs that were stitched into the LLM context. The sidecar
   retrieves the corresponding multi-vector embeddings (via a
-  caller-supplied resolver, so it can read directly from voyager-index,
-  Qdrant, an in-memory cache, or any other vector store) and scores the
-  response against them.
-- **`raw_context` fallback** - when chunk IDs are unavailable, the
+  caller-supplied resolver, so it can read directly from
+  `voyager-index`, an in-memory cache, or any other vector store) and
+  scores the response against them.
+- **`raw_context` fallback** — when chunk IDs are unavailable, the
   sidecar segments the raw context into 256-token packed sentence
   windows, encodes them with the configured ColBERT-style multi-vector
   encoder, and scores the response against those windows.
 
 The response carries:
 
-- `scores.reverse_context` - raw response-token-against-context MaxSim
-- `scores.reverse_context_calibrated` - z-scored against a held-out null bank and squashed into `(0, 1)` for a wide, readable dynamic range
-- `scores.literal_guarded` - calibrated headline discounted by unsupported response literals (dates, numbers, units, currency, URLs, emails, identifiers)
-- `scores.nli_aggregate` and `nli_diagnostics.claims` - per-claim entailment scores from the NLI verifier (default `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`, with optional cross-encoder premise reranking and atomic-fact decomposition)
-- `scores.semantic_entropy_*` - bidirectional-entailment clustering of multiple LLM samples for consistency
-- `scores.structured_source_*` - triple-level matching on JSON / Markdown-table sources
-- `scores.groundedness_v2` - convex fusion of the channels above with calibrated weights
-- `scores.risk_band` - calibrated `green` / `amber` / `red` classification by stratum
+- `scores.reverse_context` — raw response-token-against-context MaxSim
+- `scores.reverse_context_calibrated` — z-scored against a held-out null bank and squashed into `(0, 1)` for a wide, readable dynamic range
+- `scores.literal_guarded` — calibrated headline discounted by unsupported response literals (dates, numbers, units, currency, URLs, emails, identifiers)
+- `scores.nli_aggregate` and `nli_diagnostics.claims` — per-claim entailment scores from the NLI verifier, with optional cross-encoder premise reranking and atomic-fact decomposition
+- `scores.semantic_entropy_*` — bidirectional-entailment clustering of multiple LLM samples for consistency
+- `scores.structured_source_*` — triple-level matching on JSON / Markdown-table sources
+- `scores.groundedness_v2` — convex fusion of the channels above with calibrated weights
+- `scores.risk_band` — calibrated `green` / `amber` / `red` classification by stratum
 - per-token `response_tokens[]`, per-unit `support_units[]`, and `top_evidence[]` for heatmap and evidence-trace UIs
 
 ## Integration Shape
 
-A typical voyager-index plus latence-trace deployment runs them as two
+A typical voyager-index plus groundedness sidecar deployment runs them as two
 processes:
 
 ```text
@@ -71,7 +67,7 @@ client query  --> | voyager-index server  | -> chunk_ids[], context
                                 |
                                 v
                   +-----------------------+
-LLM response  --> | latence-trace sidecar | -> groundedness scores,
+LLM response  --> | Latence Trace sidecar | -> groundedness scores,
                   +-----------------------+    risk band, evidence
                                 ^
                                 |
@@ -96,13 +92,33 @@ curl -X POST http://127.0.0.1:8090/groundedness \
   }'
 ```
 
+The same shape is available for the `raw_context` fallback by replacing
+`chunk_ids` with the raw passage text.
+
+## Operational Boundary
+
+The two processes are deliberately decoupled:
+
+- **Latency budget.** Retrieval is sub-10 ms p95 in voyager-index. The
+  groundedness lane runs an NLI verifier and an optional semantic-entropy
+  peer that legitimately consume ~100–150 ms p95 even on a single
+  workstation GPU; running them out of process keeps the retrieval hot
+  path tight.
+- **Release cadence.** The sidecar evolves with NLI model updates,
+  calibration sweeps, and dataset-specific risk bands without forcing
+  voyager-index releases.
+- **Failure isolation.** A degraded NLI lane never breaks first-stage
+  retrieval, and a retrieval restart never invalidates calibrated
+  thresholds.
+- **Licensing.** Calibrated hallucination scoring is shipped under a
+  commercial license so customers can rely on calibration, peer fusion
+  weights, and drift monitoring as part of the product, not as a
+  best-effort OSS extra.
+
 ## Where To Go Next
 
-- **Sidecar README, Beta overview, and full algorithm audit:**
-  the private [`latence-trace`](https://github.com/ddickmann/latence-trace)
-  repository.
-- **Product page:** the commercial groundedness tracker is part of the
-  [latence.ai](https://latence.ai) product surface.
+- **Product page and access:** [latence.ai](https://latence.ai) hosts the
+  Latence Trace product surface, including pricing and onboarding.
 - **Retrieval boundary:** `voyager-index` itself remains the right place
   to look for indexing, hybrid search, quantization, and the optional
   Latence graph lane.

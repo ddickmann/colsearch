@@ -86,7 +86,7 @@ docker run -p 8080:8080 -v "$(pwd)/data:/data" voyager-index
 - **Multimodal** — text (ColBERT), images (ColPali / ColQwen), preprocessing for PDF / DOCX / XLSX.
 - **Operations** — WAL, checkpoint, crash recovery, scroll, retrieve, multi-worker FastAPI.
 - **Optional graph lane** — Latence sidecar for graph-aware rescue and provenance, additive to the OSS path.
-- **Optional groundedness lane** — `latence-trace` sidecar for post-generation hallucination scoring against retrieved `chunk_ids` or raw context. Commercial sidecar; not part of the OSS distribution. See the [Groundedness sidecar guide](docs/guides/groundedness-sidecar.md).
+- **Optional groundedness lane** — Latence Trace sidecar for post-generation hallucination scoring against retrieved `chunk_ids` or raw context, additive to the OSS path. See the [Groundedness sidecar guide](docs/guides/groundedness-sidecar.md).
 
 ## Benchmarks
 

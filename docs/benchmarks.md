@@ -97,11 +97,12 @@ publishing a flattering slice.
 
 ## Groundedness Tracker
 
-Post-generation hallucination scoring is shipped as a separate
-commercial sidecar and is no longer benchmarked in this OSS document.
-For the latest minimal-pair, RAGTruth, HaluEval and FActScore numbers
-see the [Groundedness sidecar guide](guides/groundedness-sidecar.md)
-and the `latence-trace` sidecar repository.
+Post-generation hallucination scoring runs in the optional
+Latence Trace sidecar and is benchmarked separately from the
+retrieval engine. See the
+[Groundedness sidecar guide](guides/groundedness-sidecar.md) for the
+integration shape and [latence.ai](https://latence.ai) for the latest
+minimal-pair, RAGTruth, HaluEval and FActScore numbers.
 
 ## Benchmark Layers
 

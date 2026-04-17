@@ -364,9 +364,9 @@ Important truth-in-advertising note:
 
 ## 7. Groundedness Tracker (sidecar)
 
-Post-generation hallucination scoring is shipped separately as the
-[`latence-trace`](https://github.com/ddickmann/latence-trace) sidecar
-(commercial, not part of the OSS distribution). The sidecar exposes
+Post-generation hallucination scoring is provided by the optional
+Latence Trace sidecar from [latence.ai](https://latence.ai), which
+runs alongside the reference API. The sidecar exposes
 `POST /groundedness` with the same `chunk_ids` / `raw_context` contract,
 calibrated risk bands, and NLI / semantic-entropy / structured-source
 peers. See the [Groundedness sidecar guide](guides/groundedness-sidecar.md)
