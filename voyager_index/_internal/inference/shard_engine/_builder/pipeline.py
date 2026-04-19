@@ -145,9 +145,19 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
             choose_effective_rroq158_k,
             encode_rroq158,
         )
-        n_tokens = int(np.asarray(active_vectors).shape[0])
+        active_arr = np.asarray(active_vectors)
+        n_tokens = int(active_arr.shape[0])
+        token_dim = int(active_arr.shape[1]) if active_arr.ndim >= 2 else 0
         gs = int(cfg.rroq158_group_size)
-        if n_tokens < gs:
+        if token_dim and token_dim < gs:
+            log.warning(
+                "RROQ158 requested but token dim=%d is smaller than "
+                "group_size=%d. Falling back to FP16 — rroq158 needs at "
+                "least group_size coordinates per token.",
+                token_dim, gs,
+            )
+            cfg.compression = Compression.FP16
+        elif n_tokens < gs:
             log.warning(
                 "RROQ158 requested but corpus has only %d tokens "
                 "(< group_size=%d). Falling back to FP16 — rroq158 needs "
@@ -195,9 +205,19 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
             choose_effective_rroq4_riem_k,
             encode_rroq4_riem,
         )
-        n_tokens = int(np.asarray(active_vectors).shape[0])
+        active_arr = np.asarray(active_vectors)
+        n_tokens = int(active_arr.shape[0])
+        token_dim = int(active_arr.shape[1]) if active_arr.ndim >= 2 else 0
         gs = int(cfg.rroq4_riem_group_size)
-        if n_tokens < gs:
+        if token_dim and token_dim < gs:
+            log.warning(
+                "RROQ4_RIEM requested but token dim=%d is smaller than "
+                "group_size=%d. Falling back to FP16 — rroq4_riem needs at "
+                "least group_size coordinates per token.",
+                token_dim, gs,
+            )
+            cfg.compression = Compression.FP16
+        elif n_tokens < gs:
             log.warning(
                 "RROQ4_RIEM requested but corpus has only %d tokens "
                 "(< group_size=%d). Falling back to FP16 — rroq4_riem needs "

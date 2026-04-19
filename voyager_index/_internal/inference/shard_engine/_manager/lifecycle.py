@@ -191,7 +191,26 @@ class ShardSegmentManagerLifecycleMixin:
 
                 gs = int(cfg.rroq158_group_size)
                 n_tok = int(all_vecs.shape[0])
-                if n_tok < gs:
+                token_dim = int(all_vecs.shape[1])
+                if token_dim < gs:
+                    # Embedding dim smaller than one ternary group → no
+                    # quantization is possible (one popcount word per group
+                    # requires at least group_size coords per token). This
+                    # is the synthetic-test / demo path (e.g. dim=16 with
+                    # the default group_size=32). Drop to FP16 with a loud
+                    # warning so the operator can either bump dim or
+                    # explicitly request FP16. Production embeddings live
+                    # in dim=128/256/768 → never trips this branch.
+                    logger.warning(
+                        "RROQ158 requested but token dim=%d is smaller than "
+                        "group_size=%d. Falling back to FP16 — rroq158 needs "
+                        "at least group_size coordinates per token to pack a "
+                        "ternary group. Pass compression=FP16 explicitly to "
+                        "silence, or use a group_size that divides %d.",
+                        token_dim, gs, token_dim,
+                    )
+                    effective_compression = Compression.FP16
+                elif n_tok < gs:
                     # Data-shape fallback (NOT a codec error): a corpus with
                     # fewer tokens than a single ternary group cannot be
                     # quantized at all (one popcount word == one group). Drop
@@ -262,7 +281,22 @@ class ShardSegmentManagerLifecycleMixin:
 
                 gs = int(cfg.rroq4_riem_group_size)
                 n_tok = int(all_vecs.shape[0])
-                if n_tok < gs:
+                token_dim = int(all_vecs.shape[1])
+                if token_dim < gs:
+                    # Embedding dim smaller than one 4-bit group → no
+                    # quantization possible. Same policy as RROQ158:
+                    # drop to FP16 with a loud warning. Production
+                    # embeddings (dim >= 128) never trip this branch.
+                    logger.warning(
+                        "RROQ4_RIEM requested but token dim=%d is smaller "
+                        "than group_size=%d. Falling back to FP16 — "
+                        "rroq4_riem needs at least group_size coordinates "
+                        "per token. Pass compression=FP16 explicitly to "
+                        "silence, or use a group_size that divides %d.",
+                        token_dim, gs, token_dim,
+                    )
+                    effective_compression = Compression.FP16
+                elif n_tok < gs:
                     # Same data-shape fallback story as RROQ158: a corpus
                     # with fewer tokens than a single 4-bit group cannot be
                     # quantized at all. Drop to FP16 with a loud warning so
