@@ -68,17 +68,30 @@ class ShardSegmentManagerSearchMixin:
             return None
         try:
             arr = np.load(str(meta_path))
+            centroids = np.ascontiguousarray(arr["centroids"], dtype=np.float32)
+            seed = int(np.asarray(arr["fwht_seed"]).item())
+            dim = int(np.asarray(arr["dim"]).item())
+            group_size = int(np.asarray(arr["group_size"]).item())
+            try:
+                from voyager_index._internal.inference.quantization.rroq158 import (
+                    get_cached_fwht_rotator,
+                )
+                rotator = get_cached_fwht_rotator(dim=dim, seed=seed)
+            except Exception:
+                rotator = None
             self._rroq158_meta = {
-                "centroids": np.asarray(arr["centroids"], dtype=np.float32),
-                "fwht_seed": int(np.asarray(arr["fwht_seed"]).item()),
-                "dim": int(np.asarray(arr["dim"]).item()),
-                "group_size": int(np.asarray(arr["group_size"]).item()),
+                "centroids": centroids,
+                "fwht_seed": seed,
+                "dim": dim,
+                "group_size": group_size,
+                "rotator": rotator,
             }
             logger.info(
-                "RROQ158 meta loaded: K=%d, dim=%d, group_size=%d",
-                self._rroq158_meta["centroids"].shape[0],
-                self._rroq158_meta["dim"],
-                self._rroq158_meta["group_size"],
+                "RROQ158 meta loaded: K=%d, dim=%d, group_size=%d (rotator cached: %s)",
+                centroids.shape[0],
+                dim,
+                group_size,
+                rotator is not None,
             )
         except Exception as exc:
             logger.warning("Failed to load RROQ158 meta from %s: %s", meta_path, exc)
@@ -249,16 +262,30 @@ class ShardSegmentManagerSearchMixin:
         try:
             with Timer(sync_cuda=False) as t_prepare:
                 q_np = q.detach().cpu().numpy().astype(np.float32)
-                centroids = meta["centroids"]
+                centroids_np = meta["centroids"]
+                on_cuda = dev.type == "cuda"
                 q_inputs = encode_query_for_rroq158(
                     q_np,
-                    centroids,
+                    None if on_cuda else centroids_np,
                     fwht_seed=meta["fwht_seed"],
                     query_bits=4,
+                    rotator=meta.get("rotator"),
+                    skip_qc_table=on_cuda,
                 )
                 qp = torch.from_numpy(q_inputs["q_planes"][None, :, :, :])
                 qm = torch.from_numpy(q_inputs["q_meta"][None, :, :])
-                qct = torch.from_numpy(q_inputs["qc_table"][None, :, :])
+                if on_cuda:
+                    # qc_table = q @ centroids.T grows linearly with K; do it
+                    # on the device since it's a small matmul that dominates
+                    # CPU prep time at K>=2048.
+                    centroids_t = meta.get("centroids_dev")
+                    if centroids_t is None or centroids_t.device != dev:
+                        centroids_t = torch.from_numpy(centroids_np).to(dev)
+                        meta["centroids_dev"] = centroids_t
+                    q_dev = torch.from_numpy(q_np).to(dev)
+                    qct = (q_dev @ centroids_t.T).unsqueeze(0)
+                else:
+                    qct = torch.from_numpy(q_inputs["qc_table"][None, :, :])
 
             with Timer(sync_cuda=False) as t_fetch:
                 doc_ids: List[int] = []

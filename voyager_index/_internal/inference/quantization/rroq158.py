@@ -72,6 +72,41 @@ def _fwht_rotator(dim: int, seed: int):
     return FastWalshHadamard(dim=dim, num_rounds=3, block_size=block_size, seed=seed)
 
 
+# Module-level rotator cache. Building the rotator costs ~0.3-0.5 ms (k random
+# perms + sign vectors); caching by (dim, seed) eliminates this from the
+# per-query hot path. Bounded to a handful of entries because we expect at
+# most one (dim, seed) pair per index.
+_FWHT_ROTATOR_CACHE: dict[tuple[int, int], object] = {}
+
+
+def get_cached_fwht_rotator(dim: int, seed: int):
+    """Return a process-cached FWHT rotator for (dim, seed).
+
+    Safe to call from many threads: dict insertion is atomic in CPython and
+    a duplicate construction race is harmless (we just replace the entry).
+
+    The returned rotator is also augmented with a ``_dense_matrix_np`` cache:
+    a ``(dim, dim)`` numpy float32 view of the rotator's linear operator. The
+    operator is fixed by ``(dim, seed)``, so we can extract it once and
+    replace the per-query 7-stage PyTorch dispatch (which has a >30 ms p95
+    tail under GIL contention with an active CUDA context) with a single
+    BLAS GEMM. See ``encode_query_for_rroq158`` for the consumer.
+    """
+    key = (dim, seed)
+    rot = _FWHT_ROTATOR_CACHE.get(key)
+    if rot is None:
+        rot = _fwht_rotator(dim, seed)
+        _FWHT_ROTATOR_CACHE[key] = rot
+    if not hasattr(rot, "_dense_matrix_np"):
+        import torch
+        with torch.no_grad():
+            padded = int(rot.padded_dim)
+            eye = torch.eye(padded, dtype=torch.float32)
+            full = rot.forward(eye).cpu().numpy().astype(np.float32, copy=False)
+        rot._dense_matrix_np = np.ascontiguousarray(full[:dim, :dim])
+    return rot
+
+
 def _l2(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     n = np.linalg.norm(x, axis=-1, keepdims=True)
     return x / (n + eps)
@@ -194,7 +229,7 @@ def encode_rroq158(
     )
     del fit_tokens; gc.collect()
 
-    rotator = _fwht_rotator(dim=dim, seed=cfg.seed)
+    rotator = get_cached_fwht_rotator(dim=dim, seed=cfg.seed)
     norms_full = np.linalg.norm(tokens, axis=1).astype(np.float32)
 
     # ---- chunked assign + ternary encode --------------------------------
@@ -260,10 +295,12 @@ def encode_rroq158(
 
 def encode_query_for_rroq158(
     queries: np.ndarray,
-    centroids: np.ndarray,
+    centroids: np.ndarray | None,
     *,
     fwht_seed: int,
     query_bits: int = 4,
+    rotator: object | None = None,
+    skip_qc_table: bool = False,
 ):
     """Build the Stage-1 host-side tensors the kernel consumes.
 
@@ -271,24 +308,47 @@ def encode_query_for_rroq158(
 
         - q_planes     : (S, query_bits, n_words) int32
         - q_meta       : (S, 2) float32  [scale, offset]
-        - qc_table     : (S, K) float32  = q_amb @ centroids.T
+        - qc_table     : (S, K) float32  = q_amb @ centroids.T  (or absent if
+                         ``skip_qc_table`` is True; pass ``centroids=None``
+                         in that case)
 
     ``queries`` is (S, dim) — we treat each query token independently
     (the wrapping launcher in scorer.py adds the batch dim).
+
+    ``centroids`` should be a CPU-resident float32 numpy array of shape
+    ``(K, dim)`` when ``skip_qc_table`` is False. When ``skip_qc_table`` is
+    True the caller is expected to compute qc_table itself on its preferred
+    device (e.g. on GPU, which is much cheaper for large K). ``rotator`` is
+    an optional pre-built ``FastWalshHadamard`` instance; when omitted we
+    hit the process-wide ``(dim, seed)`` cache so we don't pay the
+    construction cost (~0.5 ms) on every query.
     """
     if queries.ndim != 2:
         raise ValueError(f"expected (S, dim) queries, got {queries.shape}")
     s, dim = queries.shape
-    rotator = _fwht_rotator(dim=dim, seed=fwht_seed)
+    if rotator is None:
+        rotator = get_cached_fwht_rotator(dim=dim, seed=fwht_seed)
 
-    # Centroid table: <q_amb, c_k>
-    qc_table = (queries.astype(np.float32) @ centroids.T).astype(np.float32)
+    queries_f32 = queries.astype(np.float32, copy=False)
+    if skip_qc_table:
+        qc_table = None
+    else:
+        if centroids is None:
+            raise ValueError("centroids required when skip_qc_table is False")
+        qc_table = (queries_f32 @ centroids.T).astype(np.float32, copy=False)
 
-    # Rotated query for the residual term
-    import torch
-    q_rot = rotator.forward(torch.from_numpy(queries.astype(np.float32))).cpu().numpy()
-    if q_rot.shape[1] != dim:
-        q_rot = q_rot[:, :dim]
+    dense = getattr(rotator, "_dense_matrix_np", None)
+    if dense is not None and dense.shape == (dim, dim):
+        # Fast path: precomputed (dim, dim) linear operator. Single numpy
+        # GEMM, ~50 µs for S=32, dim=128 vs the 7-stage PyTorch dispatch
+        # path which has a 30+ ms p95 tail (rroq158 wrapper benchmarking
+        # 2026-04-19).
+        q_rot = (queries_f32 @ dense).astype(np.float32, copy=False)
+    else:
+        import torch
+        q_rot = rotator.forward(torch.from_numpy(queries_f32)).cpu().numpy()
+        if q_rot.shape[1] != dim:
+            q_rot = q_rot[:, :dim]
 
     # Asymmetric scalar quantization, per-token bit-planes
     if query_bits not in (4, 6, 8):
@@ -304,14 +364,16 @@ def encode_query_for_rroq158(
     planes = np.zeros((s, query_bits, n_words), dtype=np.int32)
     for k in range(query_bits):
         bit = ((quant >> k) & 0x01).astype(np.uint8)
-        # Pad to multiple of 32 if needed
         if bit.shape[1] % 32 != 0:
             pad = 32 - bit.shape[1] % 32
             bit = np.pad(bit, ((0, 0), (0, pad)))
         packed = np.packbits(bit, axis=1, bitorder="little").view(np.int32)
         planes[:, k, :packed.shape[1]] = packed
     meta = np.stack([scale, min_v], axis=1).astype(np.float32)
-    return {"q_planes": planes, "q_meta": meta, "qc_table": qc_table}
+    out = {"q_planes": planes, "q_meta": meta}
+    if qc_table is not None:
+        out["qc_table"] = qc_table
+    return out
 
 
 def pack_doc_codes_to_int32_words(sign_planes_u8: np.ndarray) -> np.ndarray:
@@ -331,4 +393,5 @@ __all__ = [
     "encode_rroq158",
     "encode_query_for_rroq158",
     "pack_doc_codes_to_int32_words",
+    "get_cached_fwht_rotator",
 ]

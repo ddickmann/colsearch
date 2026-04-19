@@ -460,6 +460,13 @@ def _build_rroq158_gpu_payload(
               + cid_dt.nbytes + cosn_dt.nbytes + sinn_dt.nbytes) / 1e6,
              bytes_per_tok)
 
+    from voyager_index._internal.inference.quantization.rroq158 import (
+        get_cached_fwht_rotator,
+    )
+
+    centroids_np = np.ascontiguousarray(enc.centroids, dtype=np.float32)
+    rotator = get_cached_fwht_rotator(dim=dim, seed=enc.fwht_seed)
+
     return {
         "sign": torch.from_numpy(sign_dt).to(device),
         "nz": torch.from_numpy(nz_dt).to(device),
@@ -469,6 +476,10 @@ def _build_rroq158_gpu_payload(
         "sinn": torch.from_numpy(sinn_dt).to(device),
         "mask": torch.from_numpy(mask_dt).to(device),
         "centroids": torch.from_numpy(enc.centroids).to(device),
+        # Cached host-side aliases so per-query encode does not have to do a
+        # GPU->CPU copy of the centroid table or rebuild the FWHT rotator.
+        "centroids_np": centroids_np,
+        "rotator": rotator,
         "fwht_seed": enc.fwht_seed,
         "n_words": n_int32_words,
         "n_groups": n_groups,
@@ -485,13 +496,35 @@ def _rroq158_score_candidates(
 ):
     """Score one query against the rroq158 GPU payload at the given candidate
     doc indices. Returns (top_ids, top_scores)."""
-    q_inputs = encode_query_for_rroq158(
-        query_np, payload["centroids"].cpu().numpy(),
-        fwht_seed=payload["fwht_seed"], query_bits=4,
-    )
-    q_planes = torch.from_numpy(q_inputs["q_planes"][None, :, :, :]).to(device)
-    q_meta = torch.from_numpy(q_inputs["q_meta"][None, :, :]).to(device)
-    qc_table = torch.from_numpy(q_inputs["qc_table"][None, :, :]).to(device)
+    on_cuda = str(device).startswith("cuda")
+    if on_cuda:
+        # qc_table = q @ centroids.T scales linearly with K and dominates
+        # CPU prep time at K>=2048 (~1 ms / 33M FLOP at K=8192). On the GPU
+        # the same matmul is ~0.005 ms, so we move it to device and skip
+        # the host-side computation in the encode helper.
+        q_inputs = encode_query_for_rroq158(
+            query_np, None,
+            fwht_seed=payload["fwht_seed"], query_bits=4,
+            rotator=payload.get("rotator"),
+            skip_qc_table=True,
+        )
+        q_planes = torch.from_numpy(q_inputs["q_planes"][None, :, :, :]).to(device)
+        q_meta = torch.from_numpy(q_inputs["q_meta"][None, :, :]).to(device)
+        q_dev = torch.from_numpy(np.ascontiguousarray(query_np, dtype=np.float32)).to(device)
+        qc_table = (q_dev @ payload["centroids"].T).unsqueeze(0)
+    else:
+        centroids_np = payload.get("centroids_np")
+        if centroids_np is None:
+            centroids_np = payload["centroids"].cpu().numpy()
+            payload["centroids_np"] = centroids_np
+        q_inputs = encode_query_for_rroq158(
+            query_np, centroids_np,
+            fwht_seed=payload["fwht_seed"], query_bits=4,
+            rotator=payload.get("rotator"),
+        )
+        q_planes = torch.from_numpy(q_inputs["q_planes"][None, :, :, :]).to(device)
+        q_meta = torch.from_numpy(q_inputs["q_meta"][None, :, :]).to(device)
+        qc_table = torch.from_numpy(q_inputs["qc_table"][None, :, :]).to(device)
 
     cand_idx = torch.tensor(
         [doc_ids_to_idx[int(cid)] for cid in candidate_ids],
