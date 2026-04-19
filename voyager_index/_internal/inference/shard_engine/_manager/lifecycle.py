@@ -185,11 +185,17 @@ class ShardSegmentManagerLifecycleMixin:
                         encode_rroq158,
                     )
 
-                    logger.info("Training RROQ158 (Riemannian 1.58-bit) quantizer ...")
+                    logger.info(
+                        "Training RROQ158 (Riemannian 1.58-bit) quantizer "
+                        "(K=%d, group_size=%d, seed=%d) ...",
+                        int(cfg.rroq158_k),
+                        int(cfg.rroq158_group_size),
+                        int(cfg.rroq158_seed),
+                    )
                     rroq_cfg = Rroq158Config(
-                        K=getattr(cfg, "rroq158_k", 1024),
-                        group_size=32,
-                        seed=cfg.seed,
+                        K=int(cfg.rroq158_k),
+                        group_size=int(cfg.rroq158_group_size),
+                        seed=int(cfg.rroq158_seed),
                     )
                     rroq158_payload = encode_rroq158(
                         np.asarray(all_vecs, dtype=np.float32), rroq_cfg
@@ -235,6 +241,10 @@ class ShardSegmentManagerLifecycleMixin:
                 "layout": cfg.layout.value,
                 "router_type": cfg.router_type.value,
             }
+            if effective_compression == Compression.RROQ158:
+                meta["rroq158_k"] = int(cfg.rroq158_k)
+                meta["rroq158_seed"] = int(cfg.rroq158_seed)
+                meta["rroq158_group_size"] = int(cfg.rroq158_group_size)
             atomic_json_write(self._path / "engine_meta.json", meta)
 
             payload_dict = {}

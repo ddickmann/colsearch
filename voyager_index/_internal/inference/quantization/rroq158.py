@@ -42,9 +42,11 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Rroq158Config:
-    K: int = 1024
+    K: int = 8192
     """Centroid codebook size. Disk overhead = ceil(log2(K))/dim bits per coord;
-    K=1024 is the offline-validated sweet spot."""
+    K=8192 is the production default — closes the K=1024 quality gap on hard
+    BEIR datasets (scidocs / arguana) at ~2 MB centroid table cost. Must be
+    a power of two and ``>= 256``."""
 
     group_size: int = 32
     """Ternary group size in coords. Must be a multiple of 32 (one popcount word

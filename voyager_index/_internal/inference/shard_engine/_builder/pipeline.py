@@ -131,6 +131,48 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
     roq_quantizer = None
     roq_doc_codes = None
     roq_doc_meta = None
+    rroq158_payload = None
+    if cfg.compression == Compression.RROQ158:
+        try:
+            from voyager_index._internal.inference.quantization.rroq158 import (
+                Rroq158Config,
+                encode_rroq158,
+            )
+            log.info(
+                "Training RROQ158 (Riemannian 1.58-bit) quantizer "
+                "(K=%d, group_size=%d, seed=%d) ...",
+                int(cfg.rroq158_k),
+                int(cfg.rroq158_group_size),
+                int(cfg.rroq158_seed),
+            )
+            t_rroq = time.time()
+            rroq158_payload = encode_rroq158(
+                np.asarray(active_vectors, dtype=np.float32),
+                Rroq158Config(
+                    K=int(cfg.rroq158_k),
+                    group_size=int(cfg.rroq158_group_size),
+                    seed=int(cfg.rroq158_seed),
+                ),
+            )
+            np.savez(
+                index_dir / "rroq158_meta.npz",
+                centroids=rroq158_payload.centroids,
+                fwht_seed=np.array(rroq158_payload.fwht_seed, dtype=np.int64),
+                dim=np.array(rroq158_payload.dim, dtype=np.int32),
+                group_size=np.array(rroq158_payload.group_size, dtype=np.int32),
+            )
+            log.info(
+                "RROQ158 encoding done in %.1fs (%d tokens, K=%d)",
+                time.time() - t_rroq,
+                int(np.asarray(active_vectors).shape[0]),
+                int(cfg.rroq158_k),
+            )
+        except Exception as exc:
+            log.warning(
+                "RROQ158 quantizer unavailable (%s), falling back to FP16", exc,
+            )
+            cfg.compression = Compression.FP16
+            rroq158_payload = None
     if cfg.compression == Compression.ROQ4:
         try:
             from voyager_index._internal.inference.quantization.rotational import (
@@ -173,6 +215,7 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
         uniform_shard_tokens=cfg.uniform_shard_tokens,
         roq_doc_codes=roq_doc_codes,
         roq_doc_meta=roq_doc_meta,
+        rroq158_payload=rroq158_payload,
     )
     build_s = time.time() - t0
     log.info("Shard store built in %.1fs", build_s)
@@ -182,22 +225,27 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
         router.save(index_dir / "router")
         log.info("Router saved to %s", index_dir / "router")
 
+    build_meta = {
+        "corpus_size": cfg.corpus_size,
+        "dim": dim,
+        "n_centroids": cfg.n_centroids,
+        "n_shards": cfg.n_shards,
+        "compression": cfg.compression.value,
+        "layout": cfg.layout.value,
+        "router_type": cfg.router_type.value,
+        "pooling_enabled": cfg.pooling.enabled,
+        "pool_factor": cfg.pooling.pool_factor,
+        "train_time_s": train_s,
+        "build_time_s": build_s,
+        "total_tokens": int(np.asarray(active_vectors).shape[0]),
+        "avg_tokens_per_doc": float(np.mean([e - s for s, e in active_offsets])),
+    }
+    if cfg.compression == Compression.RROQ158:
+        build_meta["rroq158_k"] = int(cfg.rroq158_k)
+        build_meta["rroq158_seed"] = int(cfg.rroq158_seed)
+        build_meta["rroq158_group_size"] = int(cfg.rroq158_group_size)
     with open(index_dir / "build_meta.json", "w") as f:
-        json.dump({
-            "corpus_size": cfg.corpus_size,
-            "dim": dim,
-            "n_centroids": cfg.n_centroids,
-            "n_shards": cfg.n_shards,
-            "compression": cfg.compression.value,
-            "layout": cfg.layout.value,
-            "router_type": cfg.router_type.value,
-            "pooling_enabled": cfg.pooling.enabled,
-            "pool_factor": cfg.pooling.pool_factor,
-            "train_time_s": train_s,
-            "build_time_s": build_s,
-            "total_tokens": int(np.asarray(active_vectors).shape[0]),
-            "avg_tokens_per_doc": float(np.mean([e - s for s, e in active_offsets])),
-        }, f, indent=2)
+        json.dump(build_meta, f, indent=2)
 
     gc.collect()
     log.info("Build complete. Index at %s, RSS=%.1f GB", index_dir, _mem_gb())

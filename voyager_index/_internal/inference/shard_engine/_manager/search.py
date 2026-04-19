@@ -543,6 +543,28 @@ class ShardSegmentManagerSearchMixin:
             if rroq_result is not None:
                 results, stage_stats = rroq_result
                 return results, exact_candidate_ids, "rroq158_pipeline", stage_stats
+            # If the rroq158 path returned None and *both* the Triton GPU lane
+            # and the Rust SIMD CPU kernel are unreachable, the shards on disk
+            # are rroq158-encoded with no fallback decoder; falling through
+            # would hand fp16-shaped requests to non-fp16 storage and silently
+            # return []. Fail loud instead so the operator can switch lanes.
+            if self._load_rroq158_meta() is not None:
+                cuda_available = dev.type == "cuda"
+                rust_available = False
+                try:
+                    import latence_shard_engine as _eng  # noqa: F401
+                    rust_available = hasattr(_eng, "rroq158_score_batch")
+                except ImportError:
+                    rust_available = False
+                if not cuda_available and not rust_available:
+                    raise RuntimeError(
+                        "rroq158 shards selected but neither the Triton GPU "
+                        "kernel (no CUDA available) nor the Rust SIMD CPU "
+                        "kernel (latence_shard_engine.rroq158_score_batch "
+                        "missing) is reachable. Install latence_shard_engine "
+                        "via `pip install latence-shard-engine`, or rebuild "
+                        "the index with `compression=Compression.FP16`."
+                    )
 
         if want_colbandit and self._pipeline is not None:
             results, stage_stats = self._score_pipeline_fetch(
