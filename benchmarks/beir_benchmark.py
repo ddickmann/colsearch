@@ -513,6 +513,103 @@ def _rroq158_score_candidates(
     )
 
 
+def _run_rroq158_cpu_mode(
+    name: str, index_dir: Path, all_vectors: np.ndarray, doc_offsets: list,
+    doc_ids: list, query_vecs: list, dim: int, params: dict,
+    n_workers: int = 8, n_warmup: int = 5,
+) -> Dict[str, Any]:
+    """CPU equivalent of `_run_rroq158_gpu_mode` — uses the Rust SIMD kernel
+    via `score_rroq158_topk(..., device='cpu')`.
+
+    The corpus is encoded once (CPU) into the same in-memory payload used
+    by the GPU path, but the tensors stay on CPU. Per-query LEMUR routing
+    runs on CPU, then candidate slicing + scoring uses the Rust kernel
+    inside `_rroq158_score_candidates`.
+
+    Workers are independent processes/threads each owning their own router
+    + payload reference (the underlying numpy arrays are shared via torch
+    so memory cost is the same as a single-worker run).
+    """
+    device = "cpu"
+    log.info("[rroq158-CPU] %s: loading LEMUR + encoding rroq158 ...", name)
+
+    payload = _build_rroq158_gpu_payload(all_vectors, doc_offsets, dim, params, device)
+    doc_ids_to_idx = {int(did): i for i, did in enumerate(doc_ids)}
+
+    worker_count = max(1, min(n_workers, len(query_vecs)))
+
+    routers = []
+    for _ in range(worker_count):
+        rt = LemurRouter(
+            index_dir / "lemur",
+            ann_backend=params["ann_backend"].value,
+            device=device,
+        )
+        rt.load()
+        routers.append(rt)
+
+    def _worker_search(qi: int, router: LemurRouter) -> Tuple[int, List[int], float]:
+        t0 = time.perf_counter()
+        qv = torch.from_numpy(query_vecs[qi]).float()
+        routed = router.route(
+            qv, k_candidates=params["k_candidates"],
+            prefetch_doc_cap=params["max_docs_exact"],
+        )
+        cand = list(routed.doc_ids[: params["max_docs_exact"]])
+        if not cand:
+            return qi, [], (time.perf_counter() - t0) * 1000
+        ids, _scores = _rroq158_score_candidates(
+            query_vecs[qi], payload, cand, doc_ids_to_idx, TOP_K, device,
+        )
+        return qi, ids, (time.perf_counter() - t0) * 1000
+
+    for w_idx in range(worker_count):
+        for qi in range(min(n_warmup, len(query_vecs))):
+            _worker_search(qi, routers[w_idx])
+
+    log.info("[rroq158-CPU] %s: running %d queries (%d workers) ...",
+             name, len(query_vecs), worker_count)
+    query_partitions = [
+        list(range(i, len(query_vecs), worker_count)) for i in range(worker_count)
+    ]
+
+    def _run_partition(router: LemurRouter, indices: List[int]) -> List[Tuple[int, List[int], float]]:
+        return [_worker_search(qi, router) for qi in indices]
+
+    wall_t0 = time.perf_counter()
+    all_results: List[Tuple[int, List[int], float]] = []
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [
+            pool.submit(_run_partition, router, indices)
+            for router, indices in zip(routers, query_partitions)
+            if indices
+        ]
+        for future in futures:
+            all_results.extend(future.result())
+    wall_s = time.perf_counter() - wall_t0
+
+    all_results.sort(key=lambda x: x[0])
+    all_ids = [r[1] for r in all_results]
+    all_elapsed = [r[2] for r in all_results]
+
+    qps = len(query_vecs) / wall_s if wall_s > 0 else 0
+    p50 = float(np.median(all_elapsed))
+    p95 = float(np.percentile(all_elapsed, 95))
+
+    del payload, routers
+    gc.collect()
+
+    return {
+        "mode": f"CPU-{worker_count}w",
+        "dataset": name,
+        "n_queries": len(query_vecs),
+        "all_ids": all_ids,
+        "qps": qps,
+        "p50_ms": p50,
+        "p95_ms": p95,
+    }
+
+
 def _run_rroq158_gpu_mode(
     name: str, index_dir: Path, all_vectors: np.ndarray, doc_offsets: list,
     doc_ids: list, query_vecs: list, dim: int, params: dict, n_warmup: int = 5,
@@ -888,17 +985,23 @@ def run_dataset(
             index_dir, build_s = build_index(name, all_vectors, doc_offsets, doc_ids, dim, params, device=device)
             indexing_throughput = n_docs / build_s if build_s > 0 else float("inf")
 
-            search_result = run_cpu_multiworker_mode(
-                name,
-                index_dir,
-                all_vectors,
-                doc_offsets,
-                doc_ids,
-                eval_query_vecs,
-                dim,
-                params,
-                n_workers=n_workers,
-            )
+            if compression == Compression.RROQ158:
+                search_result = _run_rroq158_cpu_mode(
+                    name, index_dir, all_vectors, doc_offsets, doc_ids,
+                    eval_query_vecs, dim, params, n_workers=n_workers,
+                )
+            else:
+                search_result = run_cpu_multiworker_mode(
+                    name,
+                    index_dir,
+                    all_vectors,
+                    doc_offsets,
+                    doc_ids,
+                    eval_query_vecs,
+                    dim,
+                    params,
+                    n_workers=n_workers,
+                )
             metrics = evaluate(search_result["all_ids"], graded_qrels, len(eval_query_vecs))
 
             results.append({

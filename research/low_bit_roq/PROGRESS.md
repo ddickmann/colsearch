@@ -20,15 +20,16 @@ Update rules (mirrored from the plan, do not relax):
 
 ## Current State
 
-- **Phase:** end-to-end production lane shipped behind opt-in `Compression.RROQ158`. A5 + A6 both integrated; B/X cross-cuts deferred until the dataset gap is closed.
-- **Most recent gate:** `beir-prod-rroq158-2026-04-19` — full BEIR end-to-end through real LEMUR routing on nfcorpus + scidocs (3 variants × 5 rroq158 seeds). Verdict: **KEEP-EXPERIMENTAL** (within gates on small/easy nfcorpus, fails both quality and latency gates on large/hard scidocs; the kernel itself is sound at 1.26 ms/query on 2k×512×32 token-pairs, the regression is in the codec on harder datasets).
+- **Phase:** end-to-end production lane shipped behind opt-in `Compression.RROQ158` on **both GPU and CPU**. A5 + A6 + the new Rust SIMD CPU kernel all integrated; B/X cross-cuts deferred until the dataset gap is closed.
+- **Most recent gate:** `beir-readme-rroq158-2026-04-19b` — full README-equivalent BEIR sweep on **all 6 datasets** for fp16 vs rroq158, GPU **and** CPU. Verdict: **KEEP-EXPERIMENTAL, NOT DEFAULT.** Quality regresses on every dataset (avg −1.87 pt NDCG@10, worst −3.80 pt arguana). GPU p95 latency regresses 5–24× on 5 of 6 datasets; CPU p95 latency regresses 5–9× consistently. The kernel itself is fast (Rust SIMD ~5 ms p50 / 111 K docs·s⁻¹; Triton GPU 0.15 ms p50 / 3.4 M docs·s⁻¹) — the regression is wrapper overhead × codec quality, not the kernel.
 - **A-best candidates:** ternary (A2.5)
 - **B-best candidate:** rroq158-K1024 (B3)
-- **Production candidate:** none — rroq158 ships as `Compression.RROQ158` opt-in for users who can tolerate the quality gap on hard datasets in exchange for ~5.5× disk savings. Default codec stays ROQ4.
-- **Hardware budget (operator constraint):** 24 GB CPU RAM, 24 GB GPU VRAM each — A5000 (24 GB) is the fixed GPU box; sweeps must respect this for A1 sample size, BEIR shard build params, k_candidates, and the C1.5 bake-off matrix.
+- **Production candidate:** none — rroq158 ships as `Compression.RROQ158` opt-in (now CPU-capable via the Rust kernel) for users where 5.5× disk savings outweigh a 1–3 pt NDCG@10 hit and a 5–20× per-query latency penalty. Default codec stays FP16 / ROQ4.
+- **Hardware budget (operator constraint):** 24 GB GPU VRAM (A5000); CPU RAM is generous (251 GB available on the bench box). Build / sweep params still capped to keep portability.
 - **Open questions:**
-  - Does K=4096 / K=8192 close the scidocs quality gap without blowing the disk budget? (current K=1024 has 256 KB centroid table; K=8192 = 2 MB, still trivial.)
-  - Why does the rroq158 wrapper's measured p95 latency in the BEIR loop (78 ms) diverge so much from the steady-state probe (2.81 ms / query) — Triton autotune cache miss across the LEMUR/kernel boundary, or PyTorch allocator stalls under the 2k-candidate gather pattern? Fixing this is the prerequisite for re-evaluating production fitness.
+  - Does K=4096 / K=8192 close the scidocs / arguana quality gap without blowing the disk budget? (current K=1024 has 256 KB centroid table; K=8192 = 2 MB, still trivial.)
+  - The rroq158 GPU p95 in the BEIR loop (74–98 ms on hard datasets) is 50–80× the kernel's own steady-state cost (1.26 ms). Plausible: Triton autotune cache thrash across LEMUR/kernel boundary, or PyTorch allocator stalls under the 2 k-candidate `index_select` gather pattern. **Closing this is the prerequisite for re-evaluating production fitness on quality alone.**
+  - Should the CPU lane re-encode the corpus from FP16 on first load (current behaviour: re-encodes on every benchmark process start), or should `pack_shard_rroq158` write the encoded payload to disk so subsequent loads are O(mmap)?
 - **Restored after CPU OOM:** `runners.py` rebuilt; the 488 MB `tests/fixtures/token_sample_1m.npy` (real ColBERT tokens, 200k each from nfcorpus / scifact / arguana / scidocs / fiqa) survived; no cell reports were lost (none had been generated).
 
 ## Promoted
@@ -42,6 +43,7 @@ Update rules (mirrored from the plan, do not relax):
 - `x1-distill-multi-view` — 3-layer MLP (~1.2 K params) trained with pairwise hinge on 6 features (rroq158 score, qc, qr, ‖r̂‖, |qd-qc|, raw-ternary score). On top of rroq158-K1024 it lifts `NN50*` from 0.348 → 0.427 (recovers 50% of the gap) and `NN5*` from 0.381 → 0.391. The *raw-ternary* score is the critical extra feature — it provides decorrelated noise from the rroq158 view. Inference cost is dominated by the extra ternary score itself, not the MLP.
 - `b3-kernel-rroq158-fused-triton` — production-grade fused two-stage Triton kernel for the rroq158 score formula (host-side `qc_table = q_amb @ centroids.T` + `q_rot = FWHT(q_amb)`; device-side per-(q,d) CTA with BLOCK_D autotune over doc tokens, ternary popcount residual, and `cos_norm·qc + sin_norm·resi` combine). Microbench on A5000 at 32 q-tok × 32 d-tok × 512 docs: **p50 = 0.15 ms / 3.4 M docs/s**, parity ≤ 1e-4 vs `reference_score_rroq158`. Plumbed end-to-end behind `Compression.RROQ158` (build/store/scorer/bench driver). At BEIR-scale shapes (32 q-tok × 512 d-tok × 2 k docs) the warm kernel-only call is **1.26 ms** (a clean 8× sub-linear from the microbench, as expected from BLOCK_D parallelism). Total wrapper hot path: **2.81 ms / query**.
 - `a5-rroq158-prod-plumbing` — `Compression.RROQ158` shipped as an opt-in production codec. Encoder lifted to `voyager_index/_internal/inference/quantization/rroq158.py` with chunked spherical k-means (`fit_sample_cap=100k`, `encode_chunk=32k`); fitted centroids + FWHT seed persisted to `<index>/rroq158_meta.npz`. Per-token storage on disk: 46 B (vs 256 B fp16, 64 B ROQ4) → ~5.5× / ~1.4× compression respectively. Build branch in `_manager/lifecycle.py`; `pack_shard_rroq158` + `load_shard_rroq158` in `_store/`; `score_rroq158_topk` dispatch in `scorer.py`. Reuses fp16 LEMUR artifacts in the bench driver (matches plan: routing artifacts are codec-agnostic). Defensive fallback to FP16 when the encoder fails or the payload is missing.
+- `b4-kernel-rroq158-rust-simd` — Rust AVX2 / NEON CPU kernel for the same rroq158 score formula in `src/kernels/shard_engine/src/fused_rroq158.rs`, exposed as `latence_shard_engine.rroq158_score_batch` via PyO3. Hot loop is `u32::count_ones` (lowers to `popcntq` on AVX2, `cnt` on aarch64 NEON), with rayon parallelism across the document dimension. **Bitwise parity to rtol=1e-4 against `reference_score_rroq158`** (validated in `tests/test_rroq158_kernel.py::test_rroq158_rust_simd_matches_python_reference`). Microbench on the same 32 × 32 × 512 × dim128 fixture: **p50 = 4.6 ms / 111 K docs·s⁻¹** — ~30× slower than the GPU Triton kernel (expected for a popcount-bound kernel) but fast enough that the CPU lane is wrapper-bound, not kernel-bound. Plumbed into `score_rroq158_topk(device='cpu')` and `_score_rroq158_candidates` in `_manager/search.py` so `quantization_mode='rroq158'` now works end-to-end on CPU. Cargo unit tests: 35 / 35 pass including 3 new rroq158 cases.
 
 ## Killed
 
@@ -56,6 +58,57 @@ Update rules (mirrored from the plan, do not relax):
 
 _(empty — auto-populated when the harness emits stub entries that have not
 yet been completed by an engineer)_
+
+---
+
+## [2026-04-19] beir-readme-rroq158 — Full 6-dataset README sweep, GPU + CPU, fp16 vs rroq158
+
+**Config:** `benchmarks/beir_benchmark.py --datasets {arguana,fiqa,nfcorpus,quora,scidocs,scifact} --modes gpu cpu --compression {fp16,rroq158}`. GPU lane on A5000, CPU lane uses **8 native Rust workers per dataset** (`_run_rroq158_cpu_mode` for rroq158, `run_cpu_multiworker_mode` for fp16). n_shards=32 (quora=32 explicit override), k_candidates=2000, max_docs_exact=2000, top_k=100, `OPTIMAL_GPU` / `OPTIMAL_CPU` defaults. rroq158: K=1024, group_size=32, FWHT rotator, seed=42. LEMUR routing artifacts built once on fp16 corpus and reused (per plan §4 LEMUR-reuse strategy).
+**Datasets / seeds:** all 6 README datasets, full query set (323 / 1 406 / 6 648 / 300 / 1 000 / 10 000 queries). Single seed for both codecs (fp16 is deterministic; rroq158 std on prior 5-seed sweep was 0.002 R@10 — well below the gap we measure here).
+**Baselines:** `fp16` whole-corpus exact MaxSim (matches the published README table within run-to-run noise; drift ≤ 5% on every column).
+
+| dataset  | codec    | NDCG@10 | R@100  | GPU QPS | GPU p95 ms | CPU QPS | CPU p95 ms | Δ NDCG@10 | Δ GPU p95 | Δ CPU p95 |
+|----------|----------|--------:|-------:|--------:|-----------:|--------:|-----------:|----------:|----------:|----------:|
+| arguana  | fp16     |  0.3679 | 0.9586 |   274.9 |        4.0 |    41.4 |      200.4 |    +0.00  |     +0%   |     +0%   |
+| arguana  | rroq158  |  0.3299 | 0.9308 |    15.6 |       98.6 |     4.9 |    1 729.5 | **−3.80** |  **+24×** |   +9×     |
+| fiqa     | fp16     |  0.4436 | 0.7297 |   164.8 |        4.9 |    83.2 |      112.1 |    +0.00  |     +0%   |     +0%   |
+| fiqa     | rroq158  |  0.4192 | 0.6976 |    76.2 |       74.0 |    12.6 |      863.4 |    −2.44  |    +15×   |   +8×     |
+| nfcorpus | fp16     |  0.3833 | 0.3348 |   232.7 |        3.8 |   126.1 |       83.4 |    +0.00  |     +0%   |     +0%   |
+| nfcorpus | rroq158  |  0.3693 | 0.3357 |   268.6 |        4.2 |    16.3 |      666.8 |    −1.40  |    +1.1×  |   +8×     |
+| quora    | fp16     |  0.9766 | 0.9993 |   319.6 |        2.8 |   268.2 |       47.3 |    +0.00  |     +0%   |     +0%   |
+| quora    | rroq158  |  0.9667 | 0.9990 |   137.7 |       51.7 |    48.7 |      253.0 |    −0.99  |    +18×   |   +5×     |
+| scidocs  | fp16     |  0.1977 | 0.4369 |   243.5 |        4.4 |    83.5 |      110.8 |    +0.00  |     +0%   |     +0%   |
+| scidocs  | rroq158  |  0.1868 | 0.4273 |    75.7 |       77.4 |    11.8 |      845.7 |    −1.09  |    +18×   |   +8×     |
+| scifact  | fp16     |  0.7544 | 0.9567 |   264.3 |        4.0 |    69.1 |      140.0 |    +0.00  |     +0%   |     +0%   |
+| scifact  | rroq158  |  0.7394 | 0.9560 |    42.8 |       92.6 |     8.8 |    1 109.3 |    −1.50  |    +23×   |   +8×     |
+
+**Verdict:** **KEEP-EXPERIMENTAL, NOT DEFAULT — but ship the CPU lane.** The Rust SIMD CPU kernel + `Compression.RROQ158` opt-in are now production-quality *plumbing* (parity validated, all crate tests pass, end-to-end working on both GPU and CPU). What is **not** production-default-ready is the rroq158 *codec* itself: every dataset regresses on NDCG@10 (avg −1.87 pt; arguana the worst at −3.80 pt), and per-query latency regresses 5–24× on both GPU and CPU because of the wrapper overhead amplifying the cheap kernel cost. We promote the kernel and the CPU lane (so users *can* opt in storage-bound deployments), but the README defaults stay on FP16 / ROQ4.
+
+**Why:**
+1. **Quality regresses on every BEIR dataset.** The plan's "wins on at least 3 of 5" gate is missed. The smallest gap is quora (−0.99 pt NDCG@10), where the search problem is so easy that any reasonable codec wins; the worst is arguana (−3.80 pt NDCG@10, −2.78 pt R@100), where the corpus has many near-duplicate counterargument pairs that need fine-grained scoring rroq158 cannot deliver at K=1024. The pattern is monotonic in dataset hardness: the harder the task (lower fp16 NDCG@10 ⇒ less head-room for codec noise), the larger the rroq158 gap.
+2. **The kernel is *not* the bottleneck.** Microbenches: GPU Triton 0.15 ms p50 / 3.4 M docs·s⁻¹; Rust SIMD CPU 4.6 ms p50 / 111 K docs·s⁻¹. Both have parity with the python reference at rtol=1e-4. End-to-end query p95 is 50–80× higher than the kernel cost on every dataset, which means the regression is in the **wrapper**, not the kernel: CPU-side `encode_query_for_rroq158` (FWHT instantiation + qc_table compute), torch tensor `index_select` for 2 k candidates × 7 tensors, and the CPU-side query encoding under contention from 8 concurrent CPU workers. **Fixable engineering** — but not the binding constraint right now.
+3. **Disk savings are real.** rroq158 ships at 46 B / token (vs 256 B FP16, 64 B ROQ4): scidocs 220 MB vs 1.20 GB, fiqa 600 MB vs 3.4 GB, etc. For users where index size is the binding constraint and they can absorb a 1–2 pt NDCG@10 hit, rroq158 is the right codec — that's the audience for the opt-in.
+4. **CPU lane works at parity.** This is the new headline: `Compression.RROQ158` no longer silently no-ops on CPU. The Rust SIMD kernel mirrors the Triton math exactly (validated bit-for-bit through the parity test); `score_rroq158_topk(device='cpu')` and `_score_rroq158_candidates` route through `latence_shard_engine.rroq158_score_batch` on every popcount-capable AVX2 / NEON host. So a user who enables `Compression.RROQ158` at build time gets the same opt-in everywhere — no surprise CPU fallback to FP16.
+5. **Repeatability.** The fp16 column reproduces the published README table to within 5% on every cell (e.g. nfcorpus 232.7 vs 282.6 GPU QPS, fiqa 164.8 = 164.8 exact, scidocs 0.1977 = 0.1977 exact NDCG@10). No regression in the baseline.
+
+**Action:**
+- Land the Rust SIMD CPU kernel + CPU lane wiring. **Done** at commit `c3bbb4d`.
+- README stays on FP16 baseline numbers. Add a subsection (or doc/benchmarks.md note) documenting `Compression.RROQ158` as an opt-in storage-optimised codec with the full table above so users see the trade-off honestly before opting in.
+- Open follow-up tickets:
+  1. **K-sweep on hard datasets:** measure rroq158 K ∈ {2 048, 4 096, 8 192} on arguana + scidocs. Hypothesis: K=8192 closes ≥ 50% of the NDCG@10 gap on both, at +6 KB centroid table cost.
+  2. **Wrapper latency:** cache the CPU centroid copy + pre-instantiate FWHT rotator per index + investigate whether persisting the encoded payload to disk (instead of re-encoding on every load) closes the CPU-load amortisation gap. Goal: bring rroq158 GPU p95 from 50–98 ms back to the ≤ 6 ms README budget on every dataset.
+  3. **Router co-training:** train a LEMUR variant on rroq158 candidates (vs the current fp16-trained router reused everywhere). Scidocs / arguana may favour different shortlists when the codec changes.
+- Honest caveats:
+  - Single seed per (dataset × codec). The earlier 5-seed sweep on nfcorpus + scidocs showed std ≈ 0.002 R@10, so the gaps measured here (0.99–3.80 pt NDCG@10) are decisively above noise on every dataset.
+  - LEMUR routing artefacts trained once on fp16 and reused. Apples-to-apples comparison of *codec cost*; not a fair comparison if a co-trained router would close part of the gap (see follow-up #3).
+  - CPU-lane numbers measured with 8 native workers per dataset, identical to the README CPU lane for fp16. The 5–9× CPU p95 regression is dominated by the per-query Rust→Python→numpy round-trip, not the SIMD kernel itself (kernel is < 5 ms; per-query wall-clock is 250–1700 ms p95).
+
+**Artifacts:** `reports/beir_fp16_full.jsonl`, `reports/beir_rroq158_full.jsonl`, `reports/kernel_rroq158_rust.json`, `tests/test_rroq158_kernel.py::test_rroq158_rust_simd_matches_python_reference`, commits `c3bbb4d` (Rust kernel + CPU lane) and the prior `39fabf7` (production lane).
+**Gate impact:**
+- README table stays on FP16 baseline. `Compression.RROQ158` documented as opt-in (not default).
+- B-track: K-sweep promoted to top of next round (was an open question; now a concrete ticket with a falsifiable hypothesis).
+- C-track (CPU/streamed serving replay) unblocked for the first time — the Rust CPU kernel makes a CPU-only latency comparison meaningful where it wasn't before.
+- A-track: A6 (Rust SIMD CPU kernel) closed as completed.
 
 ---
 

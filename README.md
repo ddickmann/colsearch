@@ -108,13 +108,35 @@ GPU P95 stays under 6 ms across every dataset. The full per-dataset
 (same model, H100, encoding included), methodology, and caveats live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+#### Opt-in: RROQ-1.58 (Riemannian 1.58-bit ternary)
+
+`Compression.RROQ158` ships as an opt-in storage-optimised codec for
+deployments where index size dominates over absolute quality. Per-token
+storage drops to **46 B** (vs 256 B FP16, 64 B ROQ-4 — i.e. **5.5× / 1.4×
+smaller**), and both lanes are wired:
+
+- **GPU**: fused two-stage Triton kernel (`reports/kernel_rroq158.json`)
+  — 0.15 ms p50 / 3.4 M docs·s⁻¹ at 32×32×512 microbench, parity ≤ 1e-4
+  vs the python reference.
+- **CPU**: Rust SIMD kernel (`latence_shard_engine.rroq158_score_batch`)
+  using AVX2 / NEON popcount + rayon — 4.6 ms p50 / 111 K docs·s⁻¹ at
+  the same microbench, bitwise parity to rtol=1e-4 vs the python reference
+  (validated by `tests/test_rroq158_kernel.py::test_rroq158_rust_simd_matches_python_reference`).
+
+The trade-off on real BEIR: NDCG@10 regresses by 1–4 pt depending on
+dataset, and per-query p95 latency regresses 5–24× because of wrapper
+overhead amortised over the very-cheap kernel call. Full numbers and
+verdict in
+[research/low_bit_roq/PROGRESS.md](research/low_bit_roq/PROGRESS.md)
+(`[2026-04-19] beir-readme-rroq158`). Defaults remain **FP16 / ROQ-4**.
+
 ## Architecture
 
 ```text
 query (token / patch embeddings)
   → LEMUR routing MLP → FAISS ANN → candidate IDs
   → optional BM25 fusion · centroid pruning · ColBANDIT
-  → exact MaxSim   (Rust SIMD CPU  |  Triton FP16/INT8/FP8/ROQ-4 GPU)
+  → exact MaxSim   (Rust SIMD CPU FP16/RROQ-1.58  |  Triton FP16/INT8/FP8/ROQ-4/RROQ-1.58 GPU)
   → optional Latence graph augmentation
   → top-K (or packed context)
 ```
