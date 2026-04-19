@@ -73,6 +73,14 @@ class ShardSegmentManagerSearchMixin:
                 seed = int(np.asarray(arr["fwht_seed"]).item())
                 dim = int(np.asarray(arr["dim"]).item())
                 group_size = int(np.asarray(arr["group_size"]).item())
+                # k_requested / k_effective were added in 2026-04: older
+                # indexes lack them and we treat such shards as production
+                # full-K (no auto-shrink) for the loud-fail policy.
+                k_effective = int(centroids.shape[0])
+                k_requested = (
+                    int(np.asarray(arr["k_requested"]).item())
+                    if "k_requested" in arr.files else k_effective
+                )
             try:
                 from voyager_index._internal.inference.quantization.rroq4_riem import (
                     get_cached_fwht_rotator,
@@ -86,6 +94,8 @@ class ShardSegmentManagerSearchMixin:
                 "dim": dim,
                 "group_size": group_size,
                 "rotator": rotator,
+                "k_requested": k_requested,
+                "k_effective": k_effective,
             }
             logger.info(
                 "RROQ4_RIEM meta loaded: K=%d, dim=%d, group_size=%d "
@@ -130,6 +140,14 @@ class ShardSegmentManagerSearchMixin:
                 seed = int(np.asarray(arr["fwht_seed"]).item())
                 dim = int(np.asarray(arr["dim"]).item())
                 group_size = int(np.asarray(arr["group_size"]).item())
+                # k_requested / k_effective were added in 2026-04: older
+                # indexes lack them and we treat such shards as production
+                # full-K (no auto-shrink) for the loud-fail policy.
+                k_effective = int(centroids.shape[0])
+                k_requested = (
+                    int(np.asarray(arr["k_requested"]).item())
+                    if "k_requested" in arr.files else k_effective
+                )
             try:
                 from voyager_index._internal.inference.quantization.rroq158 import (
                     get_cached_fwht_rotator,
@@ -143,6 +161,8 @@ class ShardSegmentManagerSearchMixin:
                 "dim": dim,
                 "group_size": group_size,
                 "rotator": rotator,
+                "k_requested": k_requested,
+                "k_effective": k_effective,
             }
             logger.info(
                 "RROQ158 meta loaded: K=%d, dim=%d, group_size=%d (rotator cached: %s)",
@@ -810,10 +830,25 @@ class ShardSegmentManagerSearchMixin:
                 return results, exact_candidate_ids, "rroq158_pipeline", stage_stats
             # If the rroq158 path returned None and *both* the Triton GPU lane
             # and the Rust SIMD CPU kernel are unreachable, the shards on disk
-            # are rroq158-encoded with no fallback decoder; falling through
-            # would hand fp16-shaped requests to non-fp16 storage and silently
-            # return []. Fail loud instead so the operator can switch lanes.
-            if self._load_rroq158_meta() is not None:
+            # are rroq158-encoded with no fallback decoder. There are two
+            # operationally distinct cases:
+            #
+            # 1. The corpus is large enough that K==K_requested (production
+            #    rroq158 build): the shard has codes that the runtime cannot
+            #    decode at all → loud fail so the operator can install the
+            #    Rust wheel or rebuild with FP16.
+            # 2. The corpus was small enough that K auto-shrunk
+            #    (k_effective < k_requested, typical only for tests / demos
+            #    / very small shards): rroq158 was a near-no-op anyway, the
+            #    shard also carries the FP16 embeddings as a side payload,
+            #    and the user clearly didn't pick rroq158 for production
+            #    quality. Demote to FP16 with a single WARNING and let the
+            #    fall-through to ``_score_pipeline_fetch`` use the FP16
+            #    embeddings tensor that ``pack_shard_rroq158`` writes
+            #    alongside the codes. This is what keeps the OSS test
+            #    matrix green on a CPU-only runner without the Rust wheel.
+            rroq158_meta = self._load_rroq158_meta()
+            if rroq158_meta is not None:
                 cuda_available = dev.type == "cuda"
                 rust_available = False
                 try:
@@ -822,14 +857,36 @@ class ShardSegmentManagerSearchMixin:
                 except ImportError:
                     rust_available = False
                 if not cuda_available and not rust_available:
-                    raise RuntimeError(
-                        "rroq158 shards selected but neither the Triton GPU "
-                        "kernel (no CUDA available) nor the Rust SIMD CPU "
-                        "kernel (latence_shard_engine.rroq158_score_batch "
-                        "missing) is reachable. Install latence_shard_engine "
-                        "via `pip install latence-shard-engine`, or rebuild "
-                        "the index with `compression=Compression.FP16`."
-                    )
+                    k_eff = int(rroq158_meta.get("k_effective", 0) or 0)
+                    k_req = int(rroq158_meta.get("k_requested", 0) or 0)
+                    if k_eff > 0 and k_req > k_eff:
+                        logger.warning(
+                            "rroq158 shards present but no decoder kernel is "
+                            "reachable on this host (no CUDA, "
+                            "latence_shard_engine.rroq158_score_batch missing); "
+                            "K auto-shrunk to %d (< requested %d) so this is "
+                            "a tiny corpus (test / demo). Demoting this query "
+                            "to the FP16 pipeline using the embeddings tensor "
+                            "stored alongside the rroq158 codes. Install "
+                            "latence-shard-engine to use the rroq158 lane.",
+                            k_eff, k_req,
+                        )
+                        # Strip the rroq158 mode so downstream score paths
+                        # (pipeline_fetch / Triton fast_colbert_scores) take
+                        # the canonical FP16 lane on the side embeddings.
+                        try:
+                            scfg.quantization_mode = ""
+                        except Exception:
+                            pass
+                    else:
+                        raise RuntimeError(
+                            "rroq158 shards selected but neither the Triton GPU "
+                            "kernel (no CUDA available) nor the Rust SIMD CPU "
+                            "kernel (latence_shard_engine.rroq158_score_batch "
+                            "missing) is reachable. Install latence_shard_engine "
+                            "via `pip install latence-shard-engine`, or rebuild "
+                            "the index with `compression=Compression.FP16`."
+                        )
 
         if want_rroq4_riem:
             # rroq4_riem works on both CUDA (Triton) and CPU (Rust SIMD).
@@ -842,10 +899,11 @@ class ShardSegmentManagerSearchMixin:
             if rroq_result is not None:
                 results, stage_stats = rroq_result
                 return results, exact_candidate_ids, "rroq4_riem_pipeline", stage_stats
-            # Same loud-fail policy as rroq158: shards are encoded with a
-            # codec the runtime can't decode, falling through silently
-            # would empty out result rows.
-            if self._load_rroq4_riem_meta() is not None:
+            # Same two-case policy as rroq158 above: production-K shards
+            # → loud fail, K-shrunk tiny-corpus shards → FP16 fallback via
+            # the embeddings side tensor.
+            rroq4_riem_meta = self._load_rroq4_riem_meta()
+            if rroq4_riem_meta is not None:
                 cuda_available = dev.type == "cuda"
                 rust_available = False
                 try:
@@ -854,14 +912,34 @@ class ShardSegmentManagerSearchMixin:
                 except ImportError:
                     rust_available = False
                 if not cuda_available and not rust_available:
-                    raise RuntimeError(
-                        "rroq4_riem shards selected but neither the Triton GPU "
-                        "kernel (no CUDA available) nor the Rust SIMD CPU "
-                        "kernel (latence_shard_engine.rroq4_riem_score_batch "
-                        "missing) is reachable. Install latence_shard_engine "
-                        "via `pip install latence-shard-engine`, or rebuild "
-                        "the index with `compression=Compression.FP16`."
-                    )
+                    k_eff = int(rroq4_riem_meta.get("k_effective", 0) or 0)
+                    k_req = int(rroq4_riem_meta.get("k_requested", 0) or 0)
+                    if k_eff > 0 and k_req > k_eff:
+                        logger.warning(
+                            "rroq4_riem shards present but no decoder kernel "
+                            "is reachable on this host (no CUDA, "
+                            "latence_shard_engine.rroq4_riem_score_batch "
+                            "missing); K auto-shrunk to %d (< requested %d) "
+                            "so this is a tiny corpus (test / demo). Demoting "
+                            "this query to the FP16 pipeline using the "
+                            "embeddings tensor stored alongside the rroq4_riem "
+                            "codes. Install latence-shard-engine to use the "
+                            "rroq4_riem lane.",
+                            k_eff, k_req,
+                        )
+                        try:
+                            scfg.quantization_mode = ""
+                        except Exception:
+                            pass
+                    else:
+                        raise RuntimeError(
+                            "rroq4_riem shards selected but neither the Triton GPU "
+                            "kernel (no CUDA available) nor the Rust SIMD CPU "
+                            "kernel (latence_shard_engine.rroq4_riem_score_batch "
+                            "missing) is reachable. Install latence_shard_engine "
+                            "via `pip install latence-shard-engine`, or rebuild "
+                            "the index with `compression=Compression.FP16`."
+                        )
 
         if want_colbandit and self._pipeline is not None:
             results, stage_stats = self._score_pipeline_fetch(

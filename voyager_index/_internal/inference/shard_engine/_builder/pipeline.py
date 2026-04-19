@@ -182,6 +182,8 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
                 fwht_seed=np.array(rroq158_payload.fwht_seed, dtype=np.int64),
                 dim=np.array(rroq158_payload.dim, dtype=np.int32),
                 group_size=np.array(rroq158_payload.group_size, dtype=np.int32),
+                k_requested=np.array(int(cfg.rroq158_k), dtype=np.int32),
+                k_effective=np.array(effective_k, dtype=np.int32),
             )
             log.info(
                 "RROQ158 encoding done in %.1fs (%d tokens, K=%d)",
@@ -230,6 +232,8 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
                 fwht_seed=np.array(rroq4_riem_payload.fwht_seed, dtype=np.int64),
                 dim=np.array(rroq4_riem_payload.dim, dtype=np.int32),
                 group_size=np.array(rroq4_riem_payload.group_size, dtype=np.int32),
+                k_requested=np.array(int(cfg.rroq4_riem_k), dtype=np.int32),
+                k_effective=np.array(effective_k, dtype=np.int32),
             )
             log.info(
                 "RROQ4_RIEM encoding done in %.1fs (%d tokens, K=%d)",

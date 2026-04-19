@@ -288,10 +288,7 @@ class CreateCollectionRequest(BaseModel):
         default=None,
         ge=32,
         le=65536,
-        description=(
-            "rroq158 spherical k-means centroid count. Power of two and "
-            ">= rroq158_group_size. Default 8192."
-        ),
+        description=("rroq158 spherical k-means centroid count. Power of two and >= rroq158_group_size. Default 8192."),
     )
     rroq158_seed: Optional[int] = Field(
         default=None,
@@ -309,8 +306,7 @@ class CreateCollectionRequest(BaseModel):
         ge=32,
         le=65536,
         description=(
-            "rroq4_riem spherical k-means centroid count. Power of two and "
-            ">= rroq4_riem_group_size. Default 8192."
+            "rroq4_riem spherical k-means centroid count. Power of two and >= rroq4_riem_group_size. Default 8192."
         ),
     )
     rroq4_riem_seed: Optional[int] = Field(
@@ -323,8 +319,7 @@ class CreateCollectionRequest(BaseModel):
         ge=2,
         le=4096,
         description=(
-            "rroq4_riem 4-bit asymmetric group size in coords. Even integer "
-            "(two coords per packed byte). Default 32."
+            "rroq4_riem 4-bit asymmetric group size in coords. Even integer (two coords per packed byte). Default 32."
         ),
     )
     transfer_mode: Optional[str] = Field(
@@ -367,7 +362,13 @@ class CreateCollectionRequest(BaseModel):
     def validate_kind_specific_options(self) -> "CreateCollectionRequest":
         valid_compressions = {"fp16", "int8", "roq4", "rroq158", "rroq4_riem"}
         valid_quant_modes = {
-            "", "none", "int8", "fp8", "roq4", "rroq158", "rroq4_riem",
+            "",
+            "none",
+            "int8",
+            "fp8",
+            "roq4",
+            "rroq158",
+            "rroq4_riem",
         }
         valid_transfer_modes = {"pageable", "pinned", "double_buffered"}
         if self.kind not in (CollectionKind.DENSE, CollectionKind.SHARD):
@@ -406,14 +407,9 @@ class CreateCollectionRequest(BaseModel):
                 raise ValueError("use_colbandit is only for shard collections")
         else:
             if self.compression is not None and self.compression not in valid_compressions:
-                raise ValueError(
-                    "compression must be one of: fp16, int8, roq4, rroq158, rroq4_riem"
-                )
+                raise ValueError("compression must be one of: fp16, int8, roq4, rroq158, rroq4_riem")
             if self.quantization_mode is not None and self.quantization_mode not in valid_quant_modes:
-                raise ValueError(
-                    "quantization_mode must be one of: '', none, int8, fp8, "
-                    "roq4, rroq158, rroq4_riem"
-                )
+                raise ValueError("quantization_mode must be one of: '', none, int8, fp8, roq4, rroq158, rroq4_riem")
             if self.transfer_mode is not None and self.transfer_mode not in valid_transfer_modes:
                 raise ValueError("transfer_mode must be one of: pageable, pinned, double_buffered")
             # rroq158 codebook constraints — same shape rules the python lane
@@ -431,18 +427,10 @@ class CreateCollectionRequest(BaseModel):
                 raise ValueError("rroq158_k must be >= rroq158_group_size")
             # rroq4_riem codebook constraints — same shape rules the python
             # lane enforces in `Rroq4RiemConfig`.
-            if (
-                self.rroq4_riem_k is not None
-                and (self.rroq4_riem_k & (self.rroq4_riem_k - 1)) != 0
-            ):
+            if self.rroq4_riem_k is not None and (self.rroq4_riem_k & (self.rroq4_riem_k - 1)) != 0:
                 raise ValueError("rroq4_riem_k must be a power of two")
-            if (
-                self.rroq4_riem_group_size is not None
-                and self.rroq4_riem_group_size % 2 != 0
-            ):
-                raise ValueError(
-                    "rroq4_riem_group_size must be a positive even integer"
-                )
+            if self.rroq4_riem_group_size is not None and self.rroq4_riem_group_size % 2 != 0:
+                raise ValueError("rroq4_riem_group_size must be a positive even integer")
             if (
                 self.rroq4_riem_k is not None
                 and self.rroq4_riem_group_size is not None
@@ -773,7 +761,13 @@ class SearchRequest(BaseModel):
     @model_validator(mode="after")
     def validate_query(self) -> "SearchRequest":
         valid_quant_modes = {
-            "", "none", "int8", "fp8", "roq4", "rroq158", "rroq4_riem",
+            "",
+            "none",
+            "int8",
+            "fp8",
+            "roq4",
+            "rroq158",
+            "rroq4_riem",
         }
         valid_transfer_modes = {"pageable", "pinned", "double_buffered"}
         if self.vector is None and self.vectors is None and not self.query_text:
@@ -781,10 +775,7 @@ class SearchRequest(BaseModel):
         if self.vector is not None and self.vectors is not None:
             raise ValueError("Provide only one of 'vector' or 'vectors'")
         if self.quantization_mode is not None and self.quantization_mode not in valid_quant_modes:
-            raise ValueError(
-                "quantization_mode must be one of: '', none, int8, fp8, roq4, "
-                "rroq158, rroq4_riem"
-            )
+            raise ValueError("quantization_mode must be one of: '', none, int8, fp8, roq4, rroq158, rroq4_riem")
         if self.transfer_mode is not None and self.transfer_mode not in valid_transfer_modes:
             raise ValueError("transfer_mode must be one of: pageable, pinned, double_buffered")
         return self

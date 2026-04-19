@@ -244,6 +244,10 @@ class ShardSegmentManagerLifecycleMixin:
                         group_size=np.array(
                             rroq158_payload.group_size, dtype=np.int32
                         ),
+                        k_requested=np.array(
+                            int(cfg.rroq158_k), dtype=np.int32
+                        ),
+                        k_effective=np.array(effective_k, dtype=np.int32),
                     )
                     logger.info(
                         "RROQ158 encoding done for %d docs (%d tokens, K=%d)",
@@ -310,6 +314,10 @@ class ShardSegmentManagerLifecycleMixin:
                         group_size=np.array(
                             rroq4_riem_payload.group_size, dtype=np.int32
                         ),
+                        k_requested=np.array(
+                            int(cfg.rroq4_riem_k), dtype=np.int32
+                        ),
+                        k_effective=np.array(effective_k, dtype=np.int32),
                     )
                     logger.info(
                         "RROQ4_RIEM encoding done for %d docs (%d tokens, K=%d)",

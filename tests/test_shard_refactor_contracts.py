@@ -38,6 +38,7 @@ def _build_manager(path: Path, *, dim: int = 16) -> ShardSegmentManager:
     # 12-doc fixture is far too small for the new RROQ158 default (K=8192);
     # explicitly pin to FP16 so this contract test exercises the legacy lane.
     from voyager_index._internal.inference.shard_engine.config import Compression
+
     config = ShardEngineConfig(
         n_shards=3,
         dim=dim,

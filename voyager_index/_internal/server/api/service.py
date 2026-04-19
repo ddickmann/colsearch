@@ -495,9 +495,7 @@ class SearchService:
             shard_cfg = ShardEngineConfig(
                 dim=int(meta["dimension"]),
                 n_shards=int(meta.get("n_shards", 256)),
-                compression=Compression(
-                    str(meta.get("compression", Compression.RROQ158.value))
-                ),
+                compression=Compression(str(meta.get("compression", Compression.RROQ158.value))),
                 k_candidates=int(meta.get("k_candidates", 2000)),
                 max_docs_exact=int(meta.get("max_docs_exact", 10_000)),
                 n_full_scores=int(meta.get("n_full_scores", 4096)),
@@ -960,9 +958,7 @@ class SearchService:
                     meta["rroq158_group_size"] = int(getattr(request, "rroq158_group_size", None) or 32)
                     meta["rroq4_riem_k"] = int(getattr(request, "rroq4_riem_k", None) or 8192)
                     meta["rroq4_riem_seed"] = int(getattr(request, "rroq4_riem_seed", None) or 42)
-                    meta["rroq4_riem_group_size"] = int(
-                        getattr(request, "rroq4_riem_group_size", None) or 32
-                    )
+                    meta["rroq4_riem_group_size"] = int(getattr(request, "rroq4_riem_group_size", None) or 32)
                 try:
                     runtime = CollectionRuntime(
                         name=safe_name,
