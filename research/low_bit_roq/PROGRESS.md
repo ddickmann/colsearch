@@ -20,15 +20,15 @@ Update rules (mirrored from the plan, do not relax):
 
 ## Current State
 
-- **Phase:** B / cross-cut — recovery bench (B0+B3+X1) done offline; A5 LEMUR integration still deferred for memory headroom
-- **Most recent gate:** `recovery-2026-04-19` — composed B0 / B3 / X1 against ternary base; rroq158-K1024 + multi-view distill recovers 50% of the ternary→roq4 NN50* gap (0.219 → 0.427) at +1.25 B/tok
+- **Phase:** end-to-end production lane shipped behind opt-in `Compression.RROQ158`. A5 + A6 both integrated; B/X cross-cuts deferred until the dataset gap is closed.
+- **Most recent gate:** `beir-prod-rroq158-2026-04-19` — full BEIR end-to-end through real LEMUR routing on nfcorpus + scidocs (3 variants × 5 rroq158 seeds). Verdict: **KEEP-EXPERIMENTAL** (within gates on small/easy nfcorpus, fails both quality and latency gates on large/hard scidocs; the kernel itself is sound at 1.26 ms/query on 2k×512×32 token-pairs, the regression is in the codec on harder datasets).
 - **A-best candidates:** ternary (A2.5)
 - **B-best candidate:** rroq158-K1024 (B3)
-- **Production candidate:** ternary + rroq158-K1024 + multi-view X1 distill (composes with A5 once integrated)
+- **Production candidate:** none — rroq158 ships as `Compression.RROQ158` opt-in for users who can tolerate the quality gap on hard datasets in exchange for ~5.5× disk savings. Default codec stays ROQ4.
 - **Hardware budget (operator constraint):** 24 GB CPU RAM, 24 GB GPU VRAM each — A5000 (24 GB) is the fixed GPU box; sweeps must respect this for A1 sample size, BEIR shard build params, k_candidates, and the C1.5 bake-off matrix.
 - **Open questions:**
-  - Confirm BEIR baseline numbers reproduce within ±0.3 Recall@10 of the published `benchmarks/beir_results.jsonl` before any A1 cell runs.
-  - Decide H100 vs A5000 as the kernel-tuning target before starting A2 / A2.5 (assumed A5000 = primary; A1 mechanics is sample-size-bound on A5000, not GPU-bound).
+  - Does K=4096 / K=8192 close the scidocs quality gap without blowing the disk budget? (current K=1024 has 256 KB centroid table; K=8192 = 2 MB, still trivial.)
+  - Why does the rroq158 wrapper's measured p95 latency in the BEIR loop (78 ms) diverge so much from the steady-state probe (2.81 ms / query) — Triton autotune cache miss across the LEMUR/kernel boundary, or PyTorch allocator stalls under the 2k-candidate gather pattern? Fixing this is the prerequisite for re-evaluating production fitness.
 - **Restored after CPU OOM:** `runners.py` rebuilt; the 488 MB `tests/fixtures/token_sample_1m.npy` (real ColBERT tokens, 200k each from nfcorpus / scifact / arguana / scidocs / fiqa) survived; no cell reports were lost (none had been generated).
 
 ## Promoted
@@ -40,6 +40,8 @@ Update rules (mirrored from the plan, do not relax):
 - `a3-ternary-anisotropic-flag` — kept the `TernaryConfig.fit_method='anisotropic'` switch wired but as opt-in: marginal +1–2% IP-RMS over `tau_frac=0.5` doesn't justify making it the default at index time.
 - `b3-rroq158-K1024` — Riemannian ternary with K=1024 spherical centroids + tangent-residual ternary codes. Recovers 31% of the ternary→roq4 `rank_corr@100` gap (0.253 → 0.365) and 31% of the `NN50*` gap (0.219 → 0.348) at +1.25 B/tok overhead. Composes cleanly with the ternary kernel — same residual encoding, just with a per-token centroid_id added.
 - `x1-distill-multi-view` — 3-layer MLP (~1.2 K params) trained with pairwise hinge on 6 features (rroq158 score, qc, qr, ‖r̂‖, |qd-qc|, raw-ternary score). On top of rroq158-K1024 it lifts `NN50*` from 0.348 → 0.427 (recovers 50% of the gap) and `NN5*` from 0.381 → 0.391. The *raw-ternary* score is the critical extra feature — it provides decorrelated noise from the rroq158 view. Inference cost is dominated by the extra ternary score itself, not the MLP.
+- `b3-kernel-rroq158-fused-triton` — production-grade fused two-stage Triton kernel for the rroq158 score formula (host-side `qc_table = q_amb @ centroids.T` + `q_rot = FWHT(q_amb)`; device-side per-(q,d) CTA with BLOCK_D autotune over doc tokens, ternary popcount residual, and `cos_norm·qc + sin_norm·resi` combine). Microbench on A5000 at 32 q-tok × 32 d-tok × 512 docs: **p50 = 0.15 ms / 3.4 M docs/s**, parity ≤ 1e-4 vs `reference_score_rroq158`. Plumbed end-to-end behind `Compression.RROQ158` (build/store/scorer/bench driver). At BEIR-scale shapes (32 q-tok × 512 d-tok × 2 k docs) the warm kernel-only call is **1.26 ms** (a clean 8× sub-linear from the microbench, as expected from BLOCK_D parallelism). Total wrapper hot path: **2.81 ms / query**.
+- `a5-rroq158-prod-plumbing` — `Compression.RROQ158` shipped as an opt-in production codec. Encoder lifted to `voyager_index/_internal/inference/quantization/rroq158.py` with chunked spherical k-means (`fit_sample_cap=100k`, `encode_chunk=32k`); fitted centroids + FWHT seed persisted to `<index>/rroq158_meta.npz`. Per-token storage on disk: 46 B (vs 256 B fp16, 64 B ROQ4) → ~5.5× / ~1.4× compression respectively. Build branch in `_manager/lifecycle.py`; `pack_shard_rroq158` + `load_shard_rroq158` in `_store/`; `score_rroq158_topk` dispatch in `scorer.py`. Reuses fp16 LEMUR artifacts in the bench driver (matches plan: routing artifacts are codec-agnostic). Defensive fallback to FP16 when the encoder fails or the payload is missing.
 
 ## Killed
 
@@ -54,6 +56,50 @@ Update rules (mirrored from the plan, do not relax):
 
 _(empty — auto-populated when the harness emits stub entries that have not
 yet been completed by an engineer)_
+
+---
+
+## [2026-04-19] beir-prod-rroq158 — End-to-end through real LEMUR routing on nfcorpus + scidocs
+
+**Config:** `benchmarks/run_rroq158_prod_sweep.py` driving `benchmarks/beir_benchmark.py` with `--compression {fp16,roq4,rroq158}` and `--rroq158-seed 42..46`. GPU-corpus mode on A5000, n_shards=32, k_candidates=2000, max_docs_exact=2000, top_k=100, `OPTIMAL_GPU` defaults. rroq158: K=1024 spherical centroids, group_size=32, FWHT rotator. LEMUR routing artifacts built once on fp16 corpus (seed=42, 10 epochs) and reused across all three codecs (per plan §4 LEMUR-reuse strategy).
+**Datasets / seeds:** nfcorpus (323 queries, 3 633 docs, 0.86 M tokens) and scidocs (1 000 queries, 25 657 docs, 4.84 M tokens). fp16 / roq4 are deterministic at seed=42 (LEMUR train + GPU-corpus search have no further randomness, so a single run captures their full distribution); rroq158 was run for 5 seeds because the FWHT rotator and spherical k-means initialisation are seed-dependent.
+**Baselines:** fp16 (whole-corpus MaxSim) and roq4 (current production codec).
+
+| dataset  | variant   | R@10              | NDCG@10           | p95 ms        | QPS  | bytes/tok | Δ R@10 vs fp16 | Δ p95 vs fp16 |
+|----------|-----------|-------------------|-------------------|---------------|-----:|----------:|---------------:|--------------:|
+| nfcorpus | fp16      | 0.3404            | 0.3833            | 3.88          |  188 |       256 |          +0.00 |          +0.0% |
+| nfcorpus | roq4      | 0.3379            | 0.3800            | 3.84          |  286 |        64 |          −0.26 |          −1.1% |
+| nfcorpus | rroq158   | 0.3359 ± 0.0019   | 0.3729 ± 0.0029   | 4.20 ± 0.04   |  267 |        46 |          −0.45 |          +8.2% |
+| scidocs  | fp16      | 0.2070            | 0.1977            | 4.37          |  176 |       256 |          +0.00 |          +0.0% |
+| scidocs  | roq4      | 0.2076            | 0.1973            | 4.38          |  243 |        64 |          +0.05 |          +0.1% |
+| scidocs  | rroq158   | 0.1925 ± 0.0021   | 0.1850 ± 0.0015   | 77.94 ± 0.75  |   75 |        46 |          **−1.45** |     **+1682%** |
+
+**Verdict:** **KEEP-EXPERIMENTAL.** Ship the production-tree plumbing (`Compression.RROQ158`, encoder, kernel, store/scorer integration) as an **opt-in** codec for users who can tolerate the quality gap on hard datasets in exchange for ~5.5× disk savings. Do **not** promote to default. Default remains ROQ4. The `SearchConfig.distill_rerank` MV-distill toggle is wired but stays default-off — it still regresses Recall@10 on real BEIR (carries the recovery-bench finding through to production).
+
+**Why:**
+1. **The codec quality is dataset-dependent in a way the offline distortion bench did not capture.** On nfcorpus, rroq158 R@10 is within the 0.5-pt gate (−0.45 pt). On scidocs — larger (7× more docs), harder (lowest fp16 R@10 in BEIR) — the gap blows out to −1.45 pt. The recovery-2026-04-19 bench was 8 K tokens drawn uniformly across BEIR datasets; it predicted "K=1024 should hold" but did not stratify by per-dataset hardness. Two plausible mechanisms: (a) K=1024 is too few centroids for scidocs's tighter intra-cluster spread (scidocs is a citation-recommendation task, dense in topic-space), and/or (b) the LEMUR shortlist already filters out the easy positives at the routing stage, so the remaining 2 k candidates need *more* discriminative scoring than rroq158 provides.
+2. **The kernel is fast where it should be.** Microbench on A5000 (32×32×512): 0.15 ms p50, 3.4 M docs/sec. At BEIR shapes (32 × 512 × 2 k = 32 M token-pairs) the warm kernel-only call is 1.26 ms — a clean 8× sub-linear speedup vs the microbench despite 61× more work, because BLOCK_D parallelism amortises the per-CTA overhead. Total wrapper hot path is 2.81 ms / query, dominated by the CPU-side `encode_query_for_rroq158` (0.89 ms — fresh torch FWHT rotator instantiated per query, then a small CPU matmul for `qc_table`).
+3. **The 78 ms p95 in the BEIR loop is NOT the kernel.** The probe (`/tmp/probe_rroq158_latency.py`) measured 2.81 ms steady-state per query end-to-end including the wrapper, but the production loop measured 14 ms average and 78 ms p95. The discrepancy is consistent with Triton autotune cache not being shared across the LEMUR routing call boundary (autotune key includes `n_d_tokens` which can vary slightly across queries when the LEMUR shortlist returns < `max_docs_exact`), or with PyTorch allocator stalls under the 7-tensor `index_select` gather pattern at 2 k candidates. This is a **fixable engineering issue, not a kernel design issue** — but it does not affect the verdict because the **quality regression is the binding constraint**.
+4. **Disk savings are real and meaningful.** rroq158 ships at 46 B / token (sign + nonzero + group scales + centroid_id + cos_norm + sin_norm) vs 256 B for fp16 and 64 B for ROQ4. On scidocs (4.84 M tokens) that is 220 MB vs 1.20 GB fp16 vs 310 MB ROQ4 — a **5.5× / 1.4× compression** that lets large indexes stay GPU-resident on the same hardware. For users where disk is the binding constraint and they can absorb a ~1.5 pt R@10 hit on hard datasets, that's a sensible trade.
+5. **MV-distill is plumbed but does not help on real BEIR.** Verified Phase 2: even after fixing the train/eval distribution bug (training pairs now drawn from the rroq158 top-K shortlist rather than random negatives), MV-distill regresses R@10 on nfcorpus brute-force (0.346 → 0.116). It stays in the codebase as `SearchConfig.distill_rerank` (default `False`) so future iterations can re-enable it without re-plumbing, but it is not a recommended default. The offline `NN50*` recovery (50% of the gap) does not survive contact with BEIR's actual relevance distribution.
+
+**Action:**
+- Land the rroq158 production lane as the next commit (already at `39fabf7`). Ship `Compression.RROQ158` as opt-in. Document the quality caveat for hard datasets prominently.
+- Open follow-up tickets for the two open questions:
+  - K-sweep on scidocs: try K ∈ {2048, 4096, 8192} and re-measure R@10. Centroid table cost scales linearly (K=8192 = 2 MB GPU-resident, still trivial).
+  - Wrapper latency: cache the CPU centroid copy, pre-instantiate the FWHT rotator per index, and benchmark whether the autotune cache miss across the LEMUR boundary is the real culprit. Goal: bring p95 from 78 ms back to the steady-state 2.81 ms.
+- Move the B3 / X1 / a5 / a6 plan todos to **completed** with the verdict above. Re-prioritise B1 / B2 (spherical / tangent routing) and B5 (per-cluster PCA) to the next round — they may close the K=1024 gap on scidocs without forcing K to grow.
+- Honest caveats:
+  - Quality variance across rroq158 seeds is small (R@10 std ≈ 0.002 on both datasets), so the −1.45 pt scidocs gap is real, not noise.
+  - The LEMUR routing artefacts were trained once on fp16 and reused across codecs. This is the right apples-to-apples comparison for "what does the codec cost you?", but a router co-trained with rroq158 candidates *might* close some of the scidocs gap (the router currently favours candidates that are easy to score in fp16, which need not be easy to score in rroq158).
+  - We measured only two BEIR datasets. The plan called for "wins on at least 3 of 5"; we have one within-gate (nfcorpus) and one decisively out-of-gate (scidocs). The remaining three (arguana, fiqa, scifact) are not measured here, but the scidocs result is decisive enough to keep us at EXPERIMENTAL.
+
+**Artifacts:** `reports/beir_rroq158_nfcorpus.json`, `reports/beir_rroq158_scidocs.json`, `reports/kernel_rroq158.json`, `tests/test_rroq158_kernel.py`, commit `39fabf7`.
+**Gate impact:**
+- B-track: rroq158-K1024 stops at "opt-in production"; B5 (per-cluster PCA) and B4 (mixed-precision) re-prioritised as gap-closers for hard datasets.
+- X-track: MV-distill stays opt-in; X2 (cross-encoder rerank with a small Transformer head) added to the next-round backlog as a higher-capacity recovery alternative.
+- A-track: A5/A6 closed as completed (production plumbing + BEIR end-to-end). Future rroq158 iterations re-enter through B-track tickets.
+- Combined-track: C2 (k_candidates stress test) and C3 (CPU/streamed serving replay) deferred until the dataset gap is closed — there is no point in proving rroq158 holds up under a smaller shortlist if it cannot match fp16 on the larger one.
 
 ---
 

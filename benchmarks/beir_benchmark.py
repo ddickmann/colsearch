@@ -409,7 +409,11 @@ def _build_rroq158_gpu_payload(
       centroids (K, dim) float32
       n_words, n_groups, K
     """
-    cfg = Rroq158Config(K=params.get("rroq158_k", 1024), group_size=32, seed=42)
+    cfg = Rroq158Config(
+        K=params.get("rroq158_k", 1024),
+        group_size=32,
+        seed=int(params.get("rroq158_seed", 42)),
+    )
     log.info("[rroq158] encoding %d tokens (dim=%d, K=%d)",
              all_vectors.shape[0], dim, cfg.K)
     enc = encode_rroq158(np.asarray(all_vectors, dtype=np.float32), cfg)
@@ -823,6 +827,7 @@ def run_dataset(
     compression: Optional[Compression] = None,
     distill_rerank: bool = False,
     rroq158_k: int = 1024,
+    rroq158_seed: int = 42,
 ) -> List[Dict[str, Any]]:
     all_vectors, doc_offsets, doc_ids, query_vecs, graded_qrels, dim = load_beir_npz(name)
     doc_vecs = [all_vectors[s:e] for s, e in doc_offsets]
@@ -845,6 +850,7 @@ def run_dataset(
                 params["compression"] = compression
             params["distill_rerank"] = distill_rerank
             params["rroq158_k"] = rroq158_k
+            params["rroq158_seed"] = rroq158_seed
             if name == "quora":
                 params["n_shards"] = QUORA_OVERRIDE_SHARDS
 
@@ -874,6 +880,7 @@ def run_dataset(
                 params["compression"] = compression
             params["distill_rerank"] = distill_rerank
             params["rroq158_k"] = rroq158_k
+            params["rroq158_seed"] = rroq158_seed
             if name == "quora":
                 params["n_shards"] = QUORA_OVERRIDE_SHARDS
 
@@ -1043,6 +1050,12 @@ def main():
         default=1024,
         help="Number of spherical centroids for rroq158 (default: 1024)",
     )
+    parser.add_argument(
+        "--rroq158-seed",
+        type=int,
+        default=42,
+        help="Seed for rroq158 FWHT rotator + spherical k-means init (default: 42)",
+    )
     args = parser.parse_args()
     compression = _resolve_compression(args.compression) if args.compression else None
 
@@ -1057,7 +1070,7 @@ def main():
             ds_results = run_dataset(
                 name, args.modes, n_workers=args.n_workers, n_eval=args.n_eval,
                 compression=compression, distill_rerank=args.distill_rerank,
-                rroq158_k=args.rroq158_k,
+                rroq158_k=args.rroq158_k, rroq158_seed=args.rroq158_seed,
             )
             all_results.extend(ds_results)
         except Exception as e:
