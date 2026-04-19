@@ -11,11 +11,14 @@
 > on **both** GPU (Triton fused kernel) and CPU (Rust SIMD kernel with
 > hardware popcount + cached rayon thread pool). At the kernel level it is
 > **5.8× faster than the legacy fp16 lane at p95 in the production 8-worker
-> CPU layout** while using ~5.5× less disk than fp16. Existing fp16 indexes
-> continue to load — the manifest carries the build-time codec; only newly
-> built indexes pick up the new default. Pass `compression=Compression.FP16`
-> to opt out. Methodology + per-dataset numbers in
-> [research/low_bit_roq/PROGRESS.md](research/low_bit_roq/PROGRESS.md)
+> CPU layout** while using ~5.5× less disk than fp16. For workloads that
+> reject any quality regression, ship with `Compression.RROQ4_RIEM` — the
+> Riemannian-aware 4-bit asymmetric "safe fallback" lane (Triton + Rust SIMD
+> wired, parity-tested, ~3× smaller than fp16, ~0.5% NDCG@10 gap). Existing
+> fp16 indexes continue to load — the manifest carries the build-time codec;
+> only newly built indexes pick up the new default. Pass
+> `compression=Compression.FP16` to opt out. Methodology + per-dataset
+> numbers in [research/low_bit_roq/PROGRESS.md](research/low_bit_roq/PROGRESS.md)
 > (`[2026-04-19] phase-1.5-cpu-kernel-perf-pass`).
 
 ## The pain
@@ -38,7 +41,7 @@ the **final scorer** — and engineered so a single machine can serve it.
 
 - **One-node deployment.** No control plane, no orchestration tax.
 - **One contract across CPU and GPU.** Rust SIMD on CPU, Triton on GPU.
-- **RROQ-1.58 default.** Riemannian 1.58-bit codec — strictly faster than fp16 on both lanes at ~5.5× smaller storage. FP16 / INT8 / FP8 / ROQ-4 all available, all reranked back to float truth.
+- **RROQ-1.58 default.** Riemannian 1.58-bit codec — strictly faster than fp16 on both lanes at ~5.5× smaller storage. **RROQ-4 Riemannian** ships as the safe-fallback lane for zero-regression workloads (~3× smaller than fp16, ~0.5% NDCG@10 gap). FP16 / INT8 / FP8 / ROQ-4 all available, all reranked back to float truth.
 - **Late-interaction native.** ColBERT, ColPali, ColQwen out of the box.
 - **Database semantics.** WAL, checkpoint, crash recovery, scroll, retrieve.
 - **Optional graph lane.** The Latence sidecar augments first-stage retrieval — never required.
@@ -93,7 +96,7 @@ docker run -p 8080:8080 -v "$(pwd)/data:/data" voyager-index
 ## Features
 
 - **Routing** — LEMUR proxy router + FAISS MIPS shortlist, optional ColBANDIT query-time pruning.
-- **Scoring** — Triton MaxSim and fused Rust MaxSim, RROQ-1.58 (default) / INT8 / FP8 / ROQ-4 with float rerank.
+- **Scoring** — Triton MaxSim and fused Rust MaxSim, RROQ-1.58 (default) / RROQ-4 Riemannian (safe fallback) / INT8 / FP8 / ROQ-4 with float rerank.
 - **Storage** — safetensors shards, memory-mapped CPU, GPU-resident corpus mode.
 - **Hybrid** — BM25 + dense fusion via RRF or Tabu Search refinement.
 - **Multimodal** — text (ColBERT), images (ColPali / ColQwen), preprocessing for PDF / DOCX / XLSX.
@@ -152,13 +155,65 @@ opt out of the new default. Full audit and per-phase verdicts in
 (`[2026-04-19] phase-2-to-6-rroq158-default` and
 `[2026-04-19] phase-1.5-cpu-kernel-perf-pass`).
 
+#### Safe-fallback lane: RROQ-4 Riemannian (4-bit asymmetric, K=8192)
+
+`Compression.RROQ4_RIEM` is the production option for workloads that
+cannot tolerate any quality regression vs FP16 but still want the disk
+and latency win of low-bit ROQ. It applies the same Riemannian-aware
+spherical-k-means + FWHT pipeline as RROQ-1.58, but encodes the residual
+as **4-bit asymmetric per-group** (default `group_size=32`, mins/deltas
+in fp16) instead of ternary. Both kernels are wired and parity-tested:
+
+- **GPU**: fused Triton kernel `roq_maxsim_rroq4_riem`
+  (`voyager_index._internal.kernels.triton_roq_rroq4_riem`).
+- **CPU**: Rust SIMD kernel `latence_shard_engine.rroq4_riem_score_batch`
+  with AVX2/FMA + cached rayon thread pool — bitwise parity to rtol=1e-4
+  vs the python reference (validated by
+  `tests/test_rroq4_riem_kernel.py`).
+
+Per-token storage: ~88 B (vs 256 B FP16, 46 B RROQ-1.58 — i.e. **~3×
+smaller** than fp16). Quality gap on the BEIR sweep is ~0.5% NDCG@10 vs
+fp16 — see `research/low_bit_roq/PROGRESS.md` phase 4 for the full table.
+
+Enable it from Python:
+
+```python
+from voyager_index import Index
+from voyager_index._internal.inference.shard_engine.config import Compression
+
+idx = Index("safe-fallback-demo", dim=128, engine="shard", n_shards=32,
+            k_candidates=256, compression=Compression.RROQ4_RIEM)
+```
+
+…or from the CLI:
+
+```bash
+python -m voyager_index._internal.inference.shard_engine._builder.cli \
+    --compression rroq4_riem --rroq4-riem-k 8192 --rroq4-riem-group-size 32 ...
+```
+
+…or over HTTP at collection-create time:
+
+```json
+{
+  "compression": "rroq4_riem",
+  "rroq4_riem_k": 8192,
+  "rroq4_riem_group_size": 32
+}
+```
+
+End-to-end build + search is covered by
+`tests/test_rroq4_riem_e2e.py::test_rroq4_riem_build_and_search_cpu` and
+auto-derive at search time (no `quantization_mode` override required) by
+`tests/test_shard_serving_wiring.py::test_score_sealed_candidates_auto_derives_rroq4_riem_when_meta_present`.
+
 ## Architecture
 
 ```text
 query (token / patch embeddings)
   → LEMUR routing MLP → FAISS ANN → candidate IDs
   → optional BM25 fusion · centroid pruning · ColBANDIT
-  → exact MaxSim   (Rust SIMD CPU FP16/RROQ-1.58  |  Triton FP16/INT8/FP8/ROQ-4/RROQ-1.58 GPU)
+  → exact MaxSim   (Rust SIMD CPU FP16/RROQ-1.58/RROQ-4-Riem  |  Triton FP16/INT8/FP8/ROQ-4/RROQ-1.58/RROQ-4-Riem GPU)
   → optional Latence graph augmentation
   → top-K (or packed context)
 ```
@@ -167,7 +222,7 @@ query (token / patch embeddings)
 |--------------|------------------------------------------------------------------|
 | Routing      | LEMUR MLP + FAISS MIPS, candidate budgets                        |
 | Storage      | safetensors shards, mmap, GPU-resident corpus mode               |
-| Scoring      | Triton + Rust fused MaxSim with RROQ-1.58 (default) / INT8 / FP8 / ROQ-4 fast paths |
+| Scoring      | Triton + Rust fused MaxSim with RROQ-1.58 (default) / RROQ-4 Riemannian (safe fallback) / INT8 / FP8 / ROQ-4 fast paths |
 | Optional graph | Latence sidecar, additive after first-stage retrieval          |
 | Durability   | WAL, memtable, checkpoint, crash recovery                        |
 | Serving      | FastAPI, base64 vector transport, multi-worker, OpenAPI          |

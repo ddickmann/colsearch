@@ -366,6 +366,27 @@ curl -X POST http://127.0.0.1:8080/collections/shard-guide \
   }'
 ```
 
+For the no-degradation safe-fallback lane, swap `compression` to
+`"rroq4_riem"` and the related knobs to `rroq4_riem_k` /
+`rroq4_riem_group_size` / `rroq4_riem_seed`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/shard-safe-fallback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dimension": 128,
+    "kind": "shard",
+    "n_shards": 256,
+    "compression": "rroq4_riem",
+    "rroq4_riem_k": 8192,
+    "rroq4_riem_group_size": 32,
+    "rroq4_riem_seed": 42,
+    "quantization_mode": "rroq4_riem",
+    "router_device": "cpu",
+    "use_colbandit": true
+  }'
+```
+
 The detailed CPU/GPU tuning guide for this path is
 `docs/guides/max-performance-reference-api.md`.
 

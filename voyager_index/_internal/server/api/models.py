@@ -266,19 +266,22 @@ class CreateCollectionRequest(BaseModel):
     compression: Optional[str] = Field(
         default=None,
         description=(
-            "Shard storage compression: rroq158 (default), fp16, int8, or roq4. "
-            "Default is rroq158 (Riemannian-aware 1.58-bit ROQ at K=8192) on "
-            "both GPU (Triton fused) and CPU (Rust SIMD) — ~5.5× smaller than "
-            "fp16 and strictly faster on the production 8-worker layout. Pass "
+            "Shard storage compression: rroq158 (default), rroq4_riem, fp16, "
+            "int8, or roq4. Default is rroq158 (Riemannian-aware 1.58-bit ROQ "
+            "at K=8192) on both GPU (Triton fused) and CPU (Rust SIMD) — "
+            "~5.5× smaller than fp16 and strictly faster on the production "
+            "8-worker layout. Pick rroq4_riem for the no-degradation safe "
+            "fallback (~3× smaller than fp16, ≤0.5% NDCG@10 drop). Pass "
             "'fp16' to opt into the legacy lane (e.g. parity with old indexes)."
         ),
     )
     quantization_mode: Optional[str] = Field(
         default=None,
         description=(
-            "Shard scoring mode: rroq158 (matches default codec), int8, fp8, "
-            "roq4, or empty for the exact float lane. Leave unset to let the "
-            "search path auto-derive the kernel from the build-time codec."
+            "Shard scoring mode: rroq158 (matches default codec), rroq4_riem, "
+            "int8, fp8, roq4, or empty for the exact float lane. Leave unset "
+            "to let the search path auto-derive the kernel from the "
+            "build-time codec."
         ),
     )
     rroq158_k: Optional[int] = Field(
@@ -300,6 +303,29 @@ class CreateCollectionRequest(BaseModel):
         ge=32,
         le=4096,
         description="rroq158 ternary group size in coords. Multiple of 32. Default 32.",
+    )
+    rroq4_riem_k: Optional[int] = Field(
+        default=None,
+        ge=32,
+        le=65536,
+        description=(
+            "rroq4_riem spherical k-means centroid count. Power of two and "
+            ">= rroq4_riem_group_size. Default 8192."
+        ),
+    )
+    rroq4_riem_seed: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="rroq4_riem FWHT rotator + k-means initialisation seed. Default 42.",
+    )
+    rroq4_riem_group_size: Optional[int] = Field(
+        default=None,
+        ge=2,
+        le=4096,
+        description=(
+            "rroq4_riem 4-bit asymmetric group size in coords. Even integer "
+            "(two coords per packed byte). Default 32."
+        ),
     )
     transfer_mode: Optional[str] = Field(
         default=None, description="Shard CPU->GPU transfer mode: pageable, pinned, or double_buffered"
@@ -339,8 +365,10 @@ class CreateCollectionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_kind_specific_options(self) -> "CreateCollectionRequest":
-        valid_compressions = {"fp16", "int8", "roq4", "rroq158"}
-        valid_quant_modes = {"", "none", "int8", "fp8", "roq4", "rroq158"}
+        valid_compressions = {"fp16", "int8", "roq4", "rroq158", "rroq4_riem"}
+        valid_quant_modes = {
+            "", "none", "int8", "fp8", "roq4", "rroq158", "rroq4_riem",
+        }
         valid_transfer_modes = {"pageable", "pinned", "double_buffered"}
         if self.kind not in (CollectionKind.DENSE, CollectionKind.SHARD):
             if self.distance != DistanceMetric.COSINE:
@@ -368,6 +396,9 @@ class CreateCollectionRequest(BaseModel):
                 self.rroq158_k,
                 self.rroq158_seed,
                 self.rroq158_group_size,
+                self.rroq4_riem_k,
+                self.rroq4_riem_seed,
+                self.rroq4_riem_group_size,
             )
             if any(value is not None for value in shard_only_values):
                 raise ValueError("Shard tuning fields are only supported for shard collections")
@@ -376,11 +407,12 @@ class CreateCollectionRequest(BaseModel):
         else:
             if self.compression is not None and self.compression not in valid_compressions:
                 raise ValueError(
-                    "compression must be one of: fp16, int8, roq4, rroq158"
+                    "compression must be one of: fp16, int8, roq4, rroq158, rroq4_riem"
                 )
             if self.quantization_mode is not None and self.quantization_mode not in valid_quant_modes:
                 raise ValueError(
-                    "quantization_mode must be one of: '', none, int8, fp8, roq4, rroq158"
+                    "quantization_mode must be one of: '', none, int8, fp8, "
+                    "roq4, rroq158, rroq4_riem"
                 )
             if self.transfer_mode is not None and self.transfer_mode not in valid_transfer_modes:
                 raise ValueError("transfer_mode must be one of: pageable, pinned, double_buffered")
@@ -397,6 +429,26 @@ class CreateCollectionRequest(BaseModel):
                 and self.rroq158_k < self.rroq158_group_size
             ):
                 raise ValueError("rroq158_k must be >= rroq158_group_size")
+            # rroq4_riem codebook constraints — same shape rules the python
+            # lane enforces in `Rroq4RiemConfig`.
+            if (
+                self.rroq4_riem_k is not None
+                and (self.rroq4_riem_k & (self.rroq4_riem_k - 1)) != 0
+            ):
+                raise ValueError("rroq4_riem_k must be a power of two")
+            if (
+                self.rroq4_riem_group_size is not None
+                and self.rroq4_riem_group_size % 2 != 0
+            ):
+                raise ValueError(
+                    "rroq4_riem_group_size must be a positive even integer"
+                )
+            if (
+                self.rroq4_riem_k is not None
+                and self.rroq4_riem_group_size is not None
+                and self.rroq4_riem_k < self.rroq4_riem_group_size
+            ):
+                raise ValueError("rroq4_riem_k must be >= rroq4_riem_group_size")
         return self
 
 
@@ -497,9 +549,10 @@ class SearchRequest(BaseModel):
         default=None,
         description=(
             "Shard collections only: override the scoring precision mode "
-            "(rroq158, int8, fp8, roq4, or empty for exact). Leave unset to "
-            "let the search path auto-derive the kernel from the build-time "
-            "codec — the new rroq158 default is wired this way."
+            "(rroq158, rroq4_riem, int8, fp8, roq4, or empty for exact). "
+            "Leave unset to let the search path auto-derive the kernel from "
+            "the build-time codec — the new rroq158 default is wired this "
+            "way; rroq4_riem indexes auto-route to the rroq4_riem kernel."
         ),
     )
     use_colbandit: Optional[bool] = Field(
@@ -719,7 +772,9 @@ class SearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_query(self) -> "SearchRequest":
-        valid_quant_modes = {"", "none", "int8", "fp8", "roq4", "rroq158"}
+        valid_quant_modes = {
+            "", "none", "int8", "fp8", "roq4", "rroq158", "rroq4_riem",
+        }
         valid_transfer_modes = {"pageable", "pinned", "double_buffered"}
         if self.vector is None and self.vectors is None and not self.query_text:
             raise ValueError("Provide 'vector', 'vectors', or 'query_text'")
@@ -727,7 +782,8 @@ class SearchRequest(BaseModel):
             raise ValueError("Provide only one of 'vector' or 'vectors'")
         if self.quantization_mode is not None and self.quantization_mode not in valid_quant_modes:
             raise ValueError(
-                "quantization_mode must be one of: '', none, int8, fp8, roq4, rroq158"
+                "quantization_mode must be one of: '', none, int8, fp8, roq4, "
+                "rroq158, rroq4_riem"
             )
         if self.transfer_mode is not None and self.transfer_mode not in valid_transfer_modes:
             raise ValueError("transfer_mode must be one of: pageable, pinned, double_buffered")

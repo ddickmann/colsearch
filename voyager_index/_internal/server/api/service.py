@@ -516,6 +516,9 @@ class SearchService:
                 rroq158_k=int(meta.get("rroq158_k", 8192)),
                 rroq158_seed=int(meta.get("rroq158_seed", 42)),
                 rroq158_group_size=int(meta.get("rroq158_group_size", 32)),
+                rroq4_riem_k=int(meta.get("rroq4_riem_k", 8192)),
+                rroq4_riem_seed=int(meta.get("rroq4_riem_seed", 42)),
+                rroq4_riem_group_size=int(meta.get("rroq4_riem_group_size", 32)),
             )
             engine = ShardSegmentManager(
                 path=collection_dir / "shard",
@@ -955,6 +958,11 @@ class SearchService:
                     meta["rroq158_k"] = int(getattr(request, "rroq158_k", None) or 8192)
                     meta["rroq158_seed"] = int(getattr(request, "rroq158_seed", None) or 42)
                     meta["rroq158_group_size"] = int(getattr(request, "rroq158_group_size", None) or 32)
+                    meta["rroq4_riem_k"] = int(getattr(request, "rroq4_riem_k", None) or 8192)
+                    meta["rroq4_riem_seed"] = int(getattr(request, "rroq4_riem_seed", None) or 42)
+                    meta["rroq4_riem_group_size"] = int(
+                        getattr(request, "rroq4_riem_group_size", None) or 32
+                    )
                 try:
                     runtime = CollectionRuntime(
                         name=safe_name,

@@ -162,10 +162,13 @@ curl -X POST http://localhost:8080/collections/my_col/search \
 |-----------|---------|-------------|
 | `n_shards` | 256 | Number of storage shards |
 | `dim` | 128 | Embedding dimension |
-| `compression` | `rroq158` | Storage compression. Default is `rroq158` (Riemannian 1.58-bit, K=8192, GPU+CPU). Other options: `fp16`, `int8`, `roq4` |
+| `compression` | `rroq158` | Storage compression. Default is `rroq158` (Riemannian 1.58-bit, K=8192, GPU+CPU). Other options: `fp16`, `int8`, `roq4`, `rroq4_riem` (Riemannian 4-bit asymmetric — safe-fallback lane for zero-regression workloads) |
 | `rroq158_k` | 8192 | rroq158 spherical k-means centroid count (must be a power of two ≥ `group_size`) |
 | `rroq158_seed` | 42 | rroq158 FWHT rotator + k-means initialisation seed |
 | `rroq158_group_size` | 32 | rroq158 ternary group size (must be a multiple of 32 to align with the `popcnt` kernel) |
+| `rroq4_riem_k` | 8192 | rroq4_riem spherical k-means centroid count (must be a power of two ≥ `group_size`) |
+| `rroq4_riem_seed` | 42 | rroq4_riem FWHT rotator + k-means initialisation seed |
+| `rroq4_riem_group_size` | 32 | rroq4_riem 4-bit asymmetric residual group size (positive even integer that divides `dim`) |
 | `k_candidates` | 2000 | LEMUR candidate count per query |
 | `use_colbandit` | `false` | Enable ColBANDIT query-time pruning |
 | `lemur_epochs` | 10 | LEMUR MLP training epochs |
@@ -203,6 +206,12 @@ curl -X POST http://localhost:8080/collections/my_col/search \
   (5.8× p95 in 8-worker layout). Override with `compression="fp16"` only if
   you need parity with an older deployment or to disambiguate a
   quality-regression hypothesis.
+- **RROQ-4 Riemannian (safe fallback)**: ~3× smaller than fp16 (~88 B /
+  token), ~0.5% NDCG@10 gap vs fp16, fully wired on both GPU (Triton fused
+  kernel `roq_maxsim_rroq4_riem`) and CPU (Rust SIMD kernel
+  `latence_shard_engine.rroq4_riem_score_batch`, AVX2/FMA + cached rayon
+  pool). Set `compression="rroq4_riem"` for workloads that reject any
+  quality regression while still wanting low-bit ROQ disk + latency wins.
 - **ROQ 4-bit**: still available for ~4× compression with the asymmetric
   Triton kernel. Set `compression="roq4"` and optionally
   `quantization_mode="roq4"` on CUDA.

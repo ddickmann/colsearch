@@ -97,6 +97,9 @@ class ShardEngineConfig:
         rroq158_k: int = 8192,
         rroq158_seed: int = 42,
         rroq158_group_size: int = 32,
+        rroq4_riem_k: int = 8192,
+        rroq4_riem_seed: int = 42,
+        rroq4_riem_group_size: int = 32,
     ):
         # Validate mode-specific knobs upfront so misconfiguration surfaces
         # at config-construction time (in the user's stack frame) instead of
@@ -115,6 +118,24 @@ class ShardEngineConfig:
             raise ValueError(
                 f"rroq158_group_size must be a positive multiple of 32, "
                 f"got {rroq158_group_size}"
+            )
+        # rroq4_riem has looser group_size constraints than rroq158 (the
+        # 4-bit codes pack two coords per byte, so the rule is "positive
+        # even integer" rather than "multiple of 32"). K still needs to be
+        # a power of two for the spherical k-means structure.
+        if rroq4_riem_k <= 0 or (rroq4_riem_k & (rroq4_riem_k - 1)) != 0:
+            raise ValueError(
+                f"rroq4_riem_k must be a positive power of two, got {rroq4_riem_k}"
+            )
+        if rroq4_riem_group_size <= 0 or rroq4_riem_group_size % 2 != 0:
+            raise ValueError(
+                f"rroq4_riem_group_size must be a positive even integer, "
+                f"got {rroq4_riem_group_size}"
+            )
+        if rroq4_riem_k < rroq4_riem_group_size:
+            raise ValueError(
+                f"rroq4_riem_k ({rroq4_riem_k}) must be >= "
+                f"rroq4_riem_group_size ({rroq4_riem_group_size})"
             )
         # Coerce string-typed enum args to their canonical enum values so the
         # public IndexBuilder (`with_shard(compression="rroq158")`) and the
@@ -156,6 +177,9 @@ class ShardEngineConfig:
         self.rroq158_k = int(rroq158_k)
         self.rroq158_seed = int(rroq158_seed)
         self.rroq158_group_size = int(rroq158_group_size)
+        self.rroq4_riem_k = int(rroq4_riem_k)
+        self.rroq4_riem_seed = int(rroq4_riem_seed)
+        self.rroq4_riem_group_size = int(rroq4_riem_group_size)
 
     def to_build_config(self, corpus_size: int) -> BuildConfig:
         cfg = BuildConfig(
@@ -170,6 +194,9 @@ class ShardEngineConfig:
             rroq158_k=self.rroq158_k,
             rroq158_seed=self.rroq158_seed,
             rroq158_group_size=self.rroq158_group_size,
+            rroq4_riem_k=self.rroq4_riem_k,
+            rroq4_riem_seed=self.rroq4_riem_seed,
+            rroq4_riem_group_size=self.rroq4_riem_group_size,
         )
         cfg.lemur = LemurConfig(
             enabled=self.router_type == RouterType.LEMUR,

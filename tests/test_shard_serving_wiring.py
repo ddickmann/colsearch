@@ -226,6 +226,111 @@ def test_score_sealed_candidates_auto_derives_rroq158_when_meta_present(
     assert exact_ids == [31]
 
 
+def test_score_sealed_candidates_prefers_rroq4_riem_pipeline(tmp_path: Path) -> None:
+    """When ``quantization_mode='rroq4_riem'`` is set, the rroq4_riem lane
+    wins over the fp16 / colbandit / quantized fall-throughs even on CPU.
+    Mirrors the rroq158 dispatch test — both codecs share the same
+    "explicit override wins" policy.
+    """
+    mgr = _make_manager(tmp_path)
+    try:
+        scfg = mgr._config.to_search_config()
+        scfg.quantization_mode = "rroq4_riem"
+
+        def fake_rroq_score(*args, **kwargs):
+            return ([(42, 0.91)], {"num_docs_scored": 1})
+
+        mgr._score_rroq4_riem_candidates = fake_rroq_score  # type: ignore[method-assign]
+
+        results, exact_ids, exact_path, stats = mgr._score_sealed_candidates(
+            torch.zeros((2, 4), dtype=torch.float32),
+            [42],
+            {0: [42]},
+            1,
+            scfg,
+            torch.device("cpu"),
+        )
+    finally:
+        mgr.close()
+
+    assert results == [(42, 0.91)]
+    assert exact_ids == [42]
+    assert exact_path == "rroq4_riem_pipeline"
+    assert stats["num_docs_scored"] == 1
+
+
+def test_score_sealed_candidates_rroq4_riem_hardfails_when_no_kernel(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Same loud-fail policy as rroq158: when shards are encoded with
+    rroq4_riem but neither the GPU nor the Rust SIMD kernel is reachable,
+    the dispatch must raise an actionable error instead of silently
+    returning empty results.
+    """
+    import sys
+
+    mgr = _make_manager(tmp_path)
+    try:
+        scfg = mgr._config.to_search_config()
+        scfg.quantization_mode = "rroq4_riem"
+
+        mgr._score_rroq4_riem_candidates = lambda *a, **kw: None  # type: ignore[method-assign]
+        mgr._rroq4_riem_meta = {"centroids": np.zeros((4, 4)), "fwht_seed": 0}
+
+        monkeypatch.setitem(sys.modules, "latence_shard_engine", None)
+
+        with __import__("pytest").raises(RuntimeError, match="rroq4_riem shards selected"):
+            mgr._score_sealed_candidates(
+                torch.zeros((2, 4), dtype=torch.float32),
+                [42],
+                {0: [42]},
+                1,
+                scfg,
+                torch.device("cpu"),
+            )
+    finally:
+        mgr.close()
+
+
+def test_score_sealed_candidates_auto_derives_rroq4_riem_when_meta_present(
+    tmp_path: Path,
+) -> None:
+    """When the storage codec is rroq4_riem (meta on disk / cached) and
+    the caller did NOT set ``quantization_mode``, the search path must
+    auto-route to the rroq4_riem lane.
+    """
+    mgr = _make_manager(tmp_path)
+    try:
+        scfg = mgr._config.to_search_config()
+        assert scfg.quantization_mode == ""
+
+        mgr._rroq4_riem_meta = {"centroids": np.zeros((4, 4)), "fwht_seed": 0}
+
+        captured = {}
+
+        def fake_rroq_score(*args, **kwargs):
+            captured["called"] = True
+            return ([(42, 0.91)], {"num_docs_scored": 1})
+
+        mgr._score_rroq4_riem_candidates = fake_rroq_score  # type: ignore[method-assign]
+
+        results, exact_ids, exact_path, stats = mgr._score_sealed_candidates(
+            torch.zeros((2, 4), dtype=torch.float32),
+            [42],
+            {0: [42]},
+            1,
+            scfg,
+            torch.device("cpu"),
+        )
+    finally:
+        mgr.close()
+
+    assert captured.get("called") is True
+    assert exact_path == "rroq4_riem_pipeline"
+    assert results == [(42, 0.91)]
+    assert exact_ids == [42]
+
+
 def test_default_compression_is_rroq158() -> None:
     """The library default for newly constructed configs must be RROQ158
     after the Phase 1.5 gate. Existing fp16 indexes on disk are unaffected

@@ -98,6 +98,32 @@ above for your own data. Full audit, per-phase verdicts, and rationale in
 (`[2026-04-19] phase-2-to-6-rroq158-default` and
 `[2026-04-19] phase-1.5-cpu-kernel-perf-pass`).
 
+### Safe-fallback codec: RROQ-4 Riemannian (K=8192, 4-bit asymmetric)
+
+`Compression.RROQ4_RIEM` is the production option for workloads that
+reject any quality regression vs FP16 but still want low-bit ROQ disk +
+latency wins. It applies the same Riemannian-aware spherical-k-means +
+FWHT pipeline as RROQ-1.58, but encodes the residual as **4-bit
+asymmetric per-group** (default `group_size=32`, mins/deltas in fp16)
+instead of ternary.
+
+| codec       | per-token | NDCG@10 gap vs fp16 | Disk vs fp16 | Status |
+| ----------- | --------: | ------------------: | -----------: | -----: |
+| `fp16`      | 256 B     | 0 (baseline)        | 1×           | shipped |
+| `rroq4_riem` | ~88 B    | ~0.5%               | ~3× smaller  | shipped (safe fallback) |
+| `rroq158`   | 46 B      | ~1–2%               | ~5.5× smaller | shipped (default) |
+
+Both kernels are wired and parity-tested:
+
+- **GPU**: fused Triton kernel `roq_maxsim_rroq4_riem`
+  (`voyager_index._internal.kernels.triton_roq_rroq4_riem`).
+- **CPU**: Rust SIMD kernel `latence_shard_engine.rroq4_riem_score_batch`
+  with AVX2/FMA + cached rayon thread pool, parity to rtol=1e-4 vs the
+  python reference (validated by `tests/test_rroq4_riem_kernel.py`).
+
+End-to-end build + search is covered by
+`tests/test_rroq4_riem_e2e.py::test_rroq4_riem_build_and_search_cpu`.
+
 ### Comparison vs next-plaid
 
 [next-plaid](https://github.com/lightonai/next-plaid) is an important

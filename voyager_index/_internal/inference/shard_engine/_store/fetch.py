@@ -391,3 +391,36 @@ class ShardStoreFetchMixin:
             "doc_ids": data["doc_ids"],
         }
 
+    def load_shard_rroq4_riem(self, shard_id: int) -> Optional[Dict[str, torch.Tensor]]:
+        """Load RROQ4_RIEM-specific tensors for a shard.
+
+        Returns dict with keys
+        ``{codes, mins, deltas, centroid_id, cos_norm, sin_norm,
+        doc_offsets, doc_ids}`` or ``None`` if the shard isn't
+        RROQ4_RIEM / can't be parsed. ``codes`` is a packed uint8 nibble
+        stream (two 4-bit codes per byte), ``mins`` and ``deltas`` are
+        per-(token, group) float16 codebook parameters.
+        """
+        import importlib
+
+        compat_mod = importlib.import_module("voyager_index._internal.inference.shard_engine.shard_store")
+        safetensors_available = getattr(compat_mod, "SAFETENSORS_AVAILABLE", SAFETENSORS_AVAILABLE)
+        if not safetensors_available:
+            raise ImportError("safetensors is required: pip install safetensors")
+        meta = self._meta_by_id(shard_id)
+        if meta.compression != "rroq4_riem":
+            return None
+        data = st_load(str(self.shard_dir / meta.file_name), device="cpu")
+        if "rroq4_riem_codes" not in data:
+            return None
+        return {
+            "codes": data["rroq4_riem_codes"],
+            "mins": data["rroq4_riem_mins"],
+            "deltas": data["rroq4_riem_deltas"],
+            "centroid_id": data["rroq4_riem_centroid_id"],
+            "cos_norm": data["rroq4_riem_cos_norm"],
+            "sin_norm": data["rroq4_riem_sin_norm"],
+            "doc_offsets": data["doc_offsets"],
+            "doc_ids": data["doc_ids"],
+        }
+

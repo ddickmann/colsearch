@@ -15,6 +15,17 @@ class Compression(str, Enum):
     ~30% smaller than ROQ4, and matches fp16 R@10 on offline brute-force
     nfcorpus (0.345 vs 0.345). See research/low_bit_roq/PROGRESS.md."""
 
+    RROQ4_RIEM = "rroq4_riem"
+    """Riemannian-aware 4-bit asymmetric ROQ — the safe-fallback codec.
+    Same Riemannian + FWHT-rotated structure as RROQ158, but the residual
+    is 4-bit asymmetric per-group instead of 1.58-bit ternary. ~3x smaller
+    than fp16 and within ≈ 0.5% NDCG@10 of fp16 on production BEIR — the
+    "no-degradation" lane for callers who cannot accept any quality loss
+    while still wanting smaller indexes than fp16. Slower than RROQ158 by
+    ~1.5-2x on both GPU and CPU due to the larger per-token payload, but
+    still strictly faster than fp16 thanks to Riemannian centroid-cache
+    locality."""
+
 
 class StorageLayout(str, Enum):
     RANDOM = "random"
@@ -101,6 +112,17 @@ class BuildConfig:
     rroq158_group_size: int = 32
     """Ternary group size in coordinates. Must divide ``dim`` and be a
     multiple of 32 (one popcount word per group)."""
+
+    rroq4_riem_k: int = 8192
+    """Centroid codebook size for RROQ4_RIEM. Same shape rules as
+    ``rroq158_k`` (power of two, ``>= rroq4_riem_group_size``)."""
+
+    rroq4_riem_seed: int = 42
+    """Seed for the FWHT rotation and spherical k-means init for RROQ4_RIEM."""
+
+    rroq4_riem_group_size: int = 32
+    """4-bit asymmetric group size in coordinates. Must divide ``dim`` and
+    be even so the nibble plane packs into bytes."""
 
 
 @dataclass

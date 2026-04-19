@@ -19,6 +19,7 @@ class ShardStoreBuildMixin:
         roq_doc_codes: Optional[list] = None,
         roq_doc_meta: Optional[list] = None,
         rroq158_payload: Any = None,
+        rroq4_riem_payload: Any = None,
     ) -> StoreManifest:
         if not SAFETENSORS_AVAILABLE:
             raise ImportError("safetensors is required: pip install safetensors")
@@ -54,6 +55,11 @@ class ShardStoreBuildMixin:
         if compression == Compression.RROQ158 and rroq158_payload is None:
             logger.warning(
                 "RROQ158 requested but no rroq158_payload provided; falling back to FP16"
+            )
+            compression = Compression.FP16
+        if compression == Compression.RROQ4_RIEM and rroq4_riem_payload is None:
+            logger.warning(
+                "RROQ4_RIEM requested but no rroq4_riem_payload provided; falling back to FP16"
             )
             compression = Compression.FP16
 
@@ -181,6 +187,32 @@ class ShardStoreBuildMixin:
                     pad_to=global_target_len if uniform_shard_tokens else None,
                 )
                 tensors["embeddings"] = shard_vectors.astype(np.float16)
+            elif compression == Compression.RROQ4_RIEM and rroq4_riem_payload is not None:
+                shard_doc_token_ranges = []
+                r4r_offsets = []
+                pos = 0
+                for idx_in_shard, doc_global_idx in enumerate(shard_doc_indices):
+                    s, e = doc_offsets[doc_global_idx]
+                    n_tok = e - s
+                    if uniform_shard_tokens:
+                        target = global_target_len
+                        if n_tok >= target:
+                            shard_doc_token_ranges.append((s, s + target))
+                            n_tok = target
+                        else:
+                            shard_doc_token_ranges.append((s, e))
+                    else:
+                        shard_doc_token_ranges.append((s, e))
+                    r4r_offsets.append((pos, pos + (target if uniform_shard_tokens else n_tok)))
+                    pos += (target if uniform_shard_tokens else n_tok)
+                tensors = self.pack_shard_rroq4_riem(
+                    rroq4_riem_payload,
+                    shard_doc_token_ranges,
+                    r4r_offsets,
+                    shard_doc_ids,
+                    pad_to=global_target_len if uniform_shard_tokens else None,
+                )
+                tensors["embeddings"] = shard_vectors.astype(np.float16)
             else:
                 tensors = self._pack_shard(shard_vectors, local_offsets, shard_doc_ids, compression)
             st_save_np(tensors, str(shard_path))
@@ -277,6 +309,16 @@ class ShardStoreBuildMixin:
                 "doc_offsets": offsets_arr,
                 "doc_ids": ids_arr,
             }
+        if compression == Compression.RROQ4_RIEM:
+            logger.warning(
+                "RROQ4_RIEM shard packing requires pre-encoded payload via "
+                "pack_shard_rroq4_riem(); falling back to FP16 storage for this shard"
+            )
+            return {
+                "embeddings": vectors.astype(np.float16),
+                "doc_offsets": offsets_arr,
+                "doc_ids": ids_arr,
+            }
         raise ValueError(f"Unknown compression: {compression}")
 
     @staticmethod
@@ -333,6 +375,68 @@ class ShardStoreBuildMixin:
             "rroq158_centroid_id": np.concatenate(cid_chunks, axis=0).astype(np.int32),
             "rroq158_cos_norm": np.concatenate(cos_chunks, axis=0).astype(np.float16),
             "rroq158_sin_norm": np.concatenate(sin_chunks, axis=0).astype(np.float16),
+            "doc_offsets": np.array(local_offsets, dtype=np.int64),
+            "doc_ids": np.array(doc_ids, dtype=np.int64),
+        }
+
+    @staticmethod
+    def pack_shard_rroq4_riem(
+        rroq4_riem_payload: Any,
+        token_ranges: List[Tuple[int, int]],
+        local_offsets: List[Tuple[int, int]],
+        doc_ids: List[int],
+        *,
+        pad_to: Optional[int] = None,
+    ) -> Dict[str, np.ndarray]:
+        """Pack RROQ4_RIEM-encoded tokens for a shard.
+
+        Mirrors :func:`pack_shard_rroq158` but with the per-token tensors
+        from a ``Rroq4RiemEncoded`` payload (4-bit packed codes + per-group
+        mins/deltas instead of ternary planes + scales). Padding tokens get
+        zeroed payloads so the per-token cos/sin norms zero them out at
+        scoring time without needing an explicit mask in the kernel.
+        """
+        codes_chunks: List[np.ndarray] = []
+        mins_chunks: List[np.ndarray] = []
+        dlts_chunks: List[np.ndarray] = []
+        cid_chunks: List[np.ndarray] = []
+        cos_chunks: List[np.ndarray] = []
+        sin_chunks: List[np.ndarray] = []
+        for (s, e) in token_ranges:
+            n_tok = e - s
+            cp = rroq4_riem_payload.codes_packed[s:e]
+            mn = rroq4_riem_payload.mins[s:e]
+            dl = rroq4_riem_payload.deltas[s:e]
+            ci = rroq4_riem_payload.centroid_id[s:e]
+            cn = rroq4_riem_payload.cos_norm[s:e]
+            sn = rroq4_riem_payload.sin_norm[s:e]
+            if pad_to is not None and n_tok < pad_to:
+                pad = pad_to - n_tok
+                cp = np.concatenate([cp, np.zeros((pad,) + cp.shape[1:], dtype=cp.dtype)], axis=0)
+                mn = np.concatenate([mn, np.zeros((pad,) + mn.shape[1:], dtype=mn.dtype)], axis=0)
+                # Pad deltas with 1.0 not 0.0 so a stray dot-product against
+                # a padding token still computes 0 (because cos/sin norms are
+                # zeroed) but never tries to multiply by an exact-zero scale
+                # that would generate NaNs in any numerical-debug path.
+                dl = np.concatenate(
+                    [dl, np.ones((pad,) + dl.shape[1:], dtype=dl.dtype)], axis=0
+                )
+                ci = np.concatenate([ci, np.zeros((pad,), dtype=ci.dtype)], axis=0)
+                cn = np.concatenate([cn, np.zeros((pad,), dtype=cn.dtype)], axis=0)
+                sn = np.concatenate([sn, np.zeros((pad,), dtype=sn.dtype)], axis=0)
+            codes_chunks.append(cp)
+            mins_chunks.append(mn)
+            dlts_chunks.append(dl)
+            cid_chunks.append(ci)
+            cos_chunks.append(cn)
+            sin_chunks.append(sn)
+        return {
+            "rroq4_riem_codes": np.concatenate(codes_chunks, axis=0).astype(np.uint8),
+            "rroq4_riem_mins": np.concatenate(mins_chunks, axis=0).astype(np.float16),
+            "rroq4_riem_deltas": np.concatenate(dlts_chunks, axis=0).astype(np.float16),
+            "rroq4_riem_centroid_id": np.concatenate(cid_chunks, axis=0).astype(np.int32),
+            "rroq4_riem_cos_norm": np.concatenate(cos_chunks, axis=0).astype(np.float16),
+            "rroq4_riem_sin_norm": np.concatenate(sin_chunks, axis=0).astype(np.float16),
             "doc_offsets": np.array(local_offsets, dtype=np.int64),
             "doc_ids": np.array(doc_ids, dtype=np.int64),
         }

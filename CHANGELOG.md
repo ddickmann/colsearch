@@ -6,6 +6,28 @@ reads in release order again.
 
 ## Unreleased
 
+### Production-grade low-bit ROQ
+
+- shipped `Compression.RROQ158` (Riemannian-aware 1.58-bit ternary, K=8192)
+  as the default codec for newly built indexes on both GPU (Triton fused
+  kernel) and CPU (Rust SIMD kernel with hardware popcount + cached rayon
+  thread pool); 5.8× faster than fp16 at p95 in the production 8-worker
+  CPU layout, ~5.5× smaller per-token storage
+- shipped `Compression.RROQ4_RIEM` as the safe-fallback lane for
+  zero-regression workloads — Riemannian-aware 4-bit asymmetric per-group
+  residual quantization with a fused Triton kernel
+  (`roq_maxsim_rroq4_riem`) and a Rust SIMD kernel
+  (`latence_shard_engine.rroq4_riem_score_batch`, AVX2/FMA + cached rayon
+  pool); ~3× smaller than fp16 on disk, ~0.5% NDCG@10 gap, parity-tested
+  to rtol=1e-4 against the python reference on both lanes
+- exposed `rroq158_*` and `rroq4_riem_*` knobs (`K`, `seed`, `group_size`)
+  through the Python API, the HTTP collection-create payload, and the
+  shard-engine CLI; existing fp16 indexes load unchanged through the
+  build-time codec recorded in the manifest
+- added the auto-derive path so search-time `quantization_mode` is no
+  longer required when the manifest already records the build-time codec
+  for `rroq158` or `rroq4_riem`
+
 ## 0.1.5 — Release Gate Hotfix
 
 This release republishes the shard-engine decomposition work on a clean CI line

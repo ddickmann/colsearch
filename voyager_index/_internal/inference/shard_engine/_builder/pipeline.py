@@ -132,6 +132,7 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
     roq_doc_codes = None
     roq_doc_meta = None
     rroq158_payload = None
+    rroq4_riem_payload = None
     if cfg.compression == Compression.RROQ158:
         # Hard-fail on actual codec errors (silently writing a 12× larger
         # FP16 index that scores in a different range would be a debugging
@@ -186,6 +187,54 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
                 "RROQ158 encoding done in %.1fs (%d tokens, K=%d)",
                 time.time() - t_rroq, n_tokens, effective_k,
             )
+    if cfg.compression == Compression.RROQ4_RIEM:
+        from voyager_index._internal.inference.quantization.rroq4_riem import (
+            Rroq4RiemConfig,
+            choose_effective_rroq4_riem_k,
+            encode_rroq4_riem,
+        )
+        n_tokens = int(np.asarray(active_vectors).shape[0])
+        gs = int(cfg.rroq4_riem_group_size)
+        if n_tokens < gs:
+            log.warning(
+                "RROQ4_RIEM requested but corpus has only %d tokens "
+                "(< group_size=%d). Falling back to FP16 — rroq4_riem needs "
+                "at least one 4-bit group of tokens to encode.",
+                n_tokens, gs,
+            )
+            cfg.compression = Compression.FP16
+        else:
+            effective_k = choose_effective_rroq4_riem_k(
+                n_tokens=n_tokens,
+                requested_k=int(cfg.rroq4_riem_k),
+                group_size=gs,
+            )
+            log.info(
+                "Training RROQ4_RIEM (Riemannian 4-bit asymmetric) quantizer "
+                "(K=%d, group_size=%d, seed=%d) ...",
+                effective_k, gs, int(cfg.rroq4_riem_seed),
+            )
+            t_r4r = time.time()
+            rroq4_riem_payload = encode_rroq4_riem(
+                np.asarray(active_vectors, dtype=np.float32),
+                Rroq4RiemConfig(
+                    K=effective_k,
+                    group_size=gs,
+                    seed=int(cfg.rroq4_riem_seed),
+                    fit_sample_cap=max(100_000, effective_k),
+                ),
+            )
+            np.savez(
+                index_dir / "rroq4_riem_meta.npz",
+                centroids=rroq4_riem_payload.centroids,
+                fwht_seed=np.array(rroq4_riem_payload.fwht_seed, dtype=np.int64),
+                dim=np.array(rroq4_riem_payload.dim, dtype=np.int32),
+                group_size=np.array(rroq4_riem_payload.group_size, dtype=np.int32),
+            )
+            log.info(
+                "RROQ4_RIEM encoding done in %.1fs (%d tokens, K=%d)",
+                time.time() - t_r4r, n_tokens, effective_k,
+            )
     if cfg.compression == Compression.ROQ4:
         try:
             from voyager_index._internal.inference.quantization.rotational import (
@@ -229,6 +278,7 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
         roq_doc_codes=roq_doc_codes,
         roq_doc_meta=roq_doc_meta,
         rroq158_payload=rroq158_payload,
+        rroq4_riem_payload=rroq4_riem_payload,
     )
     build_s = time.time() - t0
     log.info("Shard store built in %.1fs", build_s)
@@ -257,6 +307,10 @@ def build(cfg: BuildConfig, npz_path: Path = DEFAULT_NPZ, device: str = "cuda") 
         build_meta["rroq158_k"] = int(cfg.rroq158_k)
         build_meta["rroq158_seed"] = int(cfg.rroq158_seed)
         build_meta["rroq158_group_size"] = int(cfg.rroq158_group_size)
+    elif cfg.compression == Compression.RROQ4_RIEM:
+        build_meta["rroq4_riem_k"] = int(cfg.rroq4_riem_k)
+        build_meta["rroq4_riem_seed"] = int(cfg.rroq4_riem_seed)
+        build_meta["rroq4_riem_group_size"] = int(cfg.rroq4_riem_group_size)
     with open(index_dir / "build_meta.json", "w") as f:
         json.dump(build_meta, f, indent=2)
 

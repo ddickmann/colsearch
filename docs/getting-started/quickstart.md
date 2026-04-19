@@ -159,10 +159,15 @@ Graph augmentation runs after first-stage retrieval and is merged additively.
 - `k_candidates`: router frontier before exact scoring
 - `compression`: stored representation. Default is `rroq158` (Riemannian
   1.58-bit, K=8192) on both GPU and CPU; opt-outs include `fp16`, `int8`,
-  `roq4`. Existing indexes load against their build-time codec via the
-  manifest, so flipping the default is non-breaking for deployed clusters.
+  `roq4`, and `rroq4_riem` (Riemannian 4-bit asymmetric — the safe-fallback
+  lane for zero-regression workloads). Existing indexes load against their
+  build-time codec via the manifest, so flipping the default is
+  non-breaking for deployed clusters.
 - `rroq158_k` / `rroq158_seed` / `rroq158_group_size`: tuning knobs for the
   default codec. Defaults are `K=8192`, `seed=42`, `group_size=32`.
+- `rroq4_riem_k` / `rroq4_riem_seed` / `rroq4_riem_group_size`: tuning knobs
+  for the safe-fallback codec when `compression="rroq4_riem"`. Defaults are
+  `K=8192`, `seed=42`, `group_size=32`.
 - `quantization_mode`: active GPU scoring mode such as `int8`, `fp8`, or `roq4`
 - `transfer_mode`: CPU->GPU fetch strategy for streamed GPU scoring
 

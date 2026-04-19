@@ -51,6 +51,58 @@ class ShardSegmentManagerSearchMixin:
             return None
         return self._roq_quantizer
 
+    def _load_rroq4_riem_meta(self):
+        """Lazy-load `rroq4_riem_meta.npz` (centroids + fwht_seed + group_size).
+
+        The artifact is written by `lifecycle.build()` /
+        `pipeline.build()` when `Compression.RROQ4_RIEM` is selected.
+        Mirrors :func:`_load_rroq158_meta` — caches a `False` sentinel on
+        miss to avoid re-stat'ing the path every query.
+        """
+        if self._rroq4_riem_meta is False:
+            return None
+        if self._rroq4_riem_meta is not None:
+            return self._rroq4_riem_meta
+        meta_path = self._path / "rroq4_riem_meta.npz"
+        if not meta_path.exists():
+            self._rroq4_riem_meta = False
+            return None
+        try:
+            with np.load(str(meta_path)) as arr:
+                centroids = np.ascontiguousarray(arr["centroids"], dtype=np.float32)
+                seed = int(np.asarray(arr["fwht_seed"]).item())
+                dim = int(np.asarray(arr["dim"]).item())
+                group_size = int(np.asarray(arr["group_size"]).item())
+            try:
+                from voyager_index._internal.inference.quantization.rroq4_riem import (
+                    get_cached_fwht_rotator,
+                )
+                rotator = get_cached_fwht_rotator(dim=dim, seed=seed)
+            except Exception:
+                rotator = None
+            self._rroq4_riem_meta = {
+                "centroids": centroids,
+                "fwht_seed": seed,
+                "dim": dim,
+                "group_size": group_size,
+                "rotator": rotator,
+            }
+            logger.info(
+                "RROQ4_RIEM meta loaded: K=%d, dim=%d, group_size=%d "
+                "(rotator cached: %s)",
+                centroids.shape[0],
+                dim,
+                group_size,
+                rotator is not None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to load RROQ4_RIEM meta from %s: %s", meta_path, exc
+            )
+            self._rroq4_riem_meta = False
+            return None
+        return self._rroq4_riem_meta
+
     def _load_rroq158_meta(self):
         """Lazy-load `rroq158_meta.npz` (centroids + fwht_seed) from the index dir.
 
@@ -252,6 +304,184 @@ class ShardSegmentManagerSearchMixin:
             logger.warning("ROQ4 serving path failed; falling back to standard scoring: %s", exc)
             return None
 
+    def _score_rroq4_riem_candidates(
+        self,
+        q: torch.Tensor,
+        shard_groups: Dict[int, List[int]],
+        internal_k: int,
+        dev: torch.device,
+    ) -> Optional[Tuple[List[Tuple[int, float]], Dict[str, Any]]]:
+        """Score `shard_groups` using the rroq4_riem packed shards.
+
+        Mirrors :meth:`_score_rroq158_candidates` but with 4-bit
+        asymmetric residuals instead of ternary 1.58-bit. Works on both
+        CUDA (Triton) and CPU (Rust SIMD via `latence_shard_engine`).
+        Returns ``None`` if the index is not rroq4_riem-encoded or the
+        kernel is unreachable, in which case the caller falls through to
+        the standard scoring path.
+        """
+        if self._store is None:
+            return None
+        meta = self._load_rroq4_riem_meta()
+        if meta is None:
+            return None
+        try:
+            from voyager_index._internal.inference.quantization.rroq4_riem import (
+                encode_query_for_rroq4_riem,
+            )
+            from voyager_index._internal.inference.shard_engine.scorer import (
+                score_rroq4_riem_topk,
+            )
+        except ImportError as exc:
+            logger.warning("rroq4_riem scoring imports unavailable: %s", exc)
+            return None
+
+        try:
+            with Timer(sync_cuda=False) as t_prepare:
+                q_np = q.detach().cpu().numpy().astype(np.float32)
+                centroids_np = meta["centroids"]
+                group_size = int(meta["group_size"])
+                on_cuda = dev.type == "cuda"
+                q_inputs = encode_query_for_rroq4_riem(
+                    q_np,
+                    None if on_cuda else centroids_np,
+                    fwht_seed=meta["fwht_seed"],
+                    group_size=group_size,
+                    rotator=meta.get("rotator"),
+                    skip_qc_table=on_cuda,
+                )
+                q_rot_t = torch.from_numpy(q_inputs["q_rot"][None, :, :])
+                q_gs_t = torch.from_numpy(q_inputs["q_group_sums"][None, :, :])
+                if on_cuda:
+                    centroids_t = meta.get("centroids_dev")
+                    if centroids_t is None or centroids_t.device != dev:
+                        centroids_t = torch.from_numpy(centroids_np).to(dev)
+                        meta["centroids_dev"] = centroids_t
+                    q_dev = torch.from_numpy(q_np).to(dev)
+                    qct = (q_dev @ centroids_t.T).unsqueeze(0)
+                else:
+                    qct = torch.from_numpy(q_inputs["qc_table"][None, :, :])
+
+            with Timer(sync_cuda=False) as t_fetch:
+                doc_ids: List[int] = []
+                code_rows: List[np.ndarray] = []
+                min_rows: List[np.ndarray] = []
+                dlt_rows: List[np.ndarray] = []
+                cid_rows: List[np.ndarray] = []
+                cos_rows: List[np.ndarray] = []
+                sin_rows: List[np.ndarray] = []
+                num_shards = 0
+                for shard_id, dids in shard_groups.items():
+                    cached = self._rroq4_riem_shard_view_cache.get(int(shard_id))
+                    if cached is None:
+                        loaded = self._store.load_shard_rroq4_riem(shard_id)
+                        if loaded is None:
+                            continue
+                        cached = {
+                            "codes": loaded["codes"].cpu().numpy().astype(np.uint8, copy=False),
+                            "mins": loaded["mins"].cpu().numpy().astype(np.float32, copy=False),
+                            "deltas": loaded["deltas"].cpu().numpy().astype(np.float32, copy=False),
+                            "cid": loaded["centroid_id"].cpu().numpy().astype(np.int32, copy=False),
+                            "cos": loaded["cos_norm"].cpu().numpy().astype(np.float32, copy=False),
+                            "sin": loaded["sin_norm"].cpu().numpy().astype(np.float32, copy=False),
+                            "offsets": loaded["doc_offsets"].cpu().numpy(),
+                            "row_by_doc": {
+                                int(d): idx for idx, d in enumerate(
+                                    loaded["doc_ids"].cpu().numpy().tolist()
+                                )
+                            },
+                        }
+                        self._rroq4_riem_shard_view_cache[int(shard_id)] = cached
+                    num_shards += 1
+                    codes_t = cached["codes"]
+                    mins_t = cached["mins"]
+                    dlts_t = cached["deltas"]
+                    cid_t = cached["cid"]
+                    cos_t = cached["cos"]
+                    sin_t = cached["sin"]
+                    offsets = cached["offsets"]
+                    row_by_doc = cached["row_by_doc"]
+                    for did in dids:
+                        row = row_by_doc.get(int(did))
+                        if row is None:
+                            continue
+                        start = int(offsets[row, 0])
+                        end = int(offsets[row, 1])
+                        doc_ids.append(int(did))
+                        code_rows.append(codes_t[start:end])
+                        min_rows.append(mins_t[start:end])
+                        dlt_rows.append(dlts_t[start:end])
+                        cid_rows.append(cid_t[start:end])
+                        cos_rows.append(cos_t[start:end])
+                        sin_rows.append(sin_t[start:end])
+                if not doc_ids:
+                    return None
+                T_max = max(r.shape[0] for r in code_rows)
+                B = len(doc_ids)
+                n_bytes = code_rows[0].shape[1]
+                n_groups = min_rows[0].shape[1]
+                doc_codes = np.zeros((B, T_max, n_bytes), dtype=np.uint8)
+                # Pad deltas with 1.0 so the kernel never multiplies by an
+                # exact-zero scale on a padding token (cos/sin norms zero
+                # the contribution out anyway, but a 0-delta would also
+                # shut down the inner-product gradient path used in any
+                # numerical-debug build).
+                doc_mins = np.zeros((B, T_max, n_groups), dtype=np.float32)
+                doc_dlts = np.ones((B, T_max, n_groups), dtype=np.float32)
+                doc_cid = np.zeros((B, T_max), dtype=np.int32)
+                doc_cos = np.zeros((B, T_max), dtype=np.float32)
+                doc_sin = np.zeros((B, T_max), dtype=np.float32)
+                docs_mask = np.zeros((B, T_max), dtype=np.float32)
+                for i, (cd, mn, dl, ci, co, si) in enumerate(
+                    zip(code_rows, min_rows, dlt_rows, cid_rows, cos_rows, sin_rows)
+                ):
+                    t = cd.shape[0]
+                    doc_codes[i, :t] = cd
+                    doc_mins[i, :t] = mn
+                    doc_dlts[i, :t] = dl
+                    doc_cid[i, :t] = ci
+                    doc_cos[i, :t] = co
+                    doc_sin[i, :t] = si
+                    docs_mask[i, :t] = 1.0
+
+            with Timer(sync_cuda=dev.type == "cuda") as t_exact:
+                ids, scores = score_rroq4_riem_topk(
+                    q_rot=q_rot_t,
+                    q_group_sums=q_gs_t,
+                    qc_table=qct,
+                    doc_centroid_id=torch.from_numpy(doc_cid),
+                    doc_cos_norm=torch.from_numpy(doc_cos),
+                    doc_sin_norm=torch.from_numpy(doc_sin),
+                    doc_codes=torch.from_numpy(doc_codes),
+                    doc_mins=torch.from_numpy(doc_mins),
+                    doc_deltas=torch.from_numpy(doc_dlts),
+                    doc_ids=doc_ids,
+                    k=internal_k,
+                    group_size=group_size,
+                    documents_mask=torch.from_numpy(docs_mask),
+                    device=dev,
+                )
+            if not ids and doc_ids:
+                return None
+            stage_stats = self._empty_exact_stage_stats("rroq4_riem_pipeline")
+            stage_stats["prepare_ms"] = t_prepare.elapsed_ms
+            stage_stats["fetch_ms"] = t_fetch.elapsed_ms
+            stage_stats["exact_ms"] = t_exact.elapsed_ms
+            stage_stats["maxsim_ms"] = t_exact.elapsed_ms
+            stage_stats["num_shards_fetched"] = num_shards
+            stage_stats["num_docs_scored"] = len(doc_ids)
+            stage_stats["h2d_bytes"] = int(
+                doc_codes.nbytes + doc_mins.nbytes + doc_dlts.nbytes
+                + doc_cid.nbytes + doc_cos.nbytes + doc_sin.nbytes
+            )
+            return list(zip(ids, scores)), stage_stats
+        except Exception as exc:
+            logger.warning(
+                "RROQ4_RIEM serving path failed; falling back to standard scoring: %s",
+                exc,
+            )
+            return None
+
     def _score_rroq158_candidates(
         self,
         q: torch.Tensor,
@@ -447,6 +677,8 @@ class ShardSegmentManagerSearchMixin:
         """
         if self._load_rroq158_meta() is not None:
             return "rroq158"
+        if self._load_rroq4_riem_meta() is not None:
+            return "rroq4_riem"
         if self._load_roq_quantizer() is not None:
             return "roq4"
         return ""
@@ -550,6 +782,7 @@ class ShardSegmentManagerSearchMixin:
             quant_mode = self._derive_quantization_mode_from_storage()
         want_roq4 = dev.type == "cuda" and quant_mode == "roq4"
         want_rroq158 = quant_mode == "rroq158"
+        want_rroq4_riem = quant_mode == "rroq4_riem"
         want_quantized_kernel = dev.type == "cuda" and quant_mode in {"int8", "fp8"}
         want_colbandit = bool(getattr(scfg, "use_colbandit", False))
 
@@ -593,6 +826,38 @@ class ShardSegmentManagerSearchMixin:
                         "rroq158 shards selected but neither the Triton GPU "
                         "kernel (no CUDA available) nor the Rust SIMD CPU "
                         "kernel (latence_shard_engine.rroq158_score_batch "
+                        "missing) is reachable. Install latence_shard_engine "
+                        "via `pip install latence-shard-engine`, or rebuild "
+                        "the index with `compression=Compression.FP16`."
+                    )
+
+        if want_rroq4_riem:
+            # rroq4_riem works on both CUDA (Triton) and CPU (Rust SIMD).
+            rroq_result = self._score_rroq4_riem_candidates(
+                q,
+                shard_groups,
+                internal_k,
+                dev,
+            )
+            if rroq_result is not None:
+                results, stage_stats = rroq_result
+                return results, exact_candidate_ids, "rroq4_riem_pipeline", stage_stats
+            # Same loud-fail policy as rroq158: shards are encoded with a
+            # codec the runtime can't decode, falling through silently
+            # would empty out result rows.
+            if self._load_rroq4_riem_meta() is not None:
+                cuda_available = dev.type == "cuda"
+                rust_available = False
+                try:
+                    import latence_shard_engine as _eng  # noqa: F401
+                    rust_available = hasattr(_eng, "rroq4_riem_score_batch")
+                except ImportError:
+                    rust_available = False
+                if not cuda_available and not rust_available:
+                    raise RuntimeError(
+                        "rroq4_riem shards selected but neither the Triton GPU "
+                        "kernel (no CUDA available) nor the Rust SIMD CPU "
+                        "kernel (latence_shard_engine.rroq4_riem_score_batch "
                         "missing) is reachable. Install latence_shard_engine "
                         "via `pip install latence-shard-engine`, or rebuild "
                         "the index with `compression=Compression.FP16`."

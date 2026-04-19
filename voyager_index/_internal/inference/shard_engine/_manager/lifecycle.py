@@ -49,13 +49,16 @@ class ShardSegmentManagerLifecycleMixin:
         self._colbandit_reranker: Optional[RerankerProtocol] = None
         self._roq_quantizer = None
         self._rroq158_meta = None  # lazy: dict{centroids, fwht_seed, dim, group_size} or False
-        # Per-shard numpy view cache for ROQ4 / RROQ158 scoring. Caches the
-        # `.cpu().numpy()` materialization of the per-shard tensors so the
-        # inner per-query loop does not re-materialize them every call. Keyed
-        # by shard_id; values are dicts of numpy arrays. See
-        # `_score_roq4_candidates` / `_score_rroq158_candidates`.
+        self._rroq4_riem_meta = None  # lazy: dict{centroids, fwht_seed, dim, group_size} or False
+        # Per-shard numpy view cache for ROQ4 / RROQ158 / RROQ4_RIEM
+        # scoring. Caches the `.cpu().numpy()` materialization of the
+        # per-shard tensors so the inner per-query loop does not
+        # re-materialize them every call. Keyed by shard_id; values are
+        # dicts of numpy arrays. See `_score_roq4_candidates` /
+        # `_score_rroq158_candidates` / `_score_rroq4_riem_candidates`.
         self._roq4_shard_view_cache: Dict[int, Dict[str, Any]] = {}
         self._rroq158_shard_view_cache: Dict[int, Dict[str, Any]] = {}
+        self._rroq4_riem_shard_view_cache: Dict[int, Dict[str, Any]] = {}
         self._last_exact_path: Optional[str] = None
         self._last_prune_path: Optional[str] = None
         self._checkpoint_mgr = ShardCheckpointManager(self._path)
@@ -153,6 +156,7 @@ class ShardSegmentManagerLifecycleMixin:
             roq_doc_codes = None
             roq_doc_meta = None
             rroq158_payload = None
+            rroq4_riem_payload = None
             effective_compression = cfg.compression
             if cfg.compression == Compression.ROQ4:
                 try:
@@ -245,6 +249,72 @@ class ShardSegmentManagerLifecycleMixin:
                         "RROQ158 encoding done for %d docs (%d tokens, K=%d)",
                         n_docs, n_tok, effective_k,
                     )
+            elif cfg.compression == Compression.RROQ4_RIEM:
+                from voyager_index._internal.inference.quantization.rroq4_riem import (
+                    Rroq4RiemConfig,
+                    choose_effective_rroq4_riem_k,
+                    encode_rroq4_riem,
+                )
+
+                gs = int(cfg.rroq4_riem_group_size)
+                n_tok = int(all_vecs.shape[0])
+                if n_tok < gs:
+                    # Same data-shape fallback story as RROQ158: a corpus
+                    # with fewer tokens than a single 4-bit group cannot be
+                    # quantized at all. Drop to FP16 with a loud warning so
+                    # the operator notices the auto-downgrade. The "no
+                    # silent FP16 fallback" rule covers codec failures
+                    # (which would silently 8x index size); this path
+                    # applies to corpora that physically cannot host any
+                    # asymmetric codebook.
+                    logger.warning(
+                        "RROQ4_RIEM requested but corpus has only %d tokens "
+                        "(< group_size=%d). Falling back to FP16 — rroq4_riem "
+                        "needs at least one 4-bit group of tokens to encode. "
+                        "Pass compression=FP16 explicitly to silence.",
+                        n_tok, gs,
+                    )
+                    effective_compression = Compression.FP16
+                else:
+                    # Auto-shrink K when the corpus has fewer tokens than the
+                    # requested codebook size (typical only in tests / demos /
+                    # very small shards). Same policy as RROQ158: keep the
+                    # user's explicit choice of the rroq4_riem codec — only
+                    # the centroid count adapts.
+                    effective_k = choose_effective_rroq4_riem_k(
+                        n_tokens=n_tok,
+                        requested_k=int(cfg.rroq4_riem_k),
+                        group_size=gs,
+                    )
+                    logger.info(
+                        "Training RROQ4_RIEM (Riemannian 4-bit asymmetric) "
+                        "quantizer (K=%d, group_size=%d, seed=%d) ...",
+                        effective_k, gs, int(cfg.rroq4_riem_seed),
+                    )
+                    r4r_cfg = Rroq4RiemConfig(
+                        K=effective_k,
+                        group_size=gs,
+                        seed=int(cfg.rroq4_riem_seed),
+                        fit_sample_cap=max(100_000, effective_k),
+                    )
+                    rroq4_riem_payload = encode_rroq4_riem(
+                        np.asarray(all_vecs, dtype=np.float32), r4r_cfg
+                    )
+                    np.savez(
+                        self._path / "rroq4_riem_meta.npz",
+                        centroids=rroq4_riem_payload.centroids,
+                        fwht_seed=np.array(
+                            rroq4_riem_payload.fwht_seed, dtype=np.int64
+                        ),
+                        dim=np.array(rroq4_riem_payload.dim, dtype=np.int32),
+                        group_size=np.array(
+                            rroq4_riem_payload.group_size, dtype=np.int32
+                        ),
+                    )
+                    logger.info(
+                        "RROQ4_RIEM encoding done for %d docs (%d tokens, K=%d)",
+                        n_docs, n_tok, effective_k,
+                    )
 
             store = ShardStore(self._path)
             store.build(
@@ -259,6 +329,7 @@ class ShardSegmentManagerLifecycleMixin:
                 roq_doc_codes=roq_doc_codes,
                 roq_doc_meta=roq_doc_meta,
                 rroq158_payload=rroq158_payload,
+                rroq4_riem_payload=rroq4_riem_payload,
             )
 
             meta = {
@@ -273,6 +344,10 @@ class ShardSegmentManagerLifecycleMixin:
                 meta["rroq158_k"] = int(cfg.rroq158_k)
                 meta["rroq158_seed"] = int(cfg.rroq158_seed)
                 meta["rroq158_group_size"] = int(cfg.rroq158_group_size)
+            elif effective_compression == Compression.RROQ4_RIEM:
+                meta["rroq4_riem_k"] = int(cfg.rroq4_riem_k)
+                meta["rroq4_riem_seed"] = int(cfg.rroq4_riem_seed)
+                meta["rroq4_riem_group_size"] = int(cfg.rroq4_riem_group_size)
             atomic_json_write(self._path / "engine_meta.json", meta)
 
             payload_dict = {}
