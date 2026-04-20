@@ -430,104 +430,230 @@ class PreloadedGpuCorpus:
         dtype: torch.dtype = torch.float16,
     ):
         n_docs = len(doc_vecs)
-        raw_max_tok = max(v.shape[0] for v in doc_vecs) if doc_vecs else 1
-        # Pad the corpus-wide D/M tensors to the next pow2 so per-query
-        # truncations in `score_candidates` always land on a value the
-        # Triton MaxSim autotune cache has been warmed for. Without this,
-        # NUM_D_TOKENS takes hundreds of unique values (one per query
-        # candidate set) and every distinct (qt, dt) pair triggers a fresh
-        # ~80 ms autotune compile on H100 (see warmup_maxsim above).
-        max_tok = _next_pow2(raw_max_tok, 32)
-        logger.info(
-            "PreloadedGpuCorpus: %d docs, max_tok=%d (raw %d, pow2-padded), dim=%d, %.1f GB %s",
-            n_docs,
-            max_tok,
-            raw_max_tok,
-            dim,
-            n_docs * max_tok * dim * (2 if dtype == torch.float16 else 4) / 1e9,
-            dtype,
-        )
-        self.D = torch.zeros((n_docs, max_tok, dim), dtype=dtype, device=device)
-        self.M = torch.zeros((n_docs, max_tok), dtype=torch.float32, device=device)
         self.doc_ids = list(doc_ids)
         self.doc_id_to_idx = {did: i for i, did in enumerate(doc_ids)}
-        self.max_tok = max_tok
         self.dim = dim
         self._device = device
-
-        raw_counts: List[int] = []
-        for i, v in enumerate(doc_vecs):
-            tok = v.shape[0]
-            raw_counts.append(tok)
-            self.D[i, :tok] = torch.from_numpy(v).to(dtype)
-            self.M[i, :tok] = 1.0
-
-        # Precomputed hot-path helpers:
-        # - self.doc_ids_tensor: GPU tensor of doc_ids for O(1) gather to
-        #   the output (avoids Python list comprehension on the fast path).
-        # - self._corpus_actual_max_pow2: pow2 bound on the longest doc;
-        #   lets us truncate D/M once and reuse the same shape for every
-        #   full-corpus query (single warmed autotune entry, no per-query
-        #   shape probe).
+        self._dtype = dtype
         self.doc_ids_tensor = torch.tensor(doc_ids, dtype=torch.long, device=device)
-        self._corpus_raw_max_tok = int(max(raw_counts)) if raw_counts else 0
-        self._corpus_actual_max_pow2 = (
-            min(_next_pow2(self._corpus_raw_max_tok, 32), max_tok)
-            if self._corpus_raw_max_tok > 0
-            else max_tok
-        )
-        self._corpus_has_padding = self._corpus_actual_max_pow2 < max_tok or any(
-            c < self._corpus_actual_max_pow2 for c in raw_counts
-        )
-        if self._corpus_actual_max_pow2 < max_tok:
-            self._D_all = self.D[:, : self._corpus_actual_max_pow2].contiguous()
-            self._M_all = self.M[:, : self._corpus_actual_max_pow2].contiguous()
-        else:
-            self._D_all = self.D
-            self._M_all = self.M
+        self._build_layout(doc_vecs)
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        logger.info(
-            "PreloadedGpuCorpus ready on %s (whole-corpus D_tok=%d, has_padding=%s)",
-            device,
-            self._corpus_actual_max_pow2,
-            self._corpus_has_padding,
+        if self._is_bucketed:
+            logger.info(
+                "PreloadedGpuCorpus ready on %s (bucketed: short n=%d D_tok=%d, "
+                "tall n=%d D_tok=%d, total %.2f GB vs %.2f GB single-tier)",
+                device,
+                int(self._short_idx.numel()), int(self._D_short.shape[1]),
+                int(self._tall_idx.numel()),
+                int(self._D_tall.shape[1]) if self._D_tall is not None else 0,
+                self._bucketed_bytes / 1e9,
+                self._single_tier_bytes / 1e9,
+            )
+        else:
+            logger.info(
+                "PreloadedGpuCorpus ready on %s (whole-corpus D_tok=%d, has_padding=%s)",
+                device,
+                self._corpus_actual_max_pow2,
+                self._corpus_has_padding,
+            )
+
+    def _bucketing_enabled(self) -> bool:
+        """Bucketed padding enabled by default; disable with env var
+        ``VOYAGER_FP16_BUCKETED_PADDING=0`` if you want to force the legacy
+        single-tier behavior. Bucketing only *activates* when it saves
+        substantial VRAM (see ``_build_layout``), so leaving the default on
+        is byte-identical to the legacy path for token-count-uniform
+        corpora (every BEIR dataset except quora)."""
+        return os.environ.get("VOYAGER_FP16_BUCKETED_PADDING", "1").strip() not in (
+            "0", "false", "False", "off",
         )
+
+    def _build_layout(self, doc_vecs: list) -> None:
+        """Allocate the GPU tensor(s) for a corpus snapshot.
+
+        Picks between two layouts:
+
+          * **Single-tier** (legacy): one ``(n_docs, T_max, dim)`` tensor
+            with ``T_max = next_pow2(max(token_counts), 32)``. Used when
+            the corpus token-count distribution is roughly uniform, which
+            is the case for every BEIR dataset whose corpus is not heavily
+            tail-skewed.
+
+          * **Bucketed** (new): two tensors —
+            ``(n_short, T_short, dim)`` for docs with
+            ``token_count <= T_short`` (where ``T_short = next_pow2(p95)``)
+            and ``(n_tall, T_tall, dim)`` for the rest. The MaxSim kernel
+            is launched once per non-empty bucket and scores are scattered
+            back into a single ``(n_docs,)`` buffer for top-k. Triggered
+            only when ``bucketed_bytes < 0.7 * single_tier_bytes`` AND
+            ``n_docs >= 1024`` (small corpora don't benefit from the extra
+            kernel launch). For quora (522 K docs, p95=30, max=253) this
+            cuts the GPU corpus from 34.3 GB to ~9 GB, restoring the
+            whole-corpus fast path on H100.
+        """
+        n_docs = len(doc_vecs)
+        raw_counts = np.array(
+            [v.shape[0] for v in doc_vecs], dtype=np.int64
+        ) if doc_vecs else np.array([1], dtype=np.int64)
+
+        raw_max_tok = int(raw_counts.max()) if doc_vecs else 1
+        T_max = _next_pow2(raw_max_tok, 32)
+        dtype_bytes = (2 if self._dtype == torch.float16 else 4)
+        single_tier_bytes = n_docs * T_max * self.dim * dtype_bytes
+        self._single_tier_bytes = single_tier_bytes
+
+        # Decide whether to bucket
+        T_short = T_max
+        n_short = n_docs
+        bucketed_bytes = single_tier_bytes
+        bucketed = False
+        if self._bucketing_enabled() and n_docs >= 1024 and len(raw_counts) > 0:
+            p95 = int(np.percentile(raw_counts, 95))
+            T_short_candidate = _next_pow2(max(p95, 32), 32)
+            if T_short_candidate < T_max:
+                short_mask = raw_counts <= T_short_candidate
+                n_short_candidate = int(short_mask.sum())
+                n_tall_candidate = n_docs - n_short_candidate
+                bytes_short = n_short_candidate * T_short_candidate * self.dim * dtype_bytes
+                bytes_tall = n_tall_candidate * T_max * self.dim * dtype_bytes
+                bucketed_bytes_candidate = bytes_short + bytes_tall
+                # Activate only when savings are substantial (>=30 % VRAM
+                # reduction) — under that threshold the extra kernel
+                # launch isn't worth the complexity.
+                if bucketed_bytes_candidate < 0.7 * single_tier_bytes:
+                    bucketed = True
+                    T_short = T_short_candidate
+                    n_short = n_short_candidate
+                    bucketed_bytes = bucketed_bytes_candidate
+
+        self._is_bucketed = bucketed
+        self._bucketed_bytes = bucketed_bytes
+        self._gpu_bytes = bucketed_bytes  # used by _should_use_fast_path
+
+        if not bucketed:
+            # Legacy single-tier path (unchanged byte-for-byte for
+            # token-uniform corpora).
+            self.max_tok = T_max
+            logger.info(
+                "PreloadedGpuCorpus: %d docs, max_tok=%d (raw %d, pow2-padded), "
+                "dim=%d, %.1f GB %s",
+                n_docs, T_max, raw_max_tok, self.dim,
+                single_tier_bytes / 1e9, self._dtype,
+            )
+            self.D = torch.zeros(
+                (n_docs, T_max, self.dim), dtype=self._dtype, device=self._device,
+            )
+            self.M = torch.zeros(
+                (n_docs, T_max), dtype=torch.float32, device=self._device,
+            )
+            for i, v in enumerate(doc_vecs):
+                tok = v.shape[0]
+                self.D[i, :tok] = torch.from_numpy(v).to(self._dtype)
+                self.M[i, :tok] = 1.0
+            self._corpus_raw_max_tok = raw_max_tok
+            self._corpus_actual_max_pow2 = min(_next_pow2(raw_max_tok, 32), T_max)
+            self._corpus_has_padding = (
+                self._corpus_actual_max_pow2 < T_max
+                or bool((raw_counts < self._corpus_actual_max_pow2).any())
+            )
+            if self._corpus_actual_max_pow2 < T_max:
+                self._D_all = self.D[:, : self._corpus_actual_max_pow2].contiguous()
+                self._M_all = self.M[:, : self._corpus_actual_max_pow2].contiguous()
+            else:
+                self._D_all = self.D
+                self._M_all = self.M
+            # Bucketed-only attributes set to None to keep attribute access
+            # cheap on the legacy path (no AttributeError checks needed).
+            self._D_short = None
+            self._M_short = None
+            self._D_tall = None
+            self._M_tall = None
+            self._short_idx = None
+            self._tall_idx = None
+            return
+
+        # Bucketed path
+        self.max_tok = T_max
+        n_tall = n_docs - n_short
+        short_mask_np = raw_counts <= T_short
+        short_orig = np.flatnonzero(short_mask_np).astype(np.int64)
+        tall_orig = np.flatnonzero(~short_mask_np).astype(np.int64)
+
+        logger.info(
+            "PreloadedGpuCorpus: %d docs BUCKETED (short n=%d at D_tok=%d, "
+            "tall n=%d at D_tok=%d, raw_max=%d), dim=%d, %.2f GB total "
+            "(vs %.2f GB single-tier, %.1fx leaner) %s",
+            n_docs, n_short, T_short, n_tall, T_max, raw_max_tok, self.dim,
+            bucketed_bytes / 1e9, single_tier_bytes / 1e9,
+            single_tier_bytes / max(bucketed_bytes, 1), self._dtype,
+        )
+
+        self._D_short = torch.zeros(
+            (n_short, T_short, self.dim), dtype=self._dtype, device=self._device,
+        )
+        self._M_short = torch.zeros(
+            (n_short, T_short), dtype=torch.float32, device=self._device,
+        )
+        for li, oi in enumerate(short_orig):
+            v = doc_vecs[int(oi)]
+            tok = v.shape[0]
+            self._D_short[li, :tok] = torch.from_numpy(v).to(self._dtype)
+            self._M_short[li, :tok] = 1.0
+
+        if n_tall > 0:
+            self._D_tall = torch.zeros(
+                (n_tall, T_max, self.dim), dtype=self._dtype, device=self._device,
+            )
+            self._M_tall = torch.zeros(
+                (n_tall, T_max), dtype=torch.float32, device=self._device,
+            )
+            for li, oi in enumerate(tall_orig):
+                v = doc_vecs[int(oi)]
+                tok = v.shape[0]
+                self._D_tall[li, :tok] = torch.from_numpy(v).to(self._dtype)
+                self._M_tall[li, :tok] = 1.0
+        else:
+            self._D_tall = None
+            self._M_tall = None
+
+        self._short_idx = torch.from_numpy(short_orig).to(self._device)
+        self._tall_idx = torch.from_numpy(tall_orig).to(self._device)
+
+        # orig_idx -> (bucket_id, local_idx) lookup for score_candidates.
+        # bucket_id: 0 short, 1 tall. local_idx: position within bucket.
+        bucket_id = np.zeros(n_docs, dtype=np.int64)
+        bucket_id[tall_orig] = 1
+        local_idx = np.zeros(n_docs, dtype=np.int64)
+        local_idx[short_orig] = np.arange(n_short, dtype=np.int64)
+        local_idx[tall_orig] = np.arange(n_tall, dtype=np.int64)
+        self._orig_to_bucket = torch.from_numpy(bucket_id).to(self._device)
+        self._orig_to_local = torch.from_numpy(local_idx).to(self._device)
+
+        # Legacy attributes set to keep external code that reads
+        # `.D` / `.M` working — point them at the short bucket because
+        # that's the (overwhelming) majority of the corpus. Callers that
+        # mutate `.D` / `.M` directly are not supported in bucketed mode
+        # and will trip on the score-path assertions below.
+        self.D = self._D_short
+        self.M = self._M_short
+        self._corpus_raw_max_tok = raw_max_tok
+        self._corpus_actual_max_pow2 = T_max
+        self._corpus_has_padding = True
+        self._D_all = None  # not meaningful in bucketed mode
+        self._M_all = None
 
     def refresh(self, doc_vecs: list, doc_ids: List[int]) -> None:
-        """Rebuild GPU tensors from a new sealed snapshot."""
-        n_docs = len(doc_vecs)
-        raw_max_tok = max(v.shape[0] for v in doc_vecs) if doc_vecs else 1
-        max_tok = _next_pow2(raw_max_tok, 32)
-        self.D = torch.zeros((n_docs, max_tok, self.dim), dtype=self.D.dtype, device=self._device)
-        self.M = torch.zeros((n_docs, max_tok), dtype=torch.float32, device=self._device)
+        """Rebuild GPU tensors from a new sealed snapshot. Reuses the
+        same bucketing decision as ``__init__`` so a corpus that grew /
+        shrank into a different distribution gets the right layout."""
         self.doc_ids = list(doc_ids)
         self.doc_id_to_idx = {did: i for i, did in enumerate(doc_ids)}
-        self.max_tok = max_tok
-        raw_counts: List[int] = []
-        for i, v in enumerate(doc_vecs):
-            tok = v.shape[0]
-            raw_counts.append(tok)
-            self.D[i, :tok] = torch.from_numpy(v).to(self.D.dtype)
-            self.M[i, :tok] = 1.0
-
-        self.doc_ids_tensor = torch.tensor(doc_ids, dtype=torch.long, device=self._device)
-        self._corpus_raw_max_tok = int(max(raw_counts)) if raw_counts else 0
-        self._corpus_actual_max_pow2 = (
-            min(_next_pow2(self._corpus_raw_max_tok, 32), max_tok)
-            if self._corpus_raw_max_tok > 0
-            else max_tok
+        self.doc_ids_tensor = torch.tensor(
+            doc_ids, dtype=torch.long, device=self._device,
         )
-        self._corpus_has_padding = self._corpus_actual_max_pow2 < max_tok or any(
-            c < self._corpus_actual_max_pow2 for c in raw_counts
-        )
-        if self._corpus_actual_max_pow2 < max_tok:
-            self._D_all = self.D[:, : self._corpus_actual_max_pow2].contiguous()
-            self._M_all = self.M[:, : self._corpus_actual_max_pow2].contiguous()
-        else:
-            self._D_all = self.D
-            self._M_all = self.M
+        self._build_layout(doc_vecs)
 
     def score_all(
         self,
@@ -565,7 +691,7 @@ class PreloadedGpuCorpus:
         if qt_padded != qt_raw:
             q = torch.nn.functional.pad(q, (0, 0, 0, qt_padded - qt_raw))
 
-        n_docs = self.D.shape[0]
+        n_docs = len(self.doc_ids)
         if n_docs == 0:
             if return_stats:
                 empty_stats = {
@@ -576,12 +702,44 @@ class PreloadedGpuCorpus:
                 return [], [], empty_stats
             return [], []
 
-        if not return_stats:
-            scores = maxsim(
+        def _run_maxsim_all() -> torch.Tensor:
+            """Returns a ``(n_docs,)`` score tensor for the full corpus.
+
+            Single-tier: one MaxSim launch over ``self._D_all``.
+            Bucketed:   one launch per non-empty bucket; results are
+                        scatter-merged into a ``(n_docs,)`` buffer
+                        indexed by the original doc order so the ``topk``
+                        below picks across both buckets uniformly.
+            """
+            if not self._is_bucketed:
+                return maxsim(
+                    queries_embeddings=q,
+                    documents_embeddings=self._D_all,
+                    documents_mask=self._M_all if self._corpus_has_padding else None,
+                ).squeeze(0)
+            # Bucketed: short bucket always exists (n_short >= 1 by
+            # construction whenever bucketing activates).
+            scores_buf = torch.full(
+                (n_docs,), float("-inf"),
+                dtype=torch.float32, device=self._device,
+            )
+            s_short = maxsim(
                 queries_embeddings=q,
-                documents_embeddings=self._D_all,
-                documents_mask=self._M_all if self._corpus_has_padding else None,
-            ).squeeze(0)
+                documents_embeddings=self._D_short,
+                documents_mask=self._M_short,
+            ).squeeze(0).to(torch.float32)
+            scores_buf.scatter_(0, self._short_idx, s_short)
+            if self._D_tall is not None and self._D_tall.shape[0] > 0:
+                s_tall = maxsim(
+                    queries_embeddings=q,
+                    documents_embeddings=self._D_tall,
+                    documents_mask=self._M_tall,
+                ).squeeze(0).to(torch.float32)
+                scores_buf.scatter_(0, self._tall_idx, s_tall)
+            return scores_buf
+
+        if not return_stats:
+            scores = _run_maxsim_all()
             final_k = min(k, n_docs)
             top_sc, top_idx = scores.topk(final_k)
             idx_list = top_idx.cpu().tolist()
@@ -590,15 +748,12 @@ class PreloadedGpuCorpus:
         stats = {
             "score_mode": "gpu_corpus_all",
             "prepare_ms": 0.0, "h2d_ms": 0.0, "maxsim_ms": 0.0,
-            "topk_ms": 0.0, "exact_ms": 0.0, "n_buckets": 1,
+            "topk_ms": 0.0, "exact_ms": 0.0,
+            "n_buckets": 2 if self._is_bucketed and self._D_tall is not None else 1,
         }
         with Timer(sync_cuda=True) as t_exact:
             with Timer(sync_cuda=True) as t_maxsim:
-                scores = maxsim(
-                    queries_embeddings=q,
-                    documents_embeddings=self._D_all,
-                    documents_mask=self._M_all if self._corpus_has_padding else None,
-                ).squeeze(0)
+                scores = _run_maxsim_all()
             stats["maxsim_ms"] = t_maxsim.elapsed_ms
 
             final_k = min(k, n_docs)
@@ -651,12 +806,7 @@ class PreloadedGpuCorpus:
                 return [], [], empty_stats
             return [], []
 
-        indices = torch.tensor(
-            [self.doc_id_to_idx[did] for did in valid_ids],
-            dtype=torch.long,
-            device=self._device,
-        )
-
+        n = len(valid_ids)
         stats = {
             "score_mode": "gpu_corpus",
             "prepare_ms": 0.0,
@@ -664,42 +814,101 @@ class PreloadedGpuCorpus:
             "maxsim_ms": 0.0,
             "topk_ms": 0.0,
             "exact_ms": 0.0,
-            "n_buckets": 1,
+            "n_buckets": 2 if (
+                self._is_bucketed and self._D_tall is not None
+            ) else 1,
         }
 
+        def _bucket_score(D_bucket, M_bucket, local_inds):
+            """Gather + MaxSim against a single bucket. Returns scores
+            shaped ``(local_inds.numel(),)`` (or empty)."""
+            if local_inds.numel() == 0:
+                return torch.empty(0, dtype=torch.float32, device=self._device)
+            D_slice = D_bucket[local_inds]
+            M_slice = M_bucket[local_inds]
+            has_padding = bool((M_slice[:, -1] == 0).any())
+            if has_padding:
+                raw_actual_max = int(M_slice.sum(dim=1).max().item())
+                # Round D-tokens up to next pow2 (capped at this
+                # bucket's padded extent) so NUM_D_TOKENS only ever
+                # takes a small set of pre-warmed values; the mask
+                # zeros out the padded region for correctness.
+                actual_max = min(_next_pow2(raw_actual_max, 32), M_slice.shape[1])
+                D_slice = D_slice[:, :actual_max].contiguous()
+                M_slice = M_slice[:, :actual_max].contiguous()
+            sc = maxsim(
+                queries_embeddings=q,
+                documents_embeddings=D_slice,
+                documents_mask=M_slice if has_padding else None,
+            ).squeeze(0).to(torch.float32)
+            return sc
+
         with Timer(sync_cuda=True) as t_exact:
-            with Timer(sync_cuda=True) as t_prepare:
-                D_slice = self.D[indices]
-                M_slice = self.M[indices]
-                has_padding = (M_slice[:, -1] == 0).any()
-                if has_padding:
-                    raw_actual_max = int(M_slice.sum(dim=1).max().item())
-                    # Round D-tokens up to next pow2 (capped at the
-                    # corpus-wide padded extent) so NUM_D_TOKENS only
-                    # ever takes a small set of pre-warmed values; the
-                    # mask zeros out the padded region for correctness.
-                    actual_max = min(_next_pow2(raw_actual_max, 32), M_slice.shape[1])
-                    D_slice = D_slice[:, :actual_max].contiguous()
-                    M_slice = M_slice[:, :actual_max].contiguous()
-            stats["prepare_ms"] += t_prepare.elapsed_ms
+            if not self._is_bucketed:
+                # Single-tier path (unchanged behavior for non-bucketed
+                # corpora).
+                with Timer(sync_cuda=True) as t_prepare:
+                    indices = torch.tensor(
+                        [self.doc_id_to_idx[did] for did in valid_ids],
+                        dtype=torch.long, device=self._device,
+                    )
+                stats["prepare_ms"] += t_prepare.elapsed_ms
+                with Timer(sync_cuda=True) as t_maxsim:
+                    scores = _bucket_score(self.D, self.M, indices)
+                stats["maxsim_ms"] = t_maxsim.elapsed_ms
+                final_k = min(k, n)
+                with Timer(sync_cuda=True) as t_topk:
+                    top_sc, top_idx = scores.topk(final_k)
+                stats["topk_ms"] = t_topk.elapsed_ms
+                idx_list = top_idx.cpu().tolist()
+                result = (
+                    [valid_ids[i] for i in idx_list], top_sc.cpu().tolist(),
+                )
+            else:
+                # Bucketed path: partition candidates by bucket, score
+                # each non-empty bucket, then top-k across the merged
+                # ``(n,)`` score tensor (cand_pos -> score).
+                with Timer(sync_cuda=True) as t_prepare:
+                    orig_indices = torch.tensor(
+                        [self.doc_id_to_idx[did] for did in valid_ids],
+                        dtype=torch.long, device=self._device,
+                    )
+                    buckets = self._orig_to_bucket[orig_indices]
+                    locals_t = self._orig_to_local[orig_indices]
+                    is_short = buckets == 0
+                    short_pos = torch.nonzero(is_short, as_tuple=True)[0]
+                    tall_pos = torch.nonzero(~is_short, as_tuple=True)[0]
+                    short_local = locals_t[short_pos]
+                    tall_local = locals_t[tall_pos]
+                stats["prepare_ms"] += t_prepare.elapsed_ms
 
-            with Timer(sync_cuda=True) as t_maxsim:
-                scores = maxsim(
-                    queries_embeddings=q,
-                    documents_embeddings=D_slice,
-                    documents_mask=M_slice if has_padding else None,
-                ).squeeze(0)
-            stats["maxsim_ms"] = t_maxsim.elapsed_ms
+                with Timer(sync_cuda=True) as t_maxsim:
+                    scores_buf = torch.full(
+                        (n,), float("-inf"),
+                        dtype=torch.float32, device=self._device,
+                    )
+                    if short_local.numel() > 0:
+                        sc_short = _bucket_score(
+                            self._D_short, self._M_short, short_local,
+                        )
+                        scores_buf.scatter_(0, short_pos, sc_short)
+                    if tall_local.numel() > 0 and self._D_tall is not None:
+                        sc_tall = _bucket_score(
+                            self._D_tall, self._M_tall, tall_local,
+                        )
+                        scores_buf.scatter_(0, tall_pos, sc_tall)
+                stats["maxsim_ms"] = t_maxsim.elapsed_ms
 
-            n = len(valid_ids)
-            final_k = min(k, n)
-            with Timer(sync_cuda=True) as t_topk:
-                top_sc, top_idx = scores.topk(final_k)
-            stats["topk_ms"] = t_topk.elapsed_ms
+                final_k = min(k, n)
+                with Timer(sync_cuda=True) as t_topk:
+                    top_sc, top_idx = scores_buf.topk(final_k)
+                stats["topk_ms"] = t_topk.elapsed_ms
+                idx_list = top_idx.cpu().tolist()
+                result = (
+                    [valid_ids[i] for i in idx_list], top_sc.cpu().tolist(),
+                )
 
         stats["exact_ms"] = t_exact.elapsed_ms
-        idx_list = top_idx.cpu().tolist()
-        result = ([valid_ids[i] for i in idx_list], top_sc.cpu().tolist())
         if return_stats:
             return result[0], result[1], stats
         return result

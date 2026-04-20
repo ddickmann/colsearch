@@ -186,30 +186,36 @@ def run_voyager_lane(
     name: str,
     *,
     n_eval: int = 0,
+    mode: str = "gpu",
 ) -> Dict[str, Any]:
     """Run a voyager-index lane via the existing benchmark pipeline.
 
+    `mode` is "gpu" or "cpu" — the underlying `voyager_run_dataset` already
+    knows how to dispatch each (rroq158/fp16 each have CPU/GPU lanes).
     Returns the FastPlaid-shaped row: {dataset, library, ndcg_at_10,
     indexing_time_s, qps, ...metadata}.
     """
     cfg = _VOYAGER_CONFIGS[library]
-    log.info("[voyager:%s] %s: building + searching ...", library, name)
+    if mode not in ("gpu", "cpu"):
+        raise ValueError(f"Unknown voyager mode: {mode!r}")
+    log.info("[voyager:%s/%s] %s: building + searching ...", library, mode, name)
     t_total = time.perf_counter()
     rows = voyager_run_dataset(
         name,
-        modes=cfg["modes"],
+        modes=[mode],
         n_eval=n_eval,
         compression=cfg["compression"],
         **cfg["kwargs"],
     )
     total_wall_s = time.perf_counter() - t_total
 
-    # voyager_run_dataset returns one row per mode (gpu/cpu). We take the GPU
-    # row to mirror FastPlaid's GPU-only QPS reporting.
-    gpu_rows = [r for r in rows if "GPU" in r.get("mode", "")]
-    if not gpu_rows:
-        raise RuntimeError(f"voyager lane {library!r} returned no GPU row for {name!r}")
-    r = gpu_rows[0]
+    want_substr = "GPU" if mode == "gpu" else "CPU"
+    matching = [r for r in rows if want_substr in r.get("mode", "")]
+    if not matching:
+        raise RuntimeError(
+            f"voyager lane {library!r} returned no {mode.upper()} row for {name!r}"
+        )
+    r = matching[0]
 
     # `indexing_docs_per_sec` is reported as docs/sec; convert back to wall-s.
     n_docs = int(r.get("n_docs", 0))
@@ -223,7 +229,7 @@ def run_voyager_lane(
 
     return {
         "dataset": name,
-        "library": library,
+        "library": f"{library}_{mode}",
         "ndcg_at_10": float(r.get("NDCG@10", 0.0)),
         "recall_at_100": float(r.get("recall@100", 0.0)),
         "indexing_time_s": indexing_time_s,
@@ -234,6 +240,7 @@ def run_voyager_lane(
         "n_queries": int(r.get("n_queries", 0)),
         "wall_s": total_wall_s,
         "params": r.get("params", {}),
+        "device": mode,
     }
 
 
@@ -329,9 +336,10 @@ def run_fast_plaid_lane(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    fp_mode = "gpu" if str(device).startswith("cuda") else "cpu"
     return {
         "dataset": name,
-        "library": "fast_plaid",
+        "library": f"fast_plaid_{fp_mode}",
         "ndcg_at_10": float(metrics.get("NDCG@10", 0.0)),
         "recall_at_100": float(metrics.get("recall@100", 0.0)),
         "indexing_time_s": float(indexing_time_s),
@@ -347,6 +355,7 @@ def run_fast_plaid_lane(
             "n_samples_kmeans": str(n_kmeans),
             "index_root": str(index_root),
         },
+        "device": fp_mode,
     }
 
 
@@ -440,18 +449,28 @@ def format_fast_plaid_style_table(rows: List[Dict[str, Any]]) -> str:
 
     for ds in sorted(by_dataset.keys()):
         ds_rows = by_dataset[ds]
-        # "fast_plaid" is the canonical baseline for the speed-up column;
-        # if it isn't in the run, fall back to the first row of the cell.
-        baseline = next(
-            (r["qps"] for r in ds_rows if r["library"] == "fast_plaid"),
-            ds_rows[0]["qps"] if ds_rows else None,
+        # "fast_plaid" (any device suffix) is the canonical baseline for the
+        # speed-up column; pick the matching device per row when available.
+        gpu_baseline = next(
+            (r["qps"] for r in ds_rows if r["library"] == "fast_plaid_gpu"), None,
+        )
+        cpu_baseline = next(
+            (r["qps"] for r in ds_rows if r["library"] == "fast_plaid_cpu"), None,
+        )
+        legacy_baseline = next(
+            (r["qps"] for r in ds_rows if r["library"] == "fast_plaid"), None,
         )
         for i, r in enumerate(ds_rows):
             ds_label = r["dataset"] if i == 0 else ""
             size_label = f"{r['n_docs']:>{_COL_WIDTHS['size']}d}" if i == 0 else " " * _COL_WIDTHS["size"]
+            row_baseline = (
+                gpu_baseline if r.get("device") == "gpu"
+                else cpu_baseline if r.get("device") == "cpu"
+                else legacy_baseline
+            )
             qps_str = _fmt_qps_with_speedup(
                 r["qps"],
-                baseline if r["library"] != "fast_plaid" else None,
+                row_baseline if not r["library"].startswith("fast_plaid") else None,
             )
             lines.append(
                 f"{ds_label:<{_COL_WIDTHS['dataset']}}"
@@ -571,8 +590,19 @@ def main() -> int:
     parser.add_argument(
         "--device",
         default="cuda:0",
-        help="CUDA device for the FastPlaid lane (default: cuda:0). "
-        "voyager-index lanes always pick `cuda` if available.",
+        help="CUDA device for the FastPlaid GPU lane (default: cuda:0). "
+        "Used only when --modes includes 'gpu'.",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="*",
+        default=["gpu"],
+        choices=["gpu", "cpu"],
+        help=(
+            "Which device modes to run for each library (default: gpu only). "
+            "Use `--modes gpu cpu` for the full 6-way matrix "
+            "(voyager_fp16/voyager_rroq158_gs128/fast_plaid each x gpu/cpu)."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -626,42 +656,48 @@ def main() -> int:
         log.info("─" * 78)
 
         for lib in args.libraries:
-            log.info("→ library: %s (%s)", lib, SUPPORTED_LIBRARIES[lib])
-            try:
-                if lib == "fast_plaid":
-                    row = run_fast_plaid_lane(ds, n_eval=args.n_eval, device=args.device)
-                elif lib in _VOYAGER_CONFIGS:
-                    row = run_voyager_lane(lib, ds, n_eval=args.n_eval)
-                else:
-                    raise RuntimeError(f"Unknown library: {lib}")
-            except Exception as exc:  # noqa: BLE001 — keep going; report at end
-                log.error("Cell failed (%s, %s): %s", ds, lib, exc, exc_info=True)
-                rows.append({
-                    "dataset": ds,
-                    "library": lib,
-                    "ndcg_at_10": 0.0,
-                    "recall_at_100": 0.0,
-                    "indexing_time_s": None,
-                    "qps": 0.0,
-                    "p50_ms": 0.0,
-                    "p95_ms": 0.0,
-                    "n_docs": 0,
-                    "n_queries": 0,
-                    "wall_s": 0.0,
-                    "error": str(exc),
-                })
-                continue
+            for mode in args.modes:
+                lane_label = f"{lib}/{mode}"
+                log.info("→ lane: %s (%s)", lane_label, SUPPORTED_LIBRARIES[lib])
+                try:
+                    if lib == "fast_plaid":
+                        fp_device = args.device if mode == "gpu" else "cpu"
+                        row = run_fast_plaid_lane(
+                            ds, n_eval=args.n_eval, device=fp_device,
+                        )
+                    elif lib in _VOYAGER_CONFIGS:
+                        row = run_voyager_lane(lib, ds, n_eval=args.n_eval, mode=mode)
+                    else:
+                        raise RuntimeError(f"Unknown library: {lib}")
+                except Exception as exc:  # noqa: BLE001 — keep going; report at end
+                    log.error("Cell failed (%s, %s): %s", ds, lane_label, exc, exc_info=True)
+                    rows.append({
+                        "dataset": ds,
+                        "library": f"{lib}_{mode}",
+                        "ndcg_at_10": 0.0,
+                        "recall_at_100": 0.0,
+                        "indexing_time_s": None,
+                        "qps": 0.0,
+                        "p50_ms": 0.0,
+                        "p95_ms": 0.0,
+                        "n_docs": 0,
+                        "n_queries": 0,
+                        "wall_s": 0.0,
+                        "device": mode,
+                        "error": str(exc),
+                    })
+                    continue
 
-            log.info(
-                "← %s/%s: NDCG@10=%.4f  index=%s  QPS=%.2f  p50=%.1fms  p95=%.1fms",
-                ds, lib, row["ndcg_at_10"],
-                "cached" if row["indexing_time_s"] is None else f"{row['indexing_time_s']:.2f}s",
-                row["qps"], row["p50_ms"], row["p95_ms"],
-            )
-            rows.append(row)
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                log.info(
+                    "← %s/%s: NDCG@10=%.4f  index=%s  QPS=%.2f  p50=%.1fms  p95=%.1fms",
+                    ds, lane_label, row["ndcg_at_10"],
+                    "cached" if row["indexing_time_s"] is None else f"{row['indexing_time_s']:.2f}s",
+                    row["qps"], row["p50_ms"], row["p95_ms"],
+                )
+                rows.append(row)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     # ── Output ──────────────────────────────────────────────────────────────
     print()
