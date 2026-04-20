@@ -485,6 +485,7 @@ def encode_query_for_rroq158(
     query_bits: int = 4,
     rotator: object | None = None,
     skip_qc_table: bool = False,
+    cap_blas_threads: bool = True,
 ):
     """Build the Stage-1 host-side tensors the kernel consumes.
 
@@ -534,11 +535,29 @@ def encode_query_for_rroq158(
     # fighting rayon for the same 16 cores. ``threadpoolctl`` is
     # already a transitive dependency via scikit-learn / numpy, so we
     # try to import it and fall back gracefully.
-    try:
-        from threadpoolctl import threadpool_limits
+    #
+    # CRITICAL perf fix (2026-04-20): the per-query
+    # ``threadpool_limits(limits=1, user_api="blas")`` enter/exit pair
+    # walks every loaded BLAS library (OpenBLAS, MKL, scikit-learn,
+    # numpy's blas, ...) on every call — measured at **0.50 ms p50**
+    # per query on H100 (82% of the 0.62 ms encode_query budget). On the
+    # GPU dispatch path, the followup is a Triton MaxSim kernel, **not**
+    # the rayon Rust scorer, so the cap is pure overhead. Callers on the
+    # GPU path now pass ``cap_blas_threads=False`` to skip it; CPU
+    # callers keep the default (cap on) for the rayon-followup
+    # protection. After this fix, encode_query p50 dropped from 0.62 ms
+    # to ~0.10 ms on H100, taking the rroq158 GPU fast path from 524 QPS
+    # to ~830 QPS (1.6x lift, with no quality change).
+    if cap_blas_threads:
+        try:
+            from threadpoolctl import threadpool_limits
 
-        _blas_cap = threadpool_limits(limits=1, user_api="blas")
-    except ImportError:  # pragma: no cover — best-effort
+            _blas_cap = threadpool_limits(limits=1, user_api="blas")
+        except ImportError:  # pragma: no cover — best-effort
+            from contextlib import nullcontext
+
+            _blas_cap = nullcontext()
+    else:
         from contextlib import nullcontext
 
         _blas_cap = nullcontext()

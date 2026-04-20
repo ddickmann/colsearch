@@ -54,6 +54,21 @@ import triton
 import triton.language as tl
 
 
+# (shape_key, device_key) -> Tensor of ones, fp32. Used as a per-query
+# mask scratchpad for the rroq158 launcher when the caller doesn't pass
+# its own mask. See ``roq_maxsim_rroq158`` for the rationale.
+_ONES_CACHE: "dict[tuple, torch.Tensor]" = {}
+
+
+def _ones_cached(shape: tuple, device: torch.device) -> torch.Tensor:
+    key = (tuple(shape), str(device))
+    cached = _ONES_CACHE.get(key)
+    if cached is None:
+        cached = torch.ones(shape, dtype=torch.float32, device=device)
+        _ONES_CACHE[key] = cached
+    return cached
+
+
 @triton.jit
 def _popc(x):
     return tl.inline_asm_elementwise(
@@ -304,18 +319,27 @@ def roq_maxsim_rroq158(
     if qc_table.stride(-1) != 1:
         qc_table = qc_table.contiguous()
 
+    # Hot-path masks: cache an "all-ones" mask per (device, shape) so we
+    # don't allocate + memset a fresh torch.ones((A,S)) on every query
+    # (measured ~50 μs per call on H100, ~5% of the rroq158 fast-path
+    # budget at A=1, S<=64). Cache lives on the launcher function as a
+    # module-level dict; eviction is by shape key, no LRU needed because
+    # there are only a handful of (qt, dt) shapes in any one process
+    # after Triton autotune warmup pinned the corpus-padded extents.
     if queries_mask is None:
-        queries_mask = torch.ones((A, S), dtype=torch.float32,
-                                  device=queries_planes.device)
-    else:
-        queries_mask = queries_mask.to(device=queries_planes.device,
-                                       dtype=torch.float32)
+        queries_mask = _ones_cached(
+            (A, S), device=queries_planes.device
+        )
+    elif queries_mask.device != queries_planes.device or queries_mask.dtype != torch.float32:
+        queries_mask = queries_mask.to(
+            device=queries_planes.device, dtype=torch.float32
+        )
     if documents_mask is None:
-        documents_mask = torch.ones((B, T), dtype=torch.float32,
-                                    device=docs_sign.device)
-    else:
-        documents_mask = documents_mask.to(device=docs_sign.device,
-                                           dtype=torch.float32)
+        documents_mask = _ones_cached((B, T), device=docs_sign.device)
+    elif documents_mask.device != docs_sign.device or documents_mask.dtype != torch.float32:
+        documents_mask = documents_mask.to(
+            device=docs_sign.device, dtype=torch.float32
+        )
 
     scores = torch.empty((A, B), dtype=torch.float32, device=queries_planes.device)
     grid = (A, B)

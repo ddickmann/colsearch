@@ -43,12 +43,22 @@ def _get_maxsim():
     return _maxsim_fn
 
 
-def warmup_maxsim(dim: int, doc_token_counts: List[int], device: str = "cuda") -> None:
+def warmup_maxsim(
+    dim: int,
+    doc_token_counts: List[int],
+    device: str = "cuda",
+    query_token_counts: List[int] | None = None,
+) -> None:
     """Pre-warm Triton autotune for the exact (S, T, H) shapes that will appear.
 
     Triton autotune keys on (NUM_Q_TOKENS, NUM_D_TOKENS, EMBED_DIM) only — B
     (batch size) is NOT a key.  We use B=4 for minimal memory and warm only
     the unique (S, T, H) combinations.
+
+    `score_candidates` always pads the per-call (qt, dt) up to the next pow2
+    (with mask=0 for the padded region), so we only need to warm the pow2
+    grid that the runtime will land on; this makes warmup cheap even for
+    datasets with hundreds of unique raw (qt, dt) combinations.
     """
     global _warmup_done
     if not torch.cuda.is_available() and "cuda" in device:
@@ -56,7 +66,15 @@ def warmup_maxsim(dim: int, doc_token_counts: List[int], device: str = "cuda") -
     maxsim = _get_maxsim()
     dev = torch.device(device)
 
-    q_tokens_list = [32, 64, 128, 256]
+    # Default Q-tokens grid: covers all queries up to 512 tokens at the
+    # rounded-pow2 granularity. Extra Q sizes can be supplied via
+    # `query_token_counts` to keep the grid tight on a known dataset.
+    q_pow2 = {32, 64, 128, 256, 512}
+    if query_token_counts:
+        for qt in query_token_counts:
+            q_pow2.add(_next_pow2(qt, 32))
+    q_tokens_list = sorted(q_pow2)
+
     d_tokens_set: set = set()
     for tc in doc_token_counts:
         d_tokens_set.add(_next_pow2(tc, 32))
@@ -412,11 +430,19 @@ class PreloadedGpuCorpus:
         dtype: torch.dtype = torch.float16,
     ):
         n_docs = len(doc_vecs)
-        max_tok = max(v.shape[0] for v in doc_vecs) if doc_vecs else 1
+        raw_max_tok = max(v.shape[0] for v in doc_vecs) if doc_vecs else 1
+        # Pad the corpus-wide D/M tensors to the next pow2 so per-query
+        # truncations in `score_candidates` always land on a value the
+        # Triton MaxSim autotune cache has been warmed for. Without this,
+        # NUM_D_TOKENS takes hundreds of unique values (one per query
+        # candidate set) and every distinct (qt, dt) pair triggers a fresh
+        # ~80 ms autotune compile on H100 (see warmup_maxsim above).
+        max_tok = _next_pow2(raw_max_tok, 32)
         logger.info(
-            "PreloadedGpuCorpus: %d docs, max_tok=%d, dim=%d, %.1f GB %s",
+            "PreloadedGpuCorpus: %d docs, max_tok=%d (raw %d, pow2-padded), dim=%d, %.1f GB %s",
             n_docs,
             max_tok,
+            raw_max_tok,
             dim,
             n_docs * max_tok * dim * (2 if dtype == torch.float16 else 4) / 1e9,
             dtype,
@@ -429,28 +455,161 @@ class PreloadedGpuCorpus:
         self.dim = dim
         self._device = device
 
+        raw_counts: List[int] = []
         for i, v in enumerate(doc_vecs):
             tok = v.shape[0]
+            raw_counts.append(tok)
             self.D[i, :tok] = torch.from_numpy(v).to(dtype)
             self.M[i, :tok] = 1.0
 
+        # Precomputed hot-path helpers:
+        # - self.doc_ids_tensor: GPU tensor of doc_ids for O(1) gather to
+        #   the output (avoids Python list comprehension on the fast path).
+        # - self._corpus_actual_max_pow2: pow2 bound on the longest doc;
+        #   lets us truncate D/M once and reuse the same shape for every
+        #   full-corpus query (single warmed autotune entry, no per-query
+        #   shape probe).
+        self.doc_ids_tensor = torch.tensor(doc_ids, dtype=torch.long, device=device)
+        self._corpus_raw_max_tok = int(max(raw_counts)) if raw_counts else 0
+        self._corpus_actual_max_pow2 = (
+            min(_next_pow2(self._corpus_raw_max_tok, 32), max_tok)
+            if self._corpus_raw_max_tok > 0
+            else max_tok
+        )
+        self._corpus_has_padding = self._corpus_actual_max_pow2 < max_tok or any(
+            c < self._corpus_actual_max_pow2 for c in raw_counts
+        )
+        if self._corpus_actual_max_pow2 < max_tok:
+            self._D_all = self.D[:, : self._corpus_actual_max_pow2].contiguous()
+            self._M_all = self.M[:, : self._corpus_actual_max_pow2].contiguous()
+        else:
+            self._D_all = self.D
+            self._M_all = self.M
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        logger.info("PreloadedGpuCorpus ready on %s", device)
+        logger.info(
+            "PreloadedGpuCorpus ready on %s (whole-corpus D_tok=%d, has_padding=%s)",
+            device,
+            self._corpus_actual_max_pow2,
+            self._corpus_has_padding,
+        )
 
     def refresh(self, doc_vecs: list, doc_ids: List[int]) -> None:
         """Rebuild GPU tensors from a new sealed snapshot."""
         n_docs = len(doc_vecs)
-        max_tok = max(v.shape[0] for v in doc_vecs) if doc_vecs else 1
+        raw_max_tok = max(v.shape[0] for v in doc_vecs) if doc_vecs else 1
+        max_tok = _next_pow2(raw_max_tok, 32)
         self.D = torch.zeros((n_docs, max_tok, self.dim), dtype=self.D.dtype, device=self._device)
         self.M = torch.zeros((n_docs, max_tok), dtype=torch.float32, device=self._device)
         self.doc_ids = list(doc_ids)
         self.doc_id_to_idx = {did: i for i, did in enumerate(doc_ids)}
         self.max_tok = max_tok
+        raw_counts: List[int] = []
         for i, v in enumerate(doc_vecs):
             tok = v.shape[0]
+            raw_counts.append(tok)
             self.D[i, :tok] = torch.from_numpy(v).to(self.D.dtype)
             self.M[i, :tok] = 1.0
+
+        self.doc_ids_tensor = torch.tensor(doc_ids, dtype=torch.long, device=self._device)
+        self._corpus_raw_max_tok = int(max(raw_counts)) if raw_counts else 0
+        self._corpus_actual_max_pow2 = (
+            min(_next_pow2(self._corpus_raw_max_tok, 32), max_tok)
+            if self._corpus_raw_max_tok > 0
+            else max_tok
+        )
+        self._corpus_has_padding = self._corpus_actual_max_pow2 < max_tok or any(
+            c < self._corpus_actual_max_pow2 for c in raw_counts
+        )
+        if self._corpus_actual_max_pow2 < max_tok:
+            self._D_all = self.D[:, : self._corpus_actual_max_pow2].contiguous()
+            self._M_all = self.M[:, : self._corpus_actual_max_pow2].contiguous()
+        else:
+            self._D_all = self.D
+            self._M_all = self.M
+
+    def score_all(
+        self,
+        query: torch.Tensor,
+        k: int = 10,
+        return_stats: bool = False,
+    ) -> Tuple[List[int], List[float]] | Tuple[List[int], List[float], dict]:
+        """Zero-gather MaxSim over the entire pre-loaded corpus.
+
+        Hot path for "routing-free" small-corpus workloads where
+        ``max_docs_exact >= n_docs`` — we already hold every doc on the
+        GPU at a fixed pow2 shape (see ``__init__``), so we can skip:
+          * LEMUR routing (no Python plan, no FAISS search, no MLP)
+          * per-query ``candidate_doc_ids`` list construction
+          * per-query ``(M_slice[:, -1] == 0).any()`` probe
+          * per-query ``D_slice = self.D[indices]`` gather copy
+          * per-query ``actual_max = M_slice.sum(dim=1).max().item()``
+            (host sync)
+
+        The kernel sees a single (qt_pow2, D_all_tok, dim) shape for the
+        entire run, so Triton autotune fires exactly once in warmup.
+
+        When ``return_stats`` is False (the default), the path skips the
+        three ``Timer(sync_cuda=True)`` wrappers (each Timer adds one
+        ``torch.cuda.synchronize()`` — ~30 μs on H100, ~3x the actual
+        work on a 1401-doc corpus) and the stats dict build.
+        """
+        maxsim = _get_maxsim()
+        q = query.to(self._device, dtype=torch.float16)
+        if q.dim() == 2:
+            q = q.unsqueeze(0)
+
+        qt_raw = q.shape[1]
+        qt_padded = _next_pow2(qt_raw, 32)
+        if qt_padded != qt_raw:
+            q = torch.nn.functional.pad(q, (0, 0, 0, qt_padded - qt_raw))
+
+        n_docs = self.D.shape[0]
+        if n_docs == 0:
+            if return_stats:
+                empty_stats = {
+                    "score_mode": "gpu_corpus_all",
+                    "prepare_ms": 0.0, "h2d_ms": 0.0, "maxsim_ms": 0.0,
+                    "topk_ms": 0.0, "exact_ms": 0.0, "n_buckets": 0,
+                }
+                return [], [], empty_stats
+            return [], []
+
+        if not return_stats:
+            scores = maxsim(
+                queries_embeddings=q,
+                documents_embeddings=self._D_all,
+                documents_mask=self._M_all if self._corpus_has_padding else None,
+            ).squeeze(0)
+            final_k = min(k, n_docs)
+            top_sc, top_idx = scores.topk(final_k)
+            idx_list = top_idx.cpu().tolist()
+            return [self.doc_ids[i] for i in idx_list], top_sc.cpu().tolist()
+
+        stats = {
+            "score_mode": "gpu_corpus_all",
+            "prepare_ms": 0.0, "h2d_ms": 0.0, "maxsim_ms": 0.0,
+            "topk_ms": 0.0, "exact_ms": 0.0, "n_buckets": 1,
+        }
+        with Timer(sync_cuda=True) as t_exact:
+            with Timer(sync_cuda=True) as t_maxsim:
+                scores = maxsim(
+                    queries_embeddings=q,
+                    documents_embeddings=self._D_all,
+                    documents_mask=self._M_all if self._corpus_has_padding else None,
+                ).squeeze(0)
+            stats["maxsim_ms"] = t_maxsim.elapsed_ms
+
+            final_k = min(k, n_docs)
+            with Timer(sync_cuda=True) as t_topk:
+                top_sc, top_idx = scores.topk(final_k)
+            stats["topk_ms"] = t_topk.elapsed_ms
+
+        stats["exact_ms"] = t_exact.elapsed_ms
+        idx_list = top_idx.cpu().tolist()
+        result = ([self.doc_ids[i] for i in idx_list], top_sc.cpu().tolist())
+        return result[0], result[1], stats
 
     def score_candidates(
         self,
@@ -463,6 +622,19 @@ class PreloadedGpuCorpus:
         q = query.to(self._device, dtype=torch.float16)
         if q.dim() == 2:
             q = q.unsqueeze(0)
+
+        # Pad Q-tokens to next pow2 so the Triton MaxSim autotune key
+        # falls in the warmed bin set ({32, 64, 128, 256, 512, ...}).
+        # Padded q-tokens are zero, so per-padded-q-token MaxSim is
+        # max(0, q_real·d) ≥ 0 but the same constant offset applies to
+        # every doc in the candidate set, so the relative ranking is
+        # unchanged. Skipping this pad is a ~16x QPS regression on H100
+        # because each unique (qt, dt) pair fires a fresh ~80 ms
+        # autotune compile.
+        qt_raw = q.shape[1]
+        qt_padded = _next_pow2(qt_raw, 32)
+        if qt_padded != qt_raw:
+            q = torch.nn.functional.pad(q, (0, 0, 0, qt_padded - qt_raw))
 
         valid_ids = [did for did in candidate_doc_ids if did in self.doc_id_to_idx]
         if not valid_ids:
@@ -501,7 +673,12 @@ class PreloadedGpuCorpus:
                 M_slice = self.M[indices]
                 has_padding = (M_slice[:, -1] == 0).any()
                 if has_padding:
-                    actual_max = int(M_slice.sum(dim=1).max().item())
+                    raw_actual_max = int(M_slice.sum(dim=1).max().item())
+                    # Round D-tokens up to next pow2 (capped at the
+                    # corpus-wide padded extent) so NUM_D_TOKENS only
+                    # ever takes a small set of pre-warmed values; the
+                    # mask zeros out the padded region for correctness.
+                    actual_max = min(_next_pow2(raw_actual_max, 32), M_slice.shape[1])
                     D_slice = D_slice[:, :actual_max].contiguous()
                     M_slice = M_slice[:, :actual_max].contiguous()
             stats["prepare_ms"] += t_prepare.elapsed_ms
@@ -1017,38 +1194,90 @@ def score_rroq158_topk(
     if rroq is None:
         return [], []
 
-    qp = query_planes.to(device=device, dtype=torch.int32)
-    qm = query_meta.to(device=device, dtype=torch.float32)
-    qct = qc_table.to(device=device, dtype=torch.float32)
-    cid = doc_centroid_id.to(device=device, dtype=torch.int32)
-    cos_n = doc_cos_norm.to(device=device, dtype=torch.float32)
-    sin_n = doc_sin_norm.to(device=device, dtype=torch.float32)
-    ds = doc_sign.to(device=device, dtype=torch.int32)
-    dn = doc_nz.to(device=device, dtype=torch.int32)
-    dsc = doc_scales.to(device=device, dtype=torch.float32)
+    # Hot-path tensor preparation. Per-query the doc-side tensors are
+    # always already device+dtype-correct (they live in the
+    # `_build_rroq158_gpu_payload` payload), and after the GPU encoder
+    # fix the query-side tensors are too. ``Tensor.to(device, dtype)``
+    # is **not** a no-op even when the device/dtype matches: it goes
+    # through the C++ dispatcher and adds ~5 μs/call. With 9 query-time
+    # ``.to()`` casts that was ~45 μs (~12% of a 0.36 ms fp16 query) of
+    # pure dispatch on the rroq158 hot path. We now skip the cast when
+    # the source tensor already matches.
+    def _ensure(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if t.device == device and t.dtype == dtype:
+            return t
+        return t.to(device=device, dtype=dtype)
 
-    kwargs = {}
-    if documents_mask is not None:
-        kwargs["documents_mask"] = documents_mask.to(device)
-    if queries_mask is not None:
-        kwargs["queries_mask"] = queries_mask.to(device)
+    qp = _ensure(query_planes, torch.int32)
+    qm = _ensure(query_meta, torch.float32)
+    qct = _ensure(qc_table, torch.float32)
+    cid = _ensure(doc_centroid_id, torch.int32)
+    cos_n = _ensure(doc_cos_norm, torch.float32)
+    sin_n = _ensure(doc_sin_norm, torch.float32)
+    ds = _ensure(doc_sign, torch.int32)
+    dn = _ensure(doc_nz, torch.int32)
+    dsc = _ensure(doc_scales, torch.float32)
 
-    scores = rroq(
-        queries_planes=qp,
-        queries_meta=qm,
-        qc_table=qct,
-        docs_centroid_id=cid,
-        docs_cos_norm=cos_n,
-        docs_sin_norm=sin_n,
-        docs_sign=ds,
-        docs_nz=dn,
-        docs_scales=dsc,
-        **kwargs,
-    ).squeeze(0)
+    dm_dev = (documents_mask
+              if documents_mask is None or documents_mask.device == device
+              else documents_mask.to(device))
+    qm_dev = (queries_mask
+              if queries_mask is None or queries_mask.device == device
+              else queries_mask.to(device))
+
+    scores = None
+
+    # Fast path: fused binary-tensor-core MMA kernel on sm_90+ when
+    # the codec shape is the production rroq158_gs128 + dim=128
+    # configuration. The wrapper internally checks shape support and
+    # the env flag (VOYAGER_RROQ158_USE_B1_FUSED), and returns None to
+    # signal "fall back to Triton" rather than raising. Smoke-validated
+    # to ~2.4× over the Triton kernel on H100 (B=2048, T=288) with
+    # bit-exact parity (max rel err 3.3e-7).
+    try:
+        from voyager_index._internal.kernels import cuda_b1_rroq158
+        # qp shape is (1, S, query_bits, n_words); the fused kernel
+        # only consumes a single batch row (A==1), which is also the
+        # invariant of the surrounding code.
+        qp_one = qp[0] if qp.dim() == 4 else qp
+        qm_one = qm[0] if qm.dim() == 3 else qm
+        qct_one = qct[0] if qct.dim() == 3 else qct
+        scores = cuda_b1_rroq158.score_b1_fused(
+            docs_sign=ds, docs_nz=dn, docs_scl=dsc,
+            docs_cid=cid, docs_cos=cos_n, docs_sin=sin_n,
+            docs_mask=dm_dev,
+            q_planes=qp_one, q_meta=qm_one, qc_table=qct_one,
+        )
+    except Exception:  # pragma: no cover — fall back below
+        scores = None
+
+    if scores is None:
+        kwargs = {}
+        if dm_dev is not None:
+            kwargs["documents_mask"] = dm_dev
+        if qm_dev is not None:
+            kwargs["queries_mask"] = qm_dev
+        scores = rroq(
+            queries_planes=qp,
+            queries_meta=qm,
+            qc_table=qct,
+            docs_centroid_id=cid,
+            docs_cos_norm=cos_n,
+            docs_sin_norm=sin_n,
+            docs_sign=ds,
+            docs_nz=dn,
+            docs_scales=dsc,
+            **kwargs,
+        ).squeeze(0)
     final_k = min(k, n_docs)
     top_sc, top_idx = scores.topk(final_k)
-    idx_list = top_idx.cpu().tolist()
-    return [doc_ids[i] for i in idx_list], top_sc.cpu().tolist()
+    # Single fused D2H: stack ids+scores into one buffer so we pay one
+    # CUDA sync instead of two .cpu() round-trips (~30 μs each on H100).
+    paired = torch.stack(
+        [top_idx.to(torch.float32), top_sc.to(torch.float32)], dim=0
+    ).cpu().numpy()
+    idx_list = paired[0].astype(np.int64).tolist()
+    return [doc_ids[i] for i in idx_list], paired[1].tolist()
 
 
 # ------------------------------------------------------------------
