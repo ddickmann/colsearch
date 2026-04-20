@@ -158,7 +158,6 @@ def test_score_sealed_candidates_rroq158_hardfails_when_no_kernel(
     the GPU Triton kernel nor the Rust SIMD CPU kernel is reachable, the
     fallback chain must raise an actionable error rather than silently
     returning no results."""
-    import voyager_index._internal.inference.shard_engine._manager.search as search_mod
     import sys
 
     mgr = _make_manager(tmp_path)
@@ -333,20 +332,28 @@ def test_score_sealed_candidates_auto_derives_rroq4_riem_when_meta_present(
 
 def test_default_compression_is_rroq158() -> None:
     """The library default for newly constructed configs must be RROQ158
-    after the Phase 1.5 gate. Existing fp16 indexes on disk are unaffected
+    after the Phase 7 production-validation sweep verdict.
+
+    The full BEIR 2026-Q2 sweep applied the F1 default-promotion rule
+    (avg ΔNDCG@10 ≥ -0.5 pt and per-cell GPU/CPU p95 ≤ fp16): rroq4_riem
+    failed both the latency conditions decisively (~2-3x slower on GPU,
+    ~10x on CPU on the BEIR 6-dataset cells), so the default reverts to
+    rroq158 (avg -1 pt NDCG@10, flat R@100, ~5.5x smaller than fp16).
+    rroq4_riem stays available as the opt-in no-quality-loss lane.
+    Existing fp16/rroq158/rroq4_riem indexes on disk are unaffected
     because the manifest carries the build-time codec."""
+    from voyager_index._internal.inference.shard_engine._manager.common import (
+        ShardEngineConfig as _SEC,
+    )
     from voyager_index._internal.inference.shard_engine.serving_config import (
         BuildConfig,
         Compression,
-    )
-    from voyager_index._internal.inference.shard_engine._manager.common import (
-        ShardEngineConfig as _SEC,
     )
 
     assert BuildConfig().compression == Compression.RROQ158
     assert _SEC().compression == Compression.RROQ158
     assert BuildConfig().rroq158_k == 8192
-    assert _SEC().rroq158_k == 8192
+    assert BuildConfig().rroq4_riem_k == 8192
 
 
 def test_inspect_query_pipeline_accepts_runtime_override_kwargs(tmp_path: Path) -> None:
