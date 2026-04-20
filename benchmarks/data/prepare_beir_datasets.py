@@ -62,6 +62,25 @@ BEIR_DATASETS: Dict[str, Dict[str, Any]] = {
         "qrels_repo": "mteb/scifact",
         "expected_docs": 5_183,
     },
+    # Added 2026-04-20 to enable the BEIR-8 head-to-head against FastPlaid
+    # (`benchmarks/fast_plaid_head_to_head.py`). Both datasets are large
+    # (171k / 382k docs) and their CPU-only `prepare_beir_datasets.py`
+    # encode pass takes a noticeable chunk of wall-time on a workstation;
+    # use `python benchmarks/data/prepare_beir_datasets.py --datasets
+    # trec-covid webis-touche2020 --batch-size 64` on the GPU box where
+    # the head-to-head will run.
+    "trec-covid": {
+        "corpus_repo": "BeIR/trec-covid",
+        "corpus_config": None,
+        "qrels_repo": "mteb/trec-covid",
+        "expected_docs": 171_332,
+    },
+    "webis-touche2020": {
+        "corpus_repo": "BeIR/webis-touche2020",
+        "corpus_config": None,
+        "qrels_repo": "mteb/webis-touche2020",
+        "expected_docs": 382_545,
+    },
 }
 
 
