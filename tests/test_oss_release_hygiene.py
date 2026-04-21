@@ -86,7 +86,17 @@ def test_release_workflow_only_builds_supported_native_wheels() -> None:
     assert "publish-root" in payload
     assert "packages-dir: dist-native/" in payload
     assert "packages-dir: dist-root/" in payload
-    assert "skip-existing" not in payload
+    # `skip-existing: true` is intentionally enabled on both pypi-publish
+    # steps. The native crates (latence-shard-engine, latence-solver) are
+    # versioned independently of the root colsearch package and only need a
+    # republish when their Rust source changes; a colsearch release that
+    # ships without a native bump (e.g. metadata-only changes like updated
+    # repository URLs) would otherwise hit "400 File already exists" on every
+    # native wheel and skip the colsearch root publish that follows. The flag
+    # is also load-bearing for `gh run rerun --failed` after a partial publish
+    # — without it, the rerun fails on every wheel that already landed in the
+    # first attempt. See ci(release) commit message for the full rationale.
+    assert "skip-existing: true" in payload
     assert "crate: hnsw_indexer" not in payload
     assert "crate: gem_router" not in payload
     assert "crate: gem_index" not in payload
