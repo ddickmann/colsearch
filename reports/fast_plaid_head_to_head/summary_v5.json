@@ -1,0 +1,87 @@
+{
+  "datasets": [
+    "scifact",
+    "webis-touche2020"
+  ],
+  "libraries": [
+    "voyager_fp16",
+    "voyager_rroq158_gs128"
+  ],
+  "summary": {
+    "voyager_fp16_gpu": {
+      "datasets": [
+        "arguana",
+        "fiqa",
+        "nfcorpus",
+        "quora",
+        "scidocs",
+        "scifact",
+        "trec-covid",
+        "webis-touche2020"
+      ],
+      "n_datasets": 8,
+      "ndcg_at_10_mean": 0.7140817344442939,
+      "qps_mean": 1846.3680198273166,
+      "qps_geomean": 1561.527781719076,
+      "indexing_time_s_total": 0.0
+    },
+    "voyager_fp16_cpu": {
+      "datasets": [
+        "arguana",
+        "fiqa",
+        "nfcorpus",
+        "quora",
+        "scidocs",
+        "scifact",
+        "trec-covid",
+        "webis-touche2020"
+      ],
+      "n_datasets": 8,
+      "ndcg_at_10_mean": 0.7117874355429099,
+      "qps_mean": 87.52135715748074,
+      "qps_geomean": 54.45877507404239,
+      "indexing_time_s_total": 0.0
+    },
+    "voyager_rroq158_gs128_gpu": {
+      "datasets": [
+        "arguana",
+        "fiqa",
+        "nfcorpus",
+        "quora",
+        "scidocs",
+        "trec-covid",
+        "scifact",
+        "webis-touche2020"
+      ],
+      "n_datasets": 8,
+      "ndcg_at_10_mean": 0.6968316031942872,
+      "qps_mean": 850.1832779185881,
+      "qps_geomean": 636.3748700484391,
+      "indexing_time_s_total": 0.0
+    },
+    "voyager_rroq158_gs128_cpu": {
+      "datasets": [
+        "arguana",
+        "fiqa",
+        "nfcorpus",
+        "quora",
+        "scidocs",
+        "scifact",
+        "trec-covid",
+        "webis-touche2020"
+      ],
+      "n_datasets": 8,
+      "ndcg_at_10_mean": 0.6961868691145309,
+      "qps_mean": 116.88295495439374,
+      "qps_geomean": 75.84926669410218,
+      "indexing_time_s_total": 0.0
+    }
+  },
+  "env": {
+    "torch": "2.9.0+cu128",
+    "cuda_available": true,
+    "cuda_device": "NVIDIA H100 80GB HBM3",
+    "voyager_index_version": "0.1.6",
+    "fast_plaid_version": null
+  }
+}

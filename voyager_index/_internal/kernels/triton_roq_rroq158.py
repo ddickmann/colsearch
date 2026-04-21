@@ -83,9 +83,21 @@ def _popc(x):
 
 @triton.autotune(
     configs=[
+        # ── Short-T tier (T=32, dominant in skewed corpora like quora) ──
+        # BLOCK_D=32 makes the inner j-loop run once → no wasted half-tile,
+        # and num_warps=1/2 keeps occupancy high when there are 500K+ CTAs.
+        triton.Config({"BLOCK_D": 32}, num_warps=1, num_stages=2),
         triton.Config({"BLOCK_D": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_D": 32}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_D": 32}, num_warps=4, num_stages=2),
+        # ── Mid tier (T=64 / 128) ──
+        triton.Config({"BLOCK_D": 64}, num_warps=2, num_stages=2),
         triton.Config({"BLOCK_D": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_D": 64}, num_warps=4, num_stages=3),
+        # ── Long-T tier (T>=128, the rare tail) ──
+        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=3),
     ],
     key=["n_d_tokens", "dim", "QUERY_BITS", "K"],
 )
@@ -126,8 +138,8 @@ def _roq_maxsim_rroq158_kernel(
     per-d-token gathers (centroid_id → qc_table, plus the cos/sin caches)
     and the cos·qc + sinc·resi combine.
     """
-    q_idx = tl.program_id(0)
-    d_idx = tl.program_id(1)
+    d_idx = tl.program_id(0)
+    q_idx = tl.program_id(1)
 
     q_ptr_base = Q_PLANES_PTR + q_idx * q_batch_stride
     qc_base = QC_TABLE_PTR + q_idx * qc_batch_stride
@@ -342,7 +354,11 @@ def roq_maxsim_rroq158(
         )
 
     scores = torch.empty((A, B), dtype=torch.float32, device=queries_planes.device)
-    grid = (A, B)
+    # Grid = (B, A): B in gridX (limit 2^31-1, accommodates million-doc corpora),
+    # A in gridY (limit 65535, A is typically 1). The previous (A, B) layout
+    # crashed with "Triton Error [CUDA]: invalid argument" on quora-class
+    # corpora (B > 65535) because gridY has the lower limit.
+    grid = (B, A)
     _roq_maxsim_rroq158_kernel[grid](
         Q_PLANES_PTR=queries_planes,
         Q_META_PTR=queries_meta,

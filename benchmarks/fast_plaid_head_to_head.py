@@ -256,6 +256,7 @@ def run_fast_plaid_lane(
     device: str = "cuda:0",
     n_warmup: int = 10,
     index_root: Optional[Path] = None,
+    time_budget_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run the FastPlaid lane on the same prepared embeddings.
 
@@ -310,10 +311,14 @@ def run_fast_plaid_lane(
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    log.info("[fast_plaid] %s: timing %d queries ...", name, n_q)
+    log.info(
+        "[fast_plaid] %s: timing %d queries (time_budget=%s) ...",
+        name, n_q, f"{time_budget_s:.0f}s" if time_budget_s else "none",
+    )
     all_ids: List[List[int]] = []
     all_elapsed_ms: List[float] = []
     t_search_wall = time.perf_counter()
+    n_completed = 0
     for qi in range(n_q):
         qt = queries[qi].unsqueeze(0)
         t0 = time.perf_counter()
@@ -322,7 +327,19 @@ def run_fast_plaid_lane(
         all_elapsed_ms.append(elapsed_ms)
         ids = _extract_top_ids(result)
         all_ids.append(ids)
+        n_completed = qi + 1
+        # Adaptive early-stop: bail out if we've burned the time budget AND
+        # have a statistically meaningful sample (>=128 queries). This keeps
+        # the bench tractable on slow lanes (e.g. fast_plaid CPU on quora 522k)
+        # while still producing a representative QPS / NDCG measurement.
+        if time_budget_s is not None and (time.perf_counter() - t_search_wall) >= time_budget_s and n_completed >= 128:
+            log.info(
+                "[fast_plaid] %s: time-budget reached after %d/%d queries (%.1fs); stopping early",
+                name, n_completed, n_q, time.perf_counter() - t_search_wall,
+            )
+            break
     wall_s = time.perf_counter() - t_search_wall
+    n_q = n_completed
 
     qps = n_q / wall_s if wall_s > 0 else 0.0
     p50 = float(np.median(all_elapsed_ms)) if all_elapsed_ms else 0.0
@@ -621,6 +638,17 @@ def main() -> int:
         action="store_true",
         help="Skip datasets whose NPZ is not yet prepared, instead of aborting.",
     )
+    parser.add_argument(
+        "--fast-plaid-cpu-time-budget-s",
+        type=float,
+        default=180.0,
+        help=(
+            "Wall-time budget (seconds) for the fast_plaid CPU search loop "
+            "before early-stop with a partial QPS/NDCG sample. Required to "
+            "keep the bench tractable on large corpora (e.g. quora 522k). "
+            "Set 0 to disable. Default: 180s."
+        ),
+    )
     args = parser.parse_args()
 
     log.info("=" * 78)
@@ -649,7 +677,31 @@ def main() -> int:
             "comparable to the published row."
         )
 
+    # Resilient: write each row to JSONL as soon as it completes, and
+    # skip cells already present (allows resume after a kill / crash).
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     rows: List[Dict[str, Any]] = []
+    completed: set = set()
+    if out_path.exists():
+        for line in out_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                rows.append(r)
+                completed.add((r.get("dataset"), r.get("library")))
+            except json.JSONDecodeError:
+                continue
+        if completed:
+            log.info("Resuming: found %d completed cells in %s", len(completed), out_path)
+
+    def _persist_row(r: Dict[str, Any]) -> None:
+        rows.append(r)
+        with out_path.open("a") as fh:
+            fh.write(json.dumps(r) + "\n")
+
     for ds in args.datasets:
         log.info("─" * 78)
         log.info("DATASET: %s", ds)
@@ -658,12 +710,24 @@ def main() -> int:
         for lib in args.libraries:
             for mode in args.modes:
                 lane_label = f"{lib}/{mode}"
+                row_key = (ds, f"{lib}_{mode}")
+                if row_key in completed:
+                    log.info("→ lane: %s — SKIP (already in %s)", lane_label, out_path)
+                    continue
                 log.info("→ lane: %s (%s)", lane_label, SUPPORTED_LIBRARIES[lib])
                 try:
                     if lib == "fast_plaid":
                         fp_device = args.device if mode == "gpu" else "cpu"
+                        # Apply a wall-time budget on fast_plaid CPU only;
+                        # GPU is fast enough to time the full query set.
+                        budget = (
+                            args.fast_plaid_cpu_time_budget_s
+                            if (mode == "cpu" and args.fast_plaid_cpu_time_budget_s and args.fast_plaid_cpu_time_budget_s > 0)
+                            else None
+                        )
                         row = run_fast_plaid_lane(
                             ds, n_eval=args.n_eval, device=fp_device,
+                            time_budget_s=budget,
                         )
                     elif lib in _VOYAGER_CONFIGS:
                         row = run_voyager_lane(lib, ds, n_eval=args.n_eval, mode=mode)
@@ -671,7 +735,7 @@ def main() -> int:
                         raise RuntimeError(f"Unknown library: {lib}")
                 except Exception as exc:  # noqa: BLE001 — keep going; report at end
                     log.error("Cell failed (%s, %s): %s", ds, lane_label, exc, exc_info=True)
-                    rows.append({
+                    _persist_row({
                         "dataset": ds,
                         "library": f"{lib}_{mode}",
                         "ndcg_at_10": 0.0,
@@ -694,7 +758,7 @@ def main() -> int:
                     "cached" if row["indexing_time_s"] is None else f"{row['indexing_time_s']:.2f}s",
                     row["qps"], row["p50_ms"], row["p95_ms"],
                 )
-                rows.append(row)
+                _persist_row(row)
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()

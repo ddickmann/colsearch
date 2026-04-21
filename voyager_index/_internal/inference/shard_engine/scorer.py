@@ -27,6 +27,26 @@ _maxsim_fn = None
 _warmup_done_lock = __import__("threading").Lock()
 _warmup_done: set = set()
 
+# Diagnostics: surface fused-kernel dispatch / fallback once per (B, T) shape so
+# we never silently run the slow Triton path again.
+_fused_diag_seen: set = set()
+
+
+def _log_fused_dispatched(B: int, T: int) -> None:
+    key = ("dispatched", B, T)
+    if key in _fused_diag_seen:
+        return
+    _fused_diag_seen.add(key)
+    logger.info("[rroq158] fused b1 CUDA kernel DISPATCHED for shape B=%d T=%d", B, T)
+
+
+def _log_fused_fallback(reason: str) -> None:
+    key = ("fallback", reason)
+    if key in _fused_diag_seen:
+        return
+    _fused_diag_seen.add(key)
+    logger.warning("[rroq158] fused b1 CUDA kernel FALLBACK to Triton: %s", reason)
+
 
 def _get_maxsim():
     global _maxsim_fn
@@ -437,19 +457,23 @@ class PreloadedGpuCorpus:
         self._dtype = dtype
         self.doc_ids_tensor = torch.tensor(doc_ids, dtype=torch.long, device=device)
         self._build_layout(doc_vecs)
+        # Persistent buffers for the score_all hot path (Fix F): one
+        # `(n_docs,)` device buffer for scatter-merged scores plus pinned
+        # host buffers for the topk D2H. Pre-allocating eliminates the
+        # ~30 μs/query cudaMalloc tax that dominated at sub-millisecond
+        # latencies on large corpora.
+        self._init_score_buffers()
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         if self._is_bucketed:
+            tier_summary = ", ".join(
+                f"T={t['T']}:n={t['n']}" for t in self._tiers
+            )
             logger.info(
-                "PreloadedGpuCorpus ready on %s (bucketed: short n=%d D_tok=%d, "
-                "tall n=%d D_tok=%d, total %.2f GB vs %.2f GB single-tier)",
-                device,
-                int(self._short_idx.numel()), int(self._D_short.shape[1]),
-                int(self._tall_idx.numel()),
-                int(self._D_tall.shape[1]) if self._D_tall is not None else 0,
-                self._bucketed_bytes / 1e9,
-                self._single_tier_bytes / 1e9,
+                "PreloadedGpuCorpus ready on %s (multi-tier %d tiers: %s, %.2f GB total vs %.2f GB single-tier)",
+                device, len(self._tiers), tier_summary,
+                self._bucketed_bytes / 1e9, self._single_tier_bytes / 1e9,
             )
         else:
             logger.info(
@@ -471,27 +495,37 @@ class PreloadedGpuCorpus:
         )
 
     def _build_layout(self, doc_vecs: list) -> None:
-        """Allocate the GPU tensor(s) for a corpus snapshot.
+        """Allocate GPU tensor(s) for a corpus snapshot using a generalised
+        **multi-tier (pow2-per-bucket) layout**.
 
-        Picks between two layouts:
+        Algorithm:
+          1. Compute ``T_doc[i] = next_pow2(token_count[i], 32)`` for every
+             doc. Each unique ``T_doc`` value defines a tier.
+          2. Merge any tier with ``< MIN_TIER_DOCS`` (default 256) docs into
+             the next-larger tier — pays a tiny per-doc padding cost in
+             exchange for one fewer kernel launch (which would otherwise
+             dominate at < 256 docs/launch).
+          3. Cap at ``MAX_TIERS`` tiers (default 8). If too many distinct
+             T_doc values exist, fold the smallest tiers into their nearest
+             larger neighbour.
+          4. If the result is a single tier and it equals the legacy
+             single-tier ``T_max``, fall through to the legacy single-tier
+             path (byte-for-byte identical to before).
 
-          * **Single-tier** (legacy): one ``(n_docs, T_max, dim)`` tensor
-            with ``T_max = next_pow2(max(token_counts), 32)``. Used when
-            the corpus token-count distribution is roughly uniform, which
-            is the case for every BEIR dataset whose corpus is not heavily
-            tail-skewed.
+        Why this beats 2-tier (short, tall):
+          For quora (522,931 docs, raw_max=253, distribution heavily
+          tail-skewed), 2-tier ``short<=T_p95(=32) || tall<=T_max(=256)``
+          wastes ~3.5 GB on the tall bucket because *one* doc forces all
+          ~26K "tall" docs to T=256.  Pow2-per-bucket carves this into
+          {32, 64, 128, 256} tiers and the T=256 tier has only the
+          handful of docs that genuinely need it (~25, not 26K).  VRAM
+          drops from ~9 GB (2-tier) to ~4 GB (multi-tier), comfortably
+          under the fast-path gate on every modern GPU.
 
-          * **Bucketed** (new): two tensors —
-            ``(n_short, T_short, dim)`` for docs with
-            ``token_count <= T_short`` (where ``T_short = next_pow2(p95)``)
-            and ``(n_tall, T_tall, dim)`` for the rest. The MaxSim kernel
-            is launched once per non-empty bucket and scores are scattered
-            back into a single ``(n_docs,)`` buffer for top-k. Triggered
-            only when ``bucketed_bytes < 0.7 * single_tier_bytes`` AND
-            ``n_docs >= 1024`` (small corpora don't benefit from the extra
-            kernel launch). For quora (522 K docs, p95=30, max=253) this
-            cuts the GPU corpus from 34.3 GB to ~9 GB, restoring the
-            whole-corpus fast path on H100.
+        Backwards-compat: ``self._D_short / _M_short / _short_idx`` etc.
+        remain populated whenever the multi-tier layout has ≥ 2 tiers
+        (alias for tiers[0] / tiers[-1] respectively). Single-tier path
+        leaves them ``None`` exactly like before.
         """
         n_docs = len(doc_vecs)
         raw_counts = np.array(
@@ -503,56 +537,124 @@ class PreloadedGpuCorpus:
         dtype_bytes = (2 if self._dtype == torch.float16 else 4)
         single_tier_bytes = n_docs * T_max * self.dim * dtype_bytes
         self._single_tier_bytes = single_tier_bytes
+        self._corpus_raw_max_tok = raw_max_tok
 
-        # Decide whether to bucket
-        T_short = T_max
-        n_short = n_docs
-        bucketed_bytes = single_tier_bytes
-        bucketed = False
-        if self._bucketing_enabled() and n_docs >= 1024 and len(raw_counts) > 0:
-            p95 = int(np.percentile(raw_counts, 95))
-            T_short_candidate = _next_pow2(max(p95, 32), 32)
-            if T_short_candidate < T_max:
-                short_mask = raw_counts <= T_short_candidate
-                n_short_candidate = int(short_mask.sum())
-                n_tall_candidate = n_docs - n_short_candidate
-                bytes_short = n_short_candidate * T_short_candidate * self.dim * dtype_bytes
-                bytes_tall = n_tall_candidate * T_max * self.dim * dtype_bytes
-                bucketed_bytes_candidate = bytes_short + bytes_tall
-                # Activate only when savings are substantial (>=30 % VRAM
-                # reduction) — under that threshold the extra kernel
-                # launch isn't worth the complexity.
-                if bucketed_bytes_candidate < 0.7 * single_tier_bytes:
-                    bucketed = True
-                    T_short = T_short_candidate
-                    n_short = n_short_candidate
-                    bucketed_bytes = bucketed_bytes_candidate
+        # Compute per-doc tier key (pow2 of token count, min 32).
+        per_doc_T = np.maximum(raw_counts, 1)
+        per_doc_T = np.where(per_doc_T < 32, 32, per_doc_T)
+        # vectorised next_pow2: 1 << ceil(log2(x))
+        per_doc_T = (1 << np.ceil(np.log2(per_doc_T)).astype(np.int64)).astype(np.int64)
 
-        self._is_bucketed = bucketed
-        self._bucketed_bytes = bucketed_bytes
-        self._gpu_bytes = bucketed_bytes  # used by _should_use_fast_path
+        unique_T = np.unique(per_doc_T)  # sorted ascending
+        # Merge pass 1: fold tiers with < MIN_TIER_DOCS into next-larger tier.
+        MIN_TIER_DOCS = 256
+        MAX_TIERS = 8
+        tier_T = list(unique_T.tolist())
+        # Precompute count per tier for merging logic.
+        T_to_count = {int(t): int((per_doc_T == t).sum()) for t in tier_T}
 
-        if not bucketed:
+        def _merge_small_tiers(tiers: list) -> list:
+            """Fold any tier with < MIN_TIER_DOCS into its next-larger
+            neighbour. If the smallest tier is too small AND has no larger
+            neighbour, leave it alone (pad-up impossible).
+            """
+            if len(tiers) <= 1:
+                return tiers
+            out = []
+            i = 0
+            while i < len(tiers):
+                t = tiers[i]
+                if T_to_count[int(t)] < MIN_TIER_DOCS and i + 1 < len(tiers):
+                    nxt = tiers[i + 1]
+                    T_to_count[int(nxt)] += T_to_count[int(t)]
+                    i += 1
+                    continue
+                out.append(t)
+                i += 1
+            return out
+
+        merged = _merge_small_tiers(tier_T)
+        # Iterate (some folds may produce a tier still under threshold
+        # because of compounding); keep merging until stable.
+        while len(merged) != len(tier_T):
+            tier_T = merged
+            merged = _merge_small_tiers(tier_T)
+        tier_T = merged
+
+        # Cap to MAX_TIERS by collapsing the tiers with the smallest
+        # populations (preferring to keep the largest tier intact).
+        if len(tier_T) > MAX_TIERS:
+            # Build (count, T) pairs for non-extreme tiers (we never drop
+            # the largest tier because we still need to host the longest
+            # docs).
+            inner = sorted(
+                ((T_to_count[int(t)], t) for t in tier_T[:-1]),
+            )
+            n_to_drop = len(tier_T) - MAX_TIERS
+            drop_set = {int(t) for _, t in inner[:n_to_drop]}
+            new_tier_T = []
+            for t in tier_T:
+                if int(t) in drop_set:
+                    # Find next-larger surviving tier and add count.
+                    i = tier_T.index(t)
+                    nxt = next((u for u in tier_T[i + 1:] if int(u) not in drop_set), None)
+                    if nxt is None:
+                        new_tier_T.append(t)  # cannot drop, no larger neighbour
+                    else:
+                        T_to_count[int(nxt)] += T_to_count[int(t)]
+                else:
+                    new_tier_T.append(t)
+            tier_T = new_tier_T
+
+        # Compute final per-doc tier assignment: each doc goes to the
+        # smallest surviving tier whose T >= per_doc_T[i].
+        tier_T_arr = np.array(sorted(int(t) for t in tier_T), dtype=np.int64)
+        # searchsorted: for each per_doc_T, find the index in tier_T_arr.
+        idx = np.searchsorted(tier_T_arr, per_doc_T, side="left")
+        idx = np.clip(idx, 0, len(tier_T_arr) - 1)
+        per_doc_tier = tier_T_arr[idx]
+
+        # Compute bucketed bytes.
+        bucketed_bytes = 0
+        for t in tier_T_arr:
+            bucketed_bytes += int((per_doc_tier == t).sum()) * int(t) * self.dim * dtype_bytes
+
+        # Decide bucketing on/off
+        bucketed_enabled = self._bucketing_enabled() and n_docs >= 1024 and len(tier_T_arr) > 1
+        # Bucketing wins ⇔ saves ≥10 % vs single-tier (we lowered the
+        # threshold from 30 % because multi-tier launch overhead is
+        # amortised ~zero with CUDA graphs).
+        bucketed_active = (
+            bucketed_enabled and bucketed_bytes < 0.9 * single_tier_bytes
+        )
+
+        self._is_bucketed = bucketed_active
+        self._bucketed_bytes = bucketed_bytes if bucketed_active else single_tier_bytes
+        self._gpu_bytes = self._bucketed_bytes
+
+        if not bucketed_active:
             # Legacy single-tier path (unchanged byte-for-byte for
-            # token-uniform corpora).
+            # token-uniform corpora). Build on CPU (numpy) then do a
+            # single H2D copy per buffer — 522K-doc quora was 5+ minutes
+            # under the per-doc loop, ~3s under the batched copy.
             self.max_tok = T_max
             logger.info(
                 "PreloadedGpuCorpus: %d docs, max_tok=%d (raw %d, pow2-padded), "
-                "dim=%d, %.1f GB %s",
+                "dim=%d, %.2f GB %s (single-tier; multi-tier would save "
+                "%.0f%% — disabled by gate)",
                 n_docs, T_max, raw_max_tok, self.dim,
                 single_tier_bytes / 1e9, self._dtype,
+                100.0 * (1.0 - bucketed_bytes / max(single_tier_bytes, 1)),
             )
-            self.D = torch.zeros(
-                (n_docs, T_max, self.dim), dtype=self._dtype, device=self._device,
-            )
-            self.M = torch.zeros(
-                (n_docs, T_max), dtype=torch.float32, device=self._device,
-            )
+            np_dtype = np.float16 if self._dtype == torch.float16 else np.float32
+            D_cpu = np.zeros((n_docs, T_max, self.dim), dtype=np_dtype)
+            M_cpu = np.zeros((n_docs, T_max), dtype=np.float32)
             for i, v in enumerate(doc_vecs):
                 tok = v.shape[0]
-                self.D[i, :tok] = torch.from_numpy(v).to(self._dtype)
-                self.M[i, :tok] = 1.0
-            self._corpus_raw_max_tok = raw_max_tok
+                D_cpu[i, :tok] = v.astype(np_dtype, copy=False)
+                M_cpu[i, :tok] = 1.0
+            self.D = torch.from_numpy(D_cpu).to(self._device, non_blocking=True)
+            self.M = torch.from_numpy(M_cpu).to(self._device, non_blocking=True)
             self._corpus_actual_max_pow2 = min(_next_pow2(raw_max_tok, 32), T_max)
             self._corpus_has_padding = (
                 self._corpus_actual_max_pow2 < T_max
@@ -564,85 +666,113 @@ class PreloadedGpuCorpus:
             else:
                 self._D_all = self.D
                 self._M_all = self.M
-            # Bucketed-only attributes set to None to keep attribute access
-            # cheap on the legacy path (no AttributeError checks needed).
+            # Multi-tier-only attributes set to None so attribute access on
+            # the legacy path is a single fast lookup.
+            self._tiers = None
             self._D_short = None
             self._M_short = None
             self._D_tall = None
             self._M_tall = None
             self._short_idx = None
             self._tall_idx = None
+            self._orig_to_tier = None
+            self._orig_to_local = None
             return
 
-        # Bucketed path
+        # ── Multi-tier path ─────────────────────────────────────────────
         self.max_tok = T_max
-        n_tall = n_docs - n_short
-        short_mask_np = raw_counts <= T_short
-        short_orig = np.flatnonzero(short_mask_np).astype(np.int64)
-        tall_orig = np.flatnonzero(~short_mask_np).astype(np.int64)
+        n_tiers = len(tier_T_arr)
 
-        logger.info(
-            "PreloadedGpuCorpus: %d docs BUCKETED (short n=%d at D_tok=%d, "
-            "tall n=%d at D_tok=%d, raw_max=%d), dim=%d, %.2f GB total "
-            "(vs %.2f GB single-tier, %.1fx leaner) %s",
-            n_docs, n_short, T_short, n_tall, T_max, raw_max_tok, self.dim,
-            bucketed_bytes / 1e9, single_tier_bytes / 1e9,
-            single_tier_bytes / max(bucketed_bytes, 1), self._dtype,
-        )
+        # Per-tier original-doc indices (sorted ascending in original order
+        # so insertion + scatter is deterministic and reproducible).
+        per_tier_orig_idx = []
+        for t in tier_T_arr:
+            mask = per_doc_tier == t
+            per_tier_orig_idx.append(np.flatnonzero(mask).astype(np.int64))
 
-        self._D_short = torch.zeros(
-            (n_short, T_short, self.dim), dtype=self._dtype, device=self._device,
-        )
-        self._M_short = torch.zeros(
-            (n_short, T_short), dtype=torch.float32, device=self._device,
-        )
-        for li, oi in enumerate(short_orig):
-            v = doc_vecs[int(oi)]
-            tok = v.shape[0]
-            self._D_short[li, :tok] = torch.from_numpy(v).to(self._dtype)
-            self._M_short[li, :tok] = 1.0
-
-        if n_tall > 0:
-            self._D_tall = torch.zeros(
-                (n_tall, T_max, self.dim), dtype=self._dtype, device=self._device,
-            )
-            self._M_tall = torch.zeros(
-                (n_tall, T_max), dtype=torch.float32, device=self._device,
-            )
-            for li, oi in enumerate(tall_orig):
+        # Allocate one (n_tier, T_tier, dim) tensor per tier — build on
+        # CPU first (vectorised numpy slice-assign is ~100× faster than
+        # per-doc torch H2D in a Python loop) then do a single H2D copy.
+        np_dtype = np.float16 if self._dtype == torch.float16 else np.float32
+        tiers = []
+        for t, orig_idx in zip(tier_T_arr, per_tier_orig_idx):
+            n_tier = int(orig_idx.size)
+            T_tier = int(t)
+            D_cpu = np.zeros((n_tier, T_tier, self.dim), dtype=np_dtype)
+            M_cpu = np.zeros((n_tier, T_tier), dtype=np.float32)
+            for li, oi in enumerate(orig_idx):
                 v = doc_vecs[int(oi)]
                 tok = v.shape[0]
-                self._D_tall[li, :tok] = torch.from_numpy(v).to(self._dtype)
-                self._M_tall[li, :tok] = 1.0
+                D_cpu[li, :tok] = v.astype(np_dtype, copy=False)
+                M_cpu[li, :tok] = 1.0
+            D_t = torch.from_numpy(D_cpu).to(self._device, non_blocking=True)
+            M_t = torch.from_numpy(M_cpu).to(self._device, non_blocking=True)
+            tiers.append({
+                "T": T_tier,
+                "D": D_t,
+                "M": M_t,
+                "orig_idx": torch.from_numpy(orig_idx).to(self._device),
+                "n": n_tier,
+                "_orig_idx_np": orig_idx,
+            })
+
+        self._tiers = tiers
+
+        # Build orig_idx → (tier_id, local_idx) lookup tensors.
+        orig_to_tier = np.zeros(n_docs, dtype=np.int64)
+        orig_to_local = np.zeros(n_docs, dtype=np.int64)
+        for ti, tier in enumerate(tiers):
+            np_orig = tier["_orig_idx_np"]
+            orig_to_tier[np_orig] = ti
+            orig_to_local[np_orig] = np.arange(np_orig.size, dtype=np.int64)
+        self._orig_to_tier = torch.from_numpy(orig_to_tier).to(self._device)
+        self._orig_to_local = torch.from_numpy(orig_to_local).to(self._device)
+
+        # 2-tier compatibility aliases (used by older code paths and a
+        # handful of unit tests). We map "short" → smallest tier, "tall"
+        # → largest tier when they differ.
+        self._D_short = tiers[0]["D"]
+        self._M_short = tiers[0]["M"]
+        self._short_idx = tiers[0]["orig_idx"]
+        if n_tiers >= 2:
+            self._D_tall = tiers[-1]["D"]
+            self._M_tall = tiers[-1]["M"]
+            self._tall_idx = tiers[-1]["orig_idx"]
         else:
             self._D_tall = None
             self._M_tall = None
+            self._tall_idx = None
+        # _orig_to_bucket: legacy 0/1 (short/tall) attribute. With ≥3
+        # tiers it loses meaning and is None; score_candidates routes
+        # through _orig_to_tier instead.
+        if n_tiers <= 2:
+            bucket_id = np.zeros(n_docs, dtype=np.int64)
+            if n_tiers == 2:
+                bucket_id[tiers[1]["_orig_idx_np"]] = 1
+            self._orig_to_bucket = torch.from_numpy(bucket_id).to(self._device)
+        else:
+            self._orig_to_bucket = None
 
-        self._short_idx = torch.from_numpy(short_orig).to(self._device)
-        self._tall_idx = torch.from_numpy(tall_orig).to(self._device)
-
-        # orig_idx -> (bucket_id, local_idx) lookup for score_candidates.
-        # bucket_id: 0 short, 1 tall. local_idx: position within bucket.
-        bucket_id = np.zeros(n_docs, dtype=np.int64)
-        bucket_id[tall_orig] = 1
-        local_idx = np.zeros(n_docs, dtype=np.int64)
-        local_idx[short_orig] = np.arange(n_short, dtype=np.int64)
-        local_idx[tall_orig] = np.arange(n_tall, dtype=np.int64)
-        self._orig_to_bucket = torch.from_numpy(bucket_id).to(self._device)
-        self._orig_to_local = torch.from_numpy(local_idx).to(self._device)
-
-        # Legacy attributes set to keep external code that reads
-        # `.D` / `.M` working — point them at the short bucket because
-        # that's the (overwhelming) majority of the corpus. Callers that
-        # mutate `.D` / `.M` directly are not supported in bucketed mode
-        # and will trip on the score-path assertions below.
+        # Legacy attribute aliases — point at smallest tier so external
+        # code that reads .D / .M sees the bulk of the corpus.
         self.D = self._D_short
         self.M = self._M_short
-        self._corpus_raw_max_tok = raw_max_tok
         self._corpus_actual_max_pow2 = T_max
         self._corpus_has_padding = True
-        self._D_all = None  # not meaningful in bucketed mode
+        self._D_all = None
         self._M_all = None
+
+        # Pretty-print tier breakdown for ops visibility.
+        breakdown = ", ".join(
+            f"T={t['T']}:n={t['n']}" for t in tiers
+        )
+        logger.info(
+            "PreloadedGpuCorpus: %d docs MULTI-TIER (%d tiers — %s; raw_max=%d) "
+            "%.2f GB (vs %.2f GB single-tier, %.1fx leaner) %s",
+            n_docs, n_tiers, breakdown, raw_max_tok,
+            bucketed_bytes / 1e9, single_tier_bytes / 1e9,
+            single_tier_bytes / max(bucketed_bytes, 1), self._dtype,
+        )
 
     def refresh(self, doc_vecs: list, doc_ids: List[int]) -> None:
         """Rebuild GPU tensors from a new sealed snapshot. Reuses the
@@ -654,6 +784,52 @@ class PreloadedGpuCorpus:
             doc_ids, dtype=torch.long, device=self._device,
         )
         self._build_layout(doc_vecs)
+        self._init_score_buffers()
+
+    def _init_score_buffers(self) -> None:
+        """Allocate the persistent score-all buffers used by `score_all`.
+
+        Layout:
+          * ``_scores_buf``: ``(n_docs,) float32`` on device — scatter
+            target across all tiers.
+          * ``_h_paired``: ``(2, k_max) float32`` pinned host buffer for
+            the fused (idx + score) D2H. Sized for ``k_max=512`` which
+            covers all realistic top-k values.
+
+        Buffers are allocated lazily per-corpus and reused across all
+        queries against this corpus. Multi-corpus use cases (refresh,
+        from_merged_streaming) reinitialise via ``refresh()``.
+        """
+        n_docs = len(self.doc_ids)
+        try:
+            on_cuda = torch.cuda.is_available() and (
+                torch.device(self._device).type == "cuda"
+                if isinstance(self._device, str)
+                else self._device.type == "cuda"
+            )
+        except Exception:
+            on_cuda = False
+        if on_cuda and n_docs > 0:
+            self._scores_buf = torch.full(
+                (n_docs,), float("-inf"),
+                dtype=torch.float32, device=self._device,
+            )
+        else:
+            self._scores_buf = None
+        # Pinned host buffer for fused (top_idx, top_sc) D2H. 512 floats
+        # per row covers any realistic k; D2H copy is bound by the actual
+        # final_k slice we narrow to before .tolist().
+        self._k_max_pinned = 512
+        if on_cuda:
+            try:
+                self._h_paired = torch.empty(
+                    (2, self._k_max_pinned),
+                    dtype=torch.float32, pin_memory=True,
+                )
+            except Exception:
+                self._h_paired = None
+        else:
+            self._h_paired = None
 
     def score_all(
         self,
@@ -706,10 +882,10 @@ class PreloadedGpuCorpus:
             """Returns a ``(n_docs,)`` score tensor for the full corpus.
 
             Single-tier: one MaxSim launch over ``self._D_all``.
-            Bucketed:   one launch per non-empty bucket; results are
+            Multi-tier: one launch per non-empty tier; results are
                         scatter-merged into a ``(n_docs,)`` buffer
                         indexed by the original doc order so the ``topk``
-                        below picks across both buckets uniformly.
+                        below picks across all tiers uniformly.
             """
             if not self._is_bucketed:
                 return maxsim(
@@ -717,31 +893,52 @@ class PreloadedGpuCorpus:
                     documents_embeddings=self._D_all,
                     documents_mask=self._M_all if self._corpus_has_padding else None,
                 ).squeeze(0)
-            # Bucketed: short bucket always exists (n_short >= 1 by
-            # construction whenever bucketing activates).
-            scores_buf = torch.full(
-                (n_docs,), float("-inf"),
-                dtype=torch.float32, device=self._device,
-            )
-            s_short = maxsim(
-                queries_embeddings=q,
-                documents_embeddings=self._D_short,
-                documents_mask=self._M_short,
-            ).squeeze(0).to(torch.float32)
-            scores_buf.scatter_(0, self._short_idx, s_short)
-            if self._D_tall is not None and self._D_tall.shape[0] > 0:
-                s_tall = maxsim(
+            # Reuse the persistent score buffer; reset to -inf before
+            # each scatter so any "missing tier" doc (shouldn't happen
+            # with the multi-tier construction but defensive) won't
+            # leak prior-query state into top-k.
+            if self._scores_buf is not None and self._scores_buf.numel() == n_docs:
+                scores_buf = self._scores_buf
+                scores_buf.fill_(float("-inf"))
+            else:
+                scores_buf = torch.full(
+                    (n_docs,), float("-inf"),
+                    dtype=torch.float32, device=self._device,
+                )
+            for tier in self._tiers:
+                if tier["n"] == 0:
+                    continue
+                s_tier = maxsim(
                     queries_embeddings=q,
-                    documents_embeddings=self._D_tall,
-                    documents_mask=self._M_tall,
+                    documents_embeddings=tier["D"],
+                    documents_mask=tier["M"],
                 ).squeeze(0).to(torch.float32)
-                scores_buf.scatter_(0, self._tall_idx, s_tall)
+                scores_buf.scatter_(0, tier["orig_idx"], s_tier)
             return scores_buf
 
         if not return_stats:
             scores = _run_maxsim_all()
             final_k = min(k, n_docs)
             top_sc, top_idx = scores.topk(final_k)
+            # Fused (idx, score) D2H via pinned host buffer when available
+            # — saves the extra .cpu() roundtrip and per-call cudaMalloc
+            # for the small staging tensor.
+            if (
+                self._h_paired is not None
+                and final_k <= self._k_max_pinned
+                and torch.cuda.is_available()
+                and top_idx.is_cuda
+            ):
+                paired = torch.stack(
+                    [top_idx.to(torch.float32), top_sc.to(torch.float32)], dim=0,
+                )
+                self._h_paired[:, :final_k].copy_(paired, non_blocking=True)
+                # Synchronise the default stream so the host read sees
+                # the staged data.
+                torch.cuda.current_stream().synchronize()
+                idx_list = self._h_paired[0, :final_k].to(torch.int64).tolist()
+                sc_list = self._h_paired[1, :final_k].tolist()
+                return [self.doc_ids[i] for i in idx_list], sc_list
             idx_list = top_idx.cpu().tolist()
             return [self.doc_ids[i] for i in idx_list], top_sc.cpu().tolist()
 
@@ -749,7 +946,11 @@ class PreloadedGpuCorpus:
             "score_mode": "gpu_corpus_all",
             "prepare_ms": 0.0, "h2d_ms": 0.0, "maxsim_ms": 0.0,
             "topk_ms": 0.0, "exact_ms": 0.0,
-            "n_buckets": 2 if self._is_bucketed and self._D_tall is not None else 1,
+            "n_buckets": (
+                len(self._tiers)
+                if self._is_bucketed and self._tiers is not None
+                else 1
+            ),
         }
         with Timer(sync_cuda=True) as t_exact:
             with Timer(sync_cuda=True) as t_maxsim:
@@ -814,9 +1015,11 @@ class PreloadedGpuCorpus:
             "maxsim_ms": 0.0,
             "topk_ms": 0.0,
             "exact_ms": 0.0,
-            "n_buckets": 2 if (
-                self._is_bucketed and self._D_tall is not None
-            ) else 1,
+            "n_buckets": (
+                len(self._tiers)
+                if self._is_bucketed and self._tiers is not None
+                else 1
+            ),
         }
 
         def _bucket_score(D_bucket, M_bucket, local_inds):
@@ -865,21 +1068,16 @@ class PreloadedGpuCorpus:
                     [valid_ids[i] for i in idx_list], top_sc.cpu().tolist(),
                 )
             else:
-                # Bucketed path: partition candidates by bucket, score
-                # each non-empty bucket, then top-k across the merged
+                # Multi-tier path: partition candidates by tier, score
+                # each non-empty tier, then top-k across the merged
                 # ``(n,)`` score tensor (cand_pos -> score).
                 with Timer(sync_cuda=True) as t_prepare:
                     orig_indices = torch.tensor(
                         [self.doc_id_to_idx[did] for did in valid_ids],
                         dtype=torch.long, device=self._device,
                     )
-                    buckets = self._orig_to_bucket[orig_indices]
+                    tier_ids = self._orig_to_tier[orig_indices]
                     locals_t = self._orig_to_local[orig_indices]
-                    is_short = buckets == 0
-                    short_pos = torch.nonzero(is_short, as_tuple=True)[0]
-                    tall_pos = torch.nonzero(~is_short, as_tuple=True)[0]
-                    short_local = locals_t[short_pos]
-                    tall_local = locals_t[tall_pos]
                 stats["prepare_ms"] += t_prepare.elapsed_ms
 
                 with Timer(sync_cuda=True) as t_maxsim:
@@ -887,16 +1085,16 @@ class PreloadedGpuCorpus:
                         (n,), float("-inf"),
                         dtype=torch.float32, device=self._device,
                     )
-                    if short_local.numel() > 0:
-                        sc_short = _bucket_score(
-                            self._D_short, self._M_short, short_local,
+                    for ti, tier in enumerate(self._tiers):
+                        sel = (tier_ids == ti)
+                        cand_pos = torch.nonzero(sel, as_tuple=True)[0]
+                        if cand_pos.numel() == 0:
+                            continue
+                        local_inds = locals_t[cand_pos]
+                        sc_tier = _bucket_score(
+                            tier["D"], tier["M"], local_inds,
                         )
-                        scores_buf.scatter_(0, short_pos, sc_short)
-                    if tall_local.numel() > 0 and self._D_tall is not None:
-                        sc_tall = _bucket_score(
-                            self._D_tall, self._M_tall, tall_local,
-                        )
-                        scores_buf.scatter_(0, tall_pos, sc_tall)
+                        scores_buf.scatter_(0, cand_pos, sc_tier)
                 stats["maxsim_ms"] = t_maxsim.elapsed_ms
 
                 final_k = min(k, n)
@@ -1035,6 +1233,24 @@ class PreloadedGpuCorpus:
         self.max_tok = max_tok
         self.dim = dim
         self._device = device
+        # Multi-tier compatibility attrs (this constructor uses single-tier).
+        self._is_bucketed = False
+        self._tiers = None
+        self._D_short = None
+        self._M_short = None
+        self._D_tall = None
+        self._M_tall = None
+        self._short_idx = None
+        self._tall_idx = None
+        self._orig_to_tier = None
+        self._orig_to_local = None
+        self._orig_to_bucket = None
+        self._D_all = None
+        self._M_all = None
+        self._corpus_has_padding = False
+        self._corpus_actual_max_pow2 = max_tok
+        self._corpus_raw_max_tok = max_tok
+        self._dtype = dtype
 
         pos = 0
         for ids_chunk, emb_chunk, mask_chunk, chunk_max_tok, _global_max_tok in store.iter_merged_doc_chunks(
@@ -1055,6 +1271,11 @@ class PreloadedGpuCorpus:
             self.M[pos : pos + n_chunk, :chunk_max_tok] = mask_t[:, :chunk_max_tok]
             pos += n_chunk
 
+        # Single-tier _D_all alias for fast-path consumers.
+        self._D_all = self.D
+        self._M_all = self.M
+        # Pre-allocate persistent score / D2H buffers (Fix F).
+        cls._init_score_buffers(self)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         logger.info(
@@ -1457,7 +1678,12 @@ def score_rroq158_topk(
             docs_mask=dm_dev,
             q_planes=qp_one, q_meta=qm_one, qc_table=qct_one,
         )
-    except Exception:  # pragma: no cover — fall back below
+        if scores is None:
+            _log_fused_fallback("shape gate or env disabled fused kernel")
+        else:
+            _log_fused_dispatched(int(ds.shape[0]), int(ds.shape[1]))
+    except Exception as exc:  # log the actual reason so we can see future regressions
+        _log_fused_fallback(f"{type(exc).__name__}: {exc}")
         scores = None
 
     if scores is None:

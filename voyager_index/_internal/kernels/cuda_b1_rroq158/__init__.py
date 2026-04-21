@@ -200,6 +200,7 @@ def score_b1_fused(
     q_planes: torch.Tensor,     # (S, query_bits, n_words) int32
     q_meta: torch.Tensor,       # (S, 2) float32
     qc_table: torch.Tensor,     # (S, K) float32
+    docs_scl_2d: Optional[torch.Tensor] = None,  # (B, T) — pre-squeezed
 ) -> Optional[torch.Tensor]:
     """Run the fused b1 MMA + epilogue kernel. Returns ``(B,) float32``
     scores on the same device as the inputs, or ``None`` if the fused
@@ -220,21 +221,30 @@ def score_b1_fused(
 
     # Pad B to a multiple of 8 (m8n8k128 tile width). Padded docs get
     # mask=0 so they contribute -inf and never enter the topk; we trim
-    # back below.
+    # back below. We use empty+copy_ rather than cat+zeros to avoid the
+    # peak-VRAM doubling that torch.cat causes (cat allocates a fresh
+    # destination AND keeps the source live until completion). At quora
+    # scale (B=522,931, T≤256, n_words=4) the docs_sign tensor alone is
+    # ~2 GB; the old cat path peaked at ~6 GB extra, which combined with
+    # the bucketed layout would push us past the fast-path VRAM gate.
     pad_b = (8 - B % 8) % 8
     if pad_b:
-        zero3 = torch.zeros(pad_b, T, n_words, dtype=torch.int32, device=device)
-        docs_sign = torch.cat([docs_sign, zero3], dim=0).contiguous()
-        docs_nz = torch.cat([docs_nz, zero3], dim=0).contiguous()
-        zero_scl = torch.zeros(pad_b, T, n_groups, dtype=torch.float32, device=device)
-        docs_scl = torch.cat([docs_scl, zero_scl], dim=0).contiguous()
-        zero_2d_i = torch.zeros(pad_b, T, dtype=torch.int32, device=device)
-        zero_2d_f = torch.zeros(pad_b, T, dtype=torch.float32, device=device)
-        docs_cid = torch.cat([docs_cid, zero_2d_i], dim=0).contiguous()
-        docs_cos = torch.cat([docs_cos, zero_2d_f], dim=0).contiguous()
-        docs_sin = torch.cat([docs_sin, zero_2d_f], dim=0).contiguous()
+        Bp = B + pad_b
+
+        def _pad_b(x: torch.Tensor) -> torch.Tensor:
+            shape = (Bp,) + tuple(x.shape[1:])
+            out = torch.zeros(shape, dtype=x.dtype, device=device)
+            out[:B].copy_(x)
+            return out
+
+        docs_sign = _pad_b(docs_sign)
+        docs_nz = _pad_b(docs_nz)
+        docs_scl = _pad_b(docs_scl)
+        docs_cid = _pad_b(docs_cid)
+        docs_cos = _pad_b(docs_cos)
+        docs_sin = _pad_b(docs_sin)
         if docs_mask is not None:
-            docs_mask = torch.cat([docs_mask, zero_2d_f], dim=0).contiguous()
+            docs_mask = _pad_b(docs_mask)
     if docs_mask is None:
         docs_mask = torch.ones(docs_sign.shape[0], T, dtype=torch.float32, device=device)
 
@@ -242,27 +252,39 @@ def score_b1_fused(
     # qc_table contribute exactly 0 to each per-doc score (verified in
     # benchmarks/_smoke_b1_mma.py), so no extra mask is required.
     if s_query < 32:
-        pad_s = 32 - s_query
-        q_planes = torch.cat(
-            [q_planes,
-             torch.zeros(pad_s, query_bits, n_words, dtype=torch.int32, device=device)],
-            dim=0,
-        ).contiguous()
-        q_meta = torch.cat(
-            [q_meta, torch.zeros(pad_s, 2, dtype=torch.float32, device=device)],
-            dim=0,
-        ).contiguous()
-        qc_table = torch.cat(
-            [qc_table, torch.zeros(pad_s, qc_table.shape[1], dtype=torch.float32, device=device)],
-            dim=0,
-        ).contiguous()
+        Sp = 32
+
+        def _pad_s(x: torch.Tensor) -> torch.Tensor:
+            shape = (Sp,) + tuple(x.shape[1:])
+            out = torch.zeros(shape, dtype=x.dtype, device=device)
+            out[:s_query].copy_(x)
+            return out
+
+        q_planes = _pad_s(q_planes)
+        q_meta = _pad_s(q_meta)
+        qc_table = _pad_s(qc_table)
 
     # The kernel takes (B, T) for n_groups=1 (we squeeze the trailing
-    # axis off scl).
-    scl_2d = docs_scl[..., 0].contiguous()
+    # axis off scl). Prefer the caller-supplied pre-squeezed tensor —
+    # ``docs_scl[..., 0].contiguous()`` allocates a fresh (B, T) f32
+    # buffer (~65 MB at quora scale) per call which is one of the two
+    # remaining per-query allocations responsible for the periodic
+    # CUDA allocator GC stalls.
+    if docs_scl_2d is not None:
+        scl_2d = docs_scl_2d
+        if pad_b:
+            # The pre-squeezed buffer was sized for the un-padded B;
+            # rebuild for the padded layout (rare path, only on first
+            # call before the caller has cached a padded version).
+            scl_2d = docs_scl[..., 0].contiguous()
+    else:
+        scl_2d = docs_scl[..., 0].contiguous()
 
+    # Inputs are already contiguous (empty+copy_ pad path or original
+    # contiguous tensors). Avoid extra .contiguous() calls that would
+    # silently allocate copies.
     scores = ext.fused_b1_rroq158(
-        docs_sign.contiguous(), docs_nz.contiguous(),
+        docs_sign, docs_nz,
         q_planes, q_meta, qc_table,
         scl_2d, docs_cid, docs_cos, docs_sin, docs_mask,
     )
