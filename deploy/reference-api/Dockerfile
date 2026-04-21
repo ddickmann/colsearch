@@ -7,10 +7,24 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    cargo \
     curl \
-    rustc \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Install a recent stable Rust via rustup. Debian's `rustc` package on
+# python:3.11-slim is currently 1.85, which predates the stabilization of
+# the `avx512_target_feature` gate (stable in 1.89+) used by the fused
+# RROQ158 AVX-512 VPOPCNTDQ tier in src/kernels/shard_engine. Pin to a
+# concrete recent stable so this build is reproducible and not at the
+# mercy of whatever rustup currently considers `stable`.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_VERSION=1.94.1
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path \
+    && rustc --version \
+    && cargo --version
 
 COPY pyproject.toml README.md LICENSE LICENSING.md THIRD_PARTY_NOTICES.md /app/
 COPY colsearch /app/colsearch
