@@ -1,7 +1,7 @@
 # voyager-index vs FastPlaid — Competitive Benchmark (BEIR-8, H100)
 
 > **Status (2026-04-21):** apples-to-apples re-bench complete. All 8 BEIR
-> corpora are the **full FastPlaid-published cardinalities** (fixed in
+> corpora at the **full FastPlaid-published cardinalities** (fixed in
 > v7); voyager numbers measured fresh on this H100 with `n_eval=500`
 > queries per dataset (statistically equivalent to the full BEIR query
 > set within ±2 % QPS noise floor). FastPlaid numbers are taken
@@ -11,75 +11,95 @@
 
 ## TL;DR
 
-| Lane | voyager `fp16` GPU geomean | voyager `rroq158_gs128` GPU geomean | FastPlaid GPU geomean | voyager `fp16` vs FastPlaid |
+| Lane | voyager `fp16` GPU geomean | voyager `rroq158_gs128` GPU geomean | FastPlaid GPU geomean | voyager `fp16/gpu` vs FastPlaid (per-DS geomean) |
 | --- | ---: | ---: | ---: | ---: |
-| BEIR-8 | **446.8 QPS** | **294.4 QPS** | 19.1 QPS | **23.4× faster** |
+| BEIR-8 | **446.7 QPS** | **294.4 QPS** | 143.2 QPS | **3.12× faster** |
 
-Per-row breakdown of the GPU lane (single-client, sequential queries — same
-methodology FastPlaid publishes):
+- `voyager_fp16/gpu` beats FastPlaid GPU on **8 / 8** BEIR-8 datasets
+  (per-DS speedup ranges from **1.24×** on `quora` to **8.20×** on
+  `nfcorpus`).
+- `voyager_rroq158_gs128/gpu` beats FastPlaid GPU on **6 / 8**, loses
+  on `trec-covid` (0.89×) and `webis-touche2020` (0.82×) where the
+  rroq158 multi-tier kernel pays more per-tier dispatch overhead than
+  fp16 — see Caveats. Net per-DS geomean: **2.06×** vs FastPlaid.
+- `voyager_rroq158_gs128` quantises the per-token vectors **6.4×**
+  smaller than fp16 and recovers within ≤ 4 NDCG@10 points on every
+  BEIR-8 dataset; on `webis-touche2020` it actually *beats* fp16
+  (0.288 vs 0.285).
 
-| Dataset | n_docs | **voyager `fp16/gpu`** | **voyager `rroq158_gs128/gpu`** | FastPlaid GPU | Voyager fp16 vs FastPlaid |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| arguana | 8 674 | **1 233.7** | **461.8** | 13.6 | **90.7×** |
-| fiqa | 57 638 | **316.7** | **357.5** | 18.2 | **17.4×** |
-| nfcorpus | 3 633 | **1 996.8** | **989.6** | 6.6 | **302.5×** |
-| quora | 522 931 | **348.6** | **293.6** | 20.9 | **16.7×** |
-| scidocs | 25 657 | **405.0** | **482.4** | 17.5 | **23.1×** |
-| scifact | 5 183 | **564.1** | **875.5** | 7.9 | **71.4×** |
-| trec-covid | 171 332 | **226.2** | 48.3 | 54.1 | **4.2×** |
-| webis-touche2020 | 382 545 | **112.9** | 57.7 | 70.1 | **1.6×** |
-| **geomean** | — | **446.8** | **294.4** | **19.1** | **23.4×** |
+---
 
-QPS on `voyager_fp16/gpu` beats the FastPlaid GPU lane on **every single
-BEIR-8 dataset**, with a geometric-mean win of **23.4×**. The biggest
-absolute throughput cells (`nfcorpus 1 997 QPS`, `arguana 1 234 QPS`) are
-in the small-to-medium corpus regime where the multi-tier MaxSim kernel
-keeps both query-side and doc-side data resident in L2; the largest
-corpus (`webis-touche2020 382 545 docs`) is the narrowest margin
-(**1.6×**) but still a clear win on the same H100.
+## GPU lane (single-client, sequential queries — same methodology FastPlaid publishes)
 
-The `rroq158_gs128` codec — which is **6.4× more memory-efficient** than
-fp16 — wins the QPS race on `fiqa`, `scidocs`, and `scifact` while
-staying within ≤ 5 NDCG points of the fp16 ceiling on every dataset
-(see the Quality table below).
+| Dataset | n_docs | **voyager `fp16/gpu`** | **voyager `rroq158_gs128/gpu`** | FastPlaid GPU | fp16/gpu vs FP | rroq158/gpu vs FP |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| arguana | 8 674 | **1 233.7** | **461.8** | 155.3 | **7.95×** | **2.97×** |
+| fiqa | 57 638 | **316.7** | **357.5** | 146.6 | **2.16×** | **2.44×** |
+| nfcorpus | 3 633 | **1 996.8** | **989.6** | 243.4 | **8.20×** | **4.07×** |
+| quora | 522 931 | **348.6** | **293.6** | 281.5 | **1.24×** | **1.04×** |
+| scidocs | 25 657 | **405.0** | **482.4** | 157.5 | **2.57×** | **3.06×** |
+| scifact | 5 183 | **564.1** | **875.5** | 190.1 | **2.97×** | **4.61×** |
+| trec-covid | 171 332 | **226.2** | 48.3 | 54.1 | **4.18×** | 0.89× |
+| webis-touche2020 | 382 545 | **112.9** | 57.7 | 70.2 | **1.61×** | 0.82× |
+| **geomean (BEIR-8)** | — | **446.7** | **294.4** | **143.2** | **3.12×** | **2.06×** |
+
+The biggest absolute throughput cells (`nfcorpus 1 997 QPS`,
+`arguana 1 234 QPS`) are in the small-to-medium corpus regime where
+the multi-tier MaxSim kernel keeps both query-side and doc-side data
+resident in L2. The narrowest fp16 wins (`quora 1.24×`,
+`webis-touche2020 1.61×`) are on the two largest corpora in BEIR-8
+where memory bandwidth — not kernel work — is the bottleneck and
+FastPlaid's PLAID-derived layout already does well.
+
+The `rroq158_gs128` codec (**6.4× more memory-efficient** than fp16)
+wins outright on `fiqa`, `scidocs`, and `scifact` (faster *and*
+smaller), is competitive on `arguana`, `nfcorpus`, `quora`, and loses
+on `trec-covid` / `webis-touche2020` — see Caveats for why.
 
 ---
 
 ## CPU lane
 
-FastPlaid does publish a CPU lane for the BEIR-6 in their first table
+FastPlaid publishes a CPU lane for the BEIR-6 in their first table
 but not for `trec-covid` / `webis-touche2020`. Same single-client,
 sequential methodology as GPU — voyager runs 8 worker threads on the
 native Rust SIMD path, FastPlaid is single-threaded by default.
 
-| Dataset | n_docs | **voyager `fp16/cpu`** (8w) | **voyager `rroq158/cpu`** (8w) | FastPlaid CPU | rroq158 vs FastPlaid |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| arguana | 8 674 | 10.0 | **20.0** | 17.4 | **1.15×** |
-| fiqa | 57 638 | 5.0 | 11.1 | 17.6 | 0.63× |
-| nfcorpus | 3 633 | 64.6 | **107.4** | 16.9 | **6.36×** |
-| quora | 522 931 | 16.6 | 8.9 | 17.7 | 0.50× |
-| scidocs | 25 657 | 7.9 | **17.2** | 16.5 | **1.04×** |
-| scifact | 5 183 | 27.3 | **50.0** | 16.9 | **2.96×** |
-| trec-covid | 171 332 | 1.4 | 2.9 | (not published) | n/a |
-| webis-touche2020 | 382 545 | 16.3 | 2.2 | (not published) | n/a |
+| Dataset | n_docs | **voyager `fp16/cpu`** (8w) | **voyager `rroq158/cpu`** (8w) | FastPlaid CPU | fp16/cpu vs FP | rroq158/cpu vs FP |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| arguana | 8 674 | 10.0 | **20.0** | 17.4 | 0.57× | **1.15×** |
+| fiqa | 57 638 | 5.0 | 11.1 | 17.6 | 0.28× | 0.63× |
+| nfcorpus | 3 633 | 64.6 | **107.4** | 16.9 | **3.82×** | **6.36×** |
+| quora | 522 931 | 16.6 | 8.9 | 17.7 | 0.94× | 0.50× |
+| scidocs | 25 657 | 7.9 | **17.2** | 16.5 | 0.48× | **1.04×** |
+| scifact | 5 183 | 27.3 | **50.0** | 16.9 | **1.61×** | **2.96×** |
+| trec-covid | 171 332 | 1.4 | 2.9 | (not published) | n/a | n/a |
+| webis-touche2020 | 382 545 | 16.3 | 2.2 | (not published) | n/a | n/a |
+| **geomean (BEIR-6)** | — | 15.1 | 23.8 | 17.2 | 0.88× | **1.39×** |
 
-CPU comparison is mixed — `rroq158` SIMD wins on small / medium corpora
-where the popcount kernel saturates per-core BW, but loses on
-million-doc-class corpora (`quora`, `webis-touche2020`) where the
-single-threaded FastPlaid kernel benefits from a tighter L2 working set.
-This is a known follow-up — see Caveats below.
+CPU is mixed and honest: `voyager_fp16/cpu` *loses* the geomean to
+FastPlaid CPU (**0.88×**); the fp16 CPU lane was never the focus of
+this PR. The `rroq158/cpu` Rust SIMD path wins the geomean
+(**1.39×**) and is the recommended CPU production lane — popcount
+saturates per-core BW on small / medium corpora and the codec is
+6.4× smaller on disk + RAM. On million-doc-class corpora (`quora`,
+`webis-touche2020`) `rroq158/cpu` underperforms because the
+single-pass kernel walks the full corpus per query; the production
+CPU dispatcher uses LEMUR routing above 100 k docs to keep the work
+bounded (this bench shows the un-routed exact-MaxSim ceiling, which
+is honest but not what production runs).
 
 ---
 
 ## Quality (NDCG@10)
 
-`rroq158_gs128` quantizes the per-token vectors at **6.4×** compression
-vs fp16 and recovers within ≤ 4 NDCG points across the BEIR-8 — most
-datasets see ≤ 1 point delta. The FastPlaid column shows the
-ColBERTv2-trained baseline that FastPlaid publishes; voyager uses
-`GTE-ModernColBERT-v1` (the same model FastPlaid's PyLate Quick Start
-ships with, but a different trained checkpoint), so the row is *quality*
-comparable but not weight-identical.
+`rroq158_gs128` quantises the per-token vectors at **6.4×**
+compression vs fp16 and recovers within ≤ 4 NDCG points across the
+BEIR-8 — most datasets see ≤ 1 point delta. The FastPlaid column
+shows the ColBERTv2-trained baseline FastPlaid publishes; voyager
+uses `GTE-ModernColBERT-v1` (the same model FastPlaid's PyLate Quick
+Start ships with, but a different trained checkpoint), so the row is
+*quality* comparable but not weight-identical.
 
 | Dataset | voyager `fp16` | voyager `rroq158_gs128` | FastPlaid (published) |
 | --- | ---: | ---: | ---: |
@@ -92,13 +112,14 @@ comparable but not weight-identical.
 | trec-covid | 0.818 | 0.787 | 0.83 |
 | webis-touche2020 | 0.285 | 0.288 | 0.24 |
 
-voyager `fp16/gpu` matches or beats FastPlaid's published NDCG@10 on
-6 of 8 datasets and is within 1.2 NDCG points on the remaining two
-(`trec-covid`, `quora`). On `webis-touche2020` voyager `fp16` is
-**4.5 points higher** than FastPlaid and `rroq158` is **4.8 points
-higher**, because the new full-corpus fast path (see §3 below) skips
-LEMUR routing on the GPU lane and exposes the true exact-MaxSim
-ceiling.
+`voyager_fp16/gpu` matches or beats FastPlaid's published NDCG@10 on
+**5 of 8** datasets (arguana, fiqa, quora, webis-touche2020, and
+≈ on nfcorpus / scifact within ±0.001), and is within 1.2 NDCG
+points on the remaining `trec-covid` (0.818 vs 0.83) and `scidocs`
+(0.187 vs 0.191). On `webis-touche2020` voyager `fp16` is **+4.5 pts**
+and `rroq158` is **+4.8 pts** vs FastPlaid because the new
+full-corpus fast path (see §3 below) skips LEMUR routing on the GPU
+lane and exposes the true exact-MaxSim ceiling.
 
 ---
 
@@ -153,6 +174,9 @@ documented inline in the source as `audit_*` / `Fix-*` markers):
    *faster* and strictly *higher NDCG*. This was the dominant
    `webis-touche2020` regression — the LEMUR routing path was paying
    1.2 s per query on a corpus the multi-tier kernel scores in 9 ms.
+   Both `run_gpu_corpus_mode` (fp16) and `_run_rroq158_gpu_mode` now
+   defer the LEMUR router init entirely when the fast-path is active,
+   so no MLP / FAISS index gets paged in for nothing.
 
 4. **Fused CUDA kernel for `rroq158`** — single-pass MaxSim in one
    kernel using H100 binary tensor cores
@@ -229,11 +253,27 @@ carries the env block (driver, CUDA, voyager + FastPlaid versions).
 
 ## Caveats
 
-- **`quora` / `webis-touche2020` `rroq158/cpu` are below `fp16/cpu`** on
-  these single-pass slices. The CPU SIMD kernel still scales
-  sub-linearly with corpus size on these datasets; the GPU lane is
-  not affected. Tracked as a follow-up; the production CPU dispatcher
-  uses LEMUR routing on >100 k corpora to keep the work bounded.
+- **`trec-covid` / `webis-touche2020` `rroq158/gpu` are below
+  FastPlaid GPU** (0.89× and 0.82× respectively) and well below the
+  same datasets' `fp16/gpu` lane (4.7× and 2.0× lower). Both corpora
+  have long-tailed token distributions (`trec-covid raw_max=2 048`,
+  `webis raw_max=300, p95=279`), so the multi-tier dispatcher fires
+  more per-tier kernel launches and the rroq158 dequant path pays
+  more dispatch overhead per launch than fp16's fused MaxSim. The
+  fp16 lane on the same corpora wins **4.18×** and **1.61×** vs
+  FastPlaid, so the corpus is not the issue — it's a known rroq158
+  multi-tier follow-up.
+- **`fp16/cpu` geomean (0.88×) loses to FastPlaid CPU.** The fp16
+  CPU lane was not the focus of this PR; recommended CPU production
+  path is `rroq158/cpu` (geomean **1.39×** vs FastPlaid CPU, and
+  6.4× smaller index).
+- **`quora` / `webis-touche2020` `rroq158/cpu`** are below
+  `fp16/cpu` on these single-pass slices because the un-routed
+  popcount kernel walks the full corpus per query. The production
+  CPU dispatcher uses LEMUR routing above 100 k corpora to keep the
+  work bounded; this bench reports the unrouted exact-MaxSim
+  ceiling, which is the apples-to-apples comparison vs FastPlaid's
+  published numbers.
 - **NDCG vs FastPlaid published row** is a quality reference, not a
   weight-identical comparison — FastPlaid's published numbers use the
   ColBERTv2 trained checkpoint, ours use `GTE-ModernColBERT-v1`. The
@@ -241,11 +281,3 @@ carries the env block (driver, CUDA, voyager + FastPlaid versions).
 - **Single-client sequential QPS** mirrors FastPlaid's published
   methodology; throughput per client multiplies linearly up to ~16
   concurrent clients on the H100 fp16 lane in practice.
-- **`trec-covid` rroq158/gpu (48 QPS)** is below the `fp16/gpu` lane
-  (226 QPS) on this corpus. The rroq158 multi-tier kernel pays an
-  extra dispatch per tier, and on `trec-covid`'s long-tailed token
-  distribution (`raw_max=2 048`) the per-tier overhead becomes a
-  larger fraction of the total. Investigation continues — the
-  `webis-touche2020` numbers (where rroq158 is competitive with fp16
-  on a similarly long-tailed corpus) suggest a tier-dispatch
-  bottleneck specific to the trec-covid token histogram.
